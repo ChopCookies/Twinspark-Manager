@@ -1,0 +1,33 @@
+{
+  "name": "smollm2-135m-smoke",
+  "description": "135M smoke-test model: checks a new image, the RoCE/NCCL wiring and the gateway in about a minute. Eager, 1K context, 32 MiB KV.",
+  "tags": ["smoke-test", "tiny"],
+  "simple": {
+    "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "quantization": "bf16",
+    "topology": "single-a",
+    "context_length": 1024,
+    "concurrency": 1,
+    "api_alias": "smoke"
+  },
+  "advanced": {
+    "dtype": "bfloat16",
+    "weight_loader": "safetensors",
+    "eager_mode": true,
+    "prefix_cache": false,
+    "gpu_memory_utilization": 0.05,
+    "max_num_batched_tokens": 1024,
+    "extra_vllm_flags": {"kv-cache-memory-bytes": 33554432}
+  },
+  "runtime_adapter": "eugr",
+  "distributed_backend": "mp",
+  "verification": "verified",
+  "image_hint": "vllm-node-b12x",
+  "source": {
+    "title": "SmolLM2-135M smoke test (single-a; duplicate as pp2 to test both nodes)",
+    "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct",
+    "author": "TwinSpark dev run 2026-09-28 (single-a and pp2 passed on this rig)",
+    "requirements": ["Nothing big: ~260 MiB of weights. 9 attention heads do not split over TP2 — use pp2 for a two-node test."],
+    "notes": ["Serves under the alias 'smoke', so it never replaces your 'default' model in clients' configs — but activating it still stops the running deployment (one deployment at a time)."]
+  }
+}

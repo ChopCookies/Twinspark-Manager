@@ -1,0 +1,20 @@
+[Unit]
+Description=TwinSpark controller + stable gateway
+After=network-online.target twinspark-agent.service
+Wants=network-online.target twinspark-agent.service
+
+[Service]
+User=twinspark
+Group=twinspark
+ExecStart=/opt/twinspark/venv/bin/tsm serve controller --config /etc/twinspark/controller.yaml
+Restart=on-failure
+RestartSec=3
+MemoryMax=768M
+OOMScoreAdjust=-500
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/twinspark /etc/twinspark/secrets
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>TwinSpark Manager</title>
+<link rel="stylesheet" href="css/style.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%236aa7ff' d='M13 2 4 14h6l-1 8 9-12h-6z'/></svg>" />
+</head>
+<body>
+  <div class="bg" aria-hidden="true">
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
+    <div class="orb orb-c"></div>
+  </div>
+
+  <!-- key gate -->
+  <div id="gate" class="gate hidden">
+    <form id="gate-form" class="glass gate-card">
+      <div class="brand">
+        <div class="logo"><svg viewBox="0 0 24 24"><path fill="#07101f" d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg></div>
+        <h1>TwinSpark<em>Manager</em></h1>
+        <p class="muted small" style="margin:0">Two DGX Sparks · one model · one endpoint</p>
+      </div>
+      <label class="field">
+        <span>Management API key</span>
+        <input id="gate-key" type="password" placeholder="tsm init --show → management_api_key" autocomplete="current-password" />
+      </label>
+      <p id="gate-err" class="err"></p>
+      <button class="btn primary" type="submit">Unlock</button>
+      <p class="hint">Kept in this browser tab only. Reach the manager over an SSH tunnel<br />or Tailscale — it listens on 127.0.0.1:8443 by default.</p>
+    </form>
+  </div>
+
+  <div id="shell" class="shell hidden">
+    <aside class="glass sidebar">
+      <div class="brand small">
+        <div class="logo"><svg viewBox="0 0 24 24"><path fill="#07101f" d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg></div>
+        <h1>TwinSpark<em>Manager</em></h1>
+      </div>
+      <nav id="nav" aria-label="Main navigation"></nav>
+      <div class="shell-foot">
+        <div id="conn" class="pill">connecting…</div>
+        <button id="logout" class="btn ghost sm" type="button">Lock</button>
+        <div id="version" class="version"></div>
+      </div>
+    </aside>
+    <main id="main" class="main" tabindex="-1"></main>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="js/app.js"></script>
+</body>
+</html>

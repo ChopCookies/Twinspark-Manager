@@ -1,0 +1,63 @@
+{
+  "name": "glm-5.3-flash-nvfp4-tp2",
+  "description": "GLM-5.3-Flash on the RedHatAI NVFP4 checkpoint (compressed-tensors, corruption-free), TP2 across both Sparks, native MTP k=3, 262K context.",
+  "tags": ["glm", "moe", "agentic", "mtp", "community"],
+  "simple": {
+    "model": "RedHatAI/GLM-5.3-Flash-NVFP4",
+    "quantization": "nvfp4",
+    "topology": "tp2",
+    "context_length": 262144,
+    "concurrency": 4,
+    "thinking": true,
+    "tool_calling": true,
+    "api_alias": "default",
+    "extra_aliases": ["glm"]
+  },
+  "behaviour": {
+    "reasoning_parser": "deepseek_r1",
+    "tool_call_parser": "glm47",
+    "manage_thinking_kwarg": false,
+    "temperature": 0.6
+  },
+  "advanced": {
+    "kv_dtype": "fp8_e4m3",
+    "block_size": 2304,
+    "prefix_cache": true,
+    "max_num_seqs": 4,
+    "max_num_batched_tokens": 4096,
+    "gpu_memory_utilization": 0.85,
+    "eager_mode": true,
+    "trust_remote_code": true,
+    "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
+    "extra_vllm_flags": {"moe-backend": "marlin", "language-model-only": true},
+    "head_start_delay_s": 25
+  },
+  "runtime_adapter": "tonyd2wild",
+  "distributed_backend": "mp",
+  "verification": "community",
+  "image_hint": "ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2",
+  "source": {
+    "title": "GLM-5.3-Flash NVFP4 (RedHatAI) — TP2 + MTP3",
+    "url": "https://github.com/himorishige/glm53-flash-2x-dgx-spark-recipe",
+    "author": "himorishige (settings), tonyd2wild (image), RedHatAI (checkpoint)",
+    "kv_bytes_per_token": 7000,
+    "measured": {
+      "single_stream_tok_s": 26.5,
+      "aggregate_c4_tok_s": 57.7,
+      "aggregate_c8_tok_s": 76.2,
+      "kv_pool": "7.48 GiB ≈ 1.15M tokens at 262K",
+      "boot": "~13-15 min (checkpoint load dominates)"
+    },
+    "requirements": [
+      "Weights RedHatAI/GLM-5.3-Flash-NVFP4 (184 GiB) on both nodes — you staged revision 18d55bfd on 2026-09-28; Pin with model ref 18d55bfd5a2194887738da73753975c9d3842f46 to keep exactly that snapshot.",
+      "Image ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 (Pin resolves the multi-arch digest; the first activation pulls it on both nodes).",
+      "The himorishige repo also bind-mounts sparse_attn_indexer_kpool_sm121.py (SM121 top-k fix). If loading fails with a sparse-MLA / top-k assert, package that file as a mod (run.sh copying it over vLLM's copy) and add it to advanced.mods."
+    ],
+    "notes": [
+      "Use the RedHatAI checkpoint, not ModelOpt NVFP4 builds: those emit intermittent corrupted tokens in vLLM (#54150).",
+      "Dropping eager mode (CUDA graphs) measured +22-38% decode on RedHatAI weights (chishiki37) — try it once this profile is known-good: set advanced.eager_mode=false in a new revision.",
+      "reasoning parser deepseek_r1 is what the measured recipe uses; the upstream vLLM recipe uses glm47 — switch if your image ships it.",
+      "KV/token ≈ 7 KB (fp8, no drafter) per tonyd2wild's measurement; used by the planner."
+    ]
+  }
+}

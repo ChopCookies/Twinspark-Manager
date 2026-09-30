@@ -1,0 +1,136 @@
+/* Run with node --test tests/web_client.test.cjs. No browser dependencies. */
+const { test } = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+
+test("monitoring distinguishes unavailable readings and stale data from zero", () => {
+  const c = client();
+  const missing = c.run("systemNode('A', {}, [], 10)");
+  assert.match(missing, /waiting for agent/);
+  assert.match(missing, /Unavailable on this device/);
+  assert.doesNotMatch(missing, /0 GiB|0<small>%/);
+  const zero = c.run("systemNode('A', {cpu_pct:0, gpu:{power_w:0}, stale:true, error:'<offline>'}, [], 10)");
+  assert.match(zero, /stale \/ disconnected/);
+  assert.match(zero, /0<small>%/);
+  assert.match(zero, /&lt;offline&gt;/);
+});
+
+test("maintenance failure offers recovery and escapes node errors", () => {
+  const c = client();
+  const result = c.run("maintenanceProgress({state:'failed', phase:'update', order:['B','A'], index:0, error:'<unsafe text>'})");
+  assert.match(result, /Recheck progress/);
+  assert.match(result, /Release after repair/);
+  assert.match(result, /&lt;unsafe text&gt;/);
+});
+
+function client() {
+  const elements = new Map(), events = new Map(), storage = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, { value: "", textContent: "", innerHTML: "", disabled: false });
+    return elements.get(id);
+  };
+  const context = vm.createContext({
+    console, URLSearchParams, setTimeout, clearInterval, setInterval,
+    sessionStorage: { getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k) },
+    window: { addEventListener: (name, fn) => events.set(name, fn) },
+    document: { addEventListener() {}, querySelector: element },
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js/app.js"), "utf8"), context);
+  return { context, element, events, storage, run: code => vm.runInContext(code, context) };
+}
+
+test("keyless sessions navigate; locked sessions ignore navigation", () => {
+  const c = client();
+  c.run("var navigations = 0; route = () => navigations++; S.unlocked = true;");
+  c.events.get("hashchange")();
+  assert.equal(c.run("navigations"), 1);
+  c.run("S.unlocked = false");
+  c.events.get("hashchange")();
+  assert.equal(c.run("navigations"), 1);
+});
+
+test("connection errors keep the login gate closed without saving the key", async () => {
+  const c = client();
+  c.run("api = async () => { throw new ApiError('controller not reachable', 0); }; var booted = false; boot = () => { booted = true; };");
+  await c.run("unlock('candidate-key')");
+  assert.equal(c.run("booted"), false);
+  assert.equal(c.run("S.key"), "");
+  assert.equal(c.storage.has("tsm_key"), false);
+  assert.equal(c.element("#gate-err").textContent, "controller not reachable");
+});
+
+test("recipe import saves the reviewed snapshot without fetching the URL again", async () => {
+  const c = client();
+  c.run(`
+    var calls = [], destination;
+    api = async (method, path, body) => {
+      calls.push({ method, path, body });
+      if (path.endsWith('import-recipe')) return { draft: { name: 'original', simple: { model: 'org/reviewed', topology: 'tp2' }, advanced: { mods: [] }, source: { ref: body.url } }, report: {} };
+      return { name: body.name };
+    };
+    modal = async options => {
+      const input = { value: 'renamed', reportValidity: () => true };
+      await options.actions[1].validate({ querySelector: () => input });
+      return { value: 'go' };
+    };
+    toast = () => {}; go = hash => { destination = hash; };
+  `);
+  await c.run("previewImport({url:'https://example.com/recipe.yaml'})");
+  const calls = JSON.parse(c.run("JSON.stringify(calls)"));
+  assert.deepEqual(calls.map(c => c.path), ["/api/v1/cookbook/import-recipe", "/api/v1/profiles"]);
+  assert.equal(calls[0].body.preview, true);
+  assert.equal(calls[1].body.name, "renamed");
+  assert.equal(calls[1].body.simple.model, "org/reviewed");
+  assert.equal(calls[1].body.source.ref, "https://example.com/recipe.yaml");
+  assert.equal(c.run("destination"), "#/profiles/renamed");
+});
+
+test("late recipe previews cannot open over a different view", async () => {
+  const c = client();
+  c.run("api = async () => { S.gen++; return {}; }; var opened = false; importDraft = () => { opened = true; };");
+  await c.run("previewImport({text:'command: vllm serve org/model'})");
+  assert.equal(c.run("opened"), false);
+});
+
+test("search combines words with the selected filter and clear restores all rows", () => {
+  const c = client();
+  c.run(`
+    libraryToolbar('test', '', [['all', 'All'], ['tp2', 'TP2']]);
+    document.querySelector('#test-filter').value = 'all';
+    bindLibrary('test', [
+      { name: 'glm-fast', model: 'org/glm', quantization: 'nvfp4', topology: 'tp2' },
+      { name: 'glm-small', model: 'org/glm', quantization: 'bf16', topology: 'single-a' },
+      { name: 'qwen', model: 'org/qwen', quantization: 'nvfp4', topology: 'tp2' }
+    ], row => row.name, (row, filter) => filter === 'all' || row.topology === filter, 'empty');
+  `);
+  const search = c.element("#test-search"), filter = c.element("#test-filter");
+  search.value = "GLM nvfp4"; search.oninput();
+  assert.equal(c.element("#test-count").textContent, "1 of 3 shown");
+  assert.equal(c.element("#test-items").innerHTML, "glm-fast");
+  search.value = ""; search.oninput(); filter.value = "tp2"; filter.onchange();
+  assert.equal(c.element("#test-count").textContent, "2 of 3 shown");
+  search.focus = () => {};
+  c.element("#test-clear").onclick();
+  assert.equal(c.element("#test-count").textContent, "3 of 3 shown");
+  assert.equal(c.element("#test-clear").disabled, true);
+});
+
+test("invalid or duplicate overrides are not silently ignored", () => {
+  const c = client();
+  c.element("#paste-text").value = "command: vllm serve org/model";
+  for (const input of ["ctx 8192", "ctx=8192\nctx=16384", "=8192"]) {
+    c.element("#paste-over").value = input;
+    assert.throws(() => c.run("pasteBody()"), /Override line/);
+  }
+  c.element("#paste-over").value = "ctx=8192\nutil=0.85\nmode=auto";
+  assert.deepEqual(JSON.parse(c.run("JSON.stringify(pasteBody().overrides)")), { ctx: 8192, util: 0.85, mode: "auto" });
+});
+
+test("pasting text alongside a URL requires choosing the intended source", () => {
+  const c = client();
+  c.element("#paste-text").value = "command: vllm serve org/model";
+  c.element("#paste-url").value = "https://example.com/recipe.yaml";
+  assert.throws(() => c.run("pasteBody()"), /either a recipe URL or pasted text/);
+});

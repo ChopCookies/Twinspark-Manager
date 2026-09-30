@@ -1,0 +1,22 @@
+[Unit]
+Description=TwinSpark agent (typed container/runtime actions)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+User=twinspark
+Group=docker
+ExecStart=/opt/twinspark/venv/bin/tsm serve agent --config /etc/twinspark/agent.yaml
+Restart=on-failure
+RestartSec=3
+# lightweight + never the OOM victim before vLLM
+MemoryMax=512M
+OOMScoreAdjust=-500
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/twinspark /var/cache/twinspark /etc/twinspark/secrets
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

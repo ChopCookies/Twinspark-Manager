@@ -1,0 +1,80 @@
+{
+  "name": "mimo-v2.6-flash-tp2",
+  "description": "Xiaomi MiMo-V2.6-Flash-RL (309B/15B active, native MXFP4 experts + FP8 attention), TP2 across both Sparks, 300K context, fp8 KV.",
+  "tags": [
+    "mimo",
+    "moe",
+    "coding",
+    "experimental"
+  ],
+  "simple": {
+    "model": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "quantization": "mxfp4",
+    "topology": "tp2",
+    "context_length": 300000,
+    "concurrency": 8,
+    "thinking": false,
+    "tool_calling": true,
+    "api_alias": "default",
+    "extra_aliases": [
+      "mimo"
+    ]
+  },
+  "behaviour": {
+    "reasoning_parser": "qwen3",
+    "tool_call_parser": "qwen3_xml",
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "manage_thinking_kwarg": false,
+    "repetition_penalty": 1.05,
+    "max_tokens": 32768
+  },
+  "advanced": {
+    "kv_dtype": "fp8",
+    "prefix_cache": true,
+    "max_num_seqs": 8,
+    "gpu_memory_utilization": 0.9,
+    "trust_remote_code": true,
+    "mods": [
+      "mimo-v26-tp2-fixes"
+    ],
+    "download_include": [
+      "dflash/*"
+    ],
+    "env": {
+      "VLLM_USE_DEEP_GEMM": "0"
+    },
+    "extra_vllm_flags": {
+      "moe-backend": "marlin",
+      "generation-config": "auto"
+    }
+  },
+  "runtime_adapter": "tonyd2wild",
+  "distributed_backend": "mp",
+  "verification": "experimental",
+  "image_hint": "ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2",
+  "source": {
+    "title": "MiMo-V2.6-Flash-RL — TP2, 300K, fp8 KV",
+    "url": "https://github.com/tonyd2wild/MiMo-V2.6-Flash-2x-DGX-Spark",
+    "author": "tonyd2wild (recipe + image), Plaaasma / MiaAI-Lab (alternatives)",
+    "measured": {
+      "single_stream_tok_s": 53.3,
+      "aggregate_c6_tok_s": 155.8,
+      "ttft_s": 0.37,
+      "kv_pool": "1.87M tokens (12.6 GiB, fp8, 300K)",
+      "note": "numbers include the bundled DFlash drafter (k=7); without it expect roughly half on code"
+    },
+    "requirements": [
+      "Mod mimo-v26-tp2-fixes on both nodes: the four vLLM patches from the recipe repo (fused fp8 QKV loading for TP2, SupportsEagle3 marker, fp8 KV pass-through, drafter value scale) packaged as a mod with a run.sh that applies them — TP2 loads wrong weights without the QKV fix.",
+      "Weights XiaomiMiMo/MiMo-V2.6-Flash-RL (~178 GB) incl. the bundled dflash/ drafter directory (download_include).",
+      "Image ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 (the same image as the GLM recipes)."
+    ],
+    "notes": [
+      "The checkpoint's generation_config sets max_new_tokens=2048, which cuts reasoning mid-thought; this profile overrides it (max_tokens 32768).",
+      "Near-greedy defaults make long tool sessions repeat the same call; repetition_penalty 1.05 is the recipe's fix.",
+      "To enable the bundled DFlash drafter (k=7), stage it as a loadable directory (see the eugr mimo-v2.6-flash mod) and add a speculative_config — measured ~2x on code.",
+      "Parser names qwen3 / qwen3_xml follow the upstream MiMo vLLM recipe; users of this image report its tool parser truncating some string arguments — see the recipe thread before relying on tool calls."
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "title": "DeepSeek V4 Flash 0731 — B12X + DSpark (your proven setup)",
+  "url": "https://github.com/eugr/spark-vllm-docker/blob/main/recipes/deepseek-v4-flash-0731.yaml",
+  "author": "eugr/spark-vllm-docker (captured from this rig on 2026-09-28)",
+  "verification": "verified",
+  "measured": {
+    "context": "max-model-len auto → 1,048,576 tokens on this rig",
+    "speculation": "DSpark, 5 tokens, probabilistic drafting",
+    "gpu_memory_utilization": "0.85"
+  },
+  "requirements": [
+    "Local image vllm-node-b12x on BOTH nodes — already built on this rig (spark-vllm-docker build-and-copy.sh with --exp-b12x). Pin uses the local image ID and checks it is identical on both nodes.",
+    "Mod instanttensor-hybrid-draft-loader on both nodes: `tsm mods import-eugr ~/spark-vllm-docker/mods --only instanttensor-hybrid-draft-loader`.",
+    "Weights deepseek-ai/DeepSeek-V4-Flash-0731 (~155 GiB) — already in your HF cache on both nodes."
+  ],
+  "notes": [
+    "This is byte-for-byte the recipe the running deployment was started with; TwinSpark only replaces host/port wiring and adds NCCL/RoCE env from controller.yaml.",
+    "Stop the eugr-launched vllm_node containers before the first TwinSpark activation (Diagnostics → foreign containers)."
+  ]
+}

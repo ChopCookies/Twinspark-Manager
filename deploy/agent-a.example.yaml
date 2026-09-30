@@ -1,0 +1,9 @@
+# /etc/twinspark/agent.yaml — Node A
+node: {node_id: A, role: agent}
+listener: {bind: 127.0.0.1, port: 9443}      # controller runs on the same box
+secrets_dir: /etc/twinspark/secrets
+runtime_mode: dry-run                        # switch to "docker" after checking `tsm plan`
+runtime:
+  vllm_port: 8100
+  hf_cache_dir: /var/lib/twinspark/hf-cache
+  compile_cache_dir: /var/cache/twinspark/compile

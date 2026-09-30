@@ -1,0 +1,67 @@
+{
+  "name": "glm-5.3-flash-nvfp4-dflash2-tp2",
+  "description": "GLM-5.3-Flash RedHatAI NVFP4, TP2, DFlash2 block-diffusion drafter k=7 — the fastest published dual-Spark GLM lane for code/structured output.",
+  "tags": ["glm", "moe", "dflash2", "experimental"],
+  "simple": {
+    "model": "RedHatAI/GLM-5.3-Flash-NVFP4",
+    "quantization": "nvfp4",
+    "topology": "tp2",
+    "context_length": 262144,
+    "concurrency": 6,
+    "thinking": true,
+    "tool_calling": true,
+    "api_alias": "default",
+    "extra_aliases": ["glm"]
+  },
+  "behaviour": {
+    "reasoning_parser": "deepseek_r1",
+    "tool_call_parser": "glm47",
+    "manage_thinking_kwarg": false,
+    "temperature": 0.6
+  },
+  "advanced": {
+    "dtype": "bfloat16",
+    "kv_dtype": "fp8",
+    "block_size": 2304,
+    "prefix_cache": true,
+    "max_num_seqs": 6,
+    "max_num_batched_tokens": 32768,
+    "gpu_memory_utilization": 0.85,
+    "eager_mode": true,
+    "trust_remote_code": true,
+    "speculative_config": {
+      "method": "dflash",
+      "model": "incoai/GLM-5.3-Flash-DFlash2",
+      "num_speculative_tokens": 7,
+      "draft_tensor_parallel_size": 1
+    },
+    "extra_models": ["incoai/GLM-5.3-Flash-DFlash2"],
+    "extra_vllm_flags": {"moe-backend": "marlin", "language-model-only": true},
+    "head_start_delay_s": 25
+  },
+  "runtime_adapter": "tonyd2wild",
+  "distributed_backend": "mp",
+  "verification": "experimental",
+  "image_hint": "ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2",
+  "source": {
+    "title": "GLM-5.3-Flash NVFP4 (RedHatAI) — TP2 + DFlash2 k=7",
+    "url": "https://github.com/seanlinmt/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark",
+    "author": "seanlinmt / tonyd2wild (recipe + image), incoai (drafter)",
+    "kv_bytes_per_token": 9178,
+    "measured": {
+      "single_stream_tok_s": 46.9,
+      "structured_tok_s": "54-61 (temp 0)",
+      "aggregate_c6_tok_s": 56.2,
+      "kv_pool": "581,040 tokens at 262K",
+      "boot": "~15 min"
+    },
+    "requirements": [
+      "Everything from glm-5.3-flash-nvfp4-tp2, plus the drafter repo incoai/GLM-5.3-Flash-DFlash2 on both nodes (staged automatically; Pin pins its commit and injects it into speculative_config).",
+      "EXPERIMENTAL: the speculative-config keys follow vLLM's dflash method; compare `tsm plan` with the recipe's launch script once before the first activation."
+    ],
+    "notes": [
+      "DFlash2 acceptance is content dependent: ~7/7 on structured text, ~5/7 on code, ~1-2/7 on prose.",
+      "KV/token ≈ 9.2 KB with the drafter (tonyd2wild)."
+    ]
+  }
+}

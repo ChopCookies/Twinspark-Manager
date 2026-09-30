@@ -1,0 +1,49 @@
+{
+  "name": "qwen3.8-flash-next-nvfp4-tp2",
+  "description": "Qwen3.8-Flash-Next NVFP4 (125B/~6B active hybrid MoE), TP2 + expert parallel, MTP3, FULL_DECODE_ONLY CUDA graphs, 262K context.",
+  "tags": ["qwen", "moe", "mtp", "experimental"],
+  "simple": {
+    "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "quantization": "nvfp4",
+    "topology": "tp-ep",
+    "context_length": 262144,
+    "concurrency": 8,
+    "thinking": true,
+    "tool_calling": true,
+    "api_alias": "default",
+    "extra_aliases": ["qwen"]
+  },
+  "behaviour": {
+    "reasoning_parser": "qwen3",
+    "tool_call_parser": "hermes",
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20
+  },
+  "advanced": {
+    "kv_dtype": "fp8",
+    "prefix_cache": true,
+    "max_num_batched_tokens": 32768,
+    "gpu_memory_utilization": 0.85,
+    "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
+    "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"}
+  },
+  "runtime_adapter": "custom",
+  "distributed_backend": "mp",
+  "verification": "experimental",
+  "image_hint": null,
+  "source": {
+    "title": "Qwen3.8-Flash-Next NVFP4 — TP2+EP, MTP3",
+    "url": "https://github.com/getrefined/Qwen3.8-Flash-Next-NVFP4-vLLM-DGX-Spark",
+    "author": "getrefined (vLLM lane), MiaAI-Lab (SGLang lane)",
+    "measured": {"single_stream_tok_s": 55.8, "aggregate_c8_tok_s": 126.1},
+    "requirements": [
+      "An image with Qwen3.8-Flash-Next support for sm_121 — pin the one from the recipe repo (Pin → image).",
+      "The 47.7 GiB n-gram (PLE) table stays resident at TP2 unless the image carries the disk-backed patch; keep torch.compile off when it is resident (a second table copy can reboot the Sparks)."
+    ],
+    "notes": [
+      "Native context 262K (YaRN to ~1M). Artificial Analysis rates it very verbose.",
+      "Experimental: flags follow the published recipe; verify with `tsm plan` against the pinned image."
+    ]
+  }
+}

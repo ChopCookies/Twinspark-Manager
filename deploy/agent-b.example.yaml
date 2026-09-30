@@ -1,0 +1,9 @@
+# /etc/twinspark/agent.yaml — Node B
+node: {node_id: B, role: agent}
+listener: {bind: 192.168.100.2, port: 9443}  # QSFP IP only — not reachable from the LAN
+secrets_dir: /etc/twinspark/secrets
+runtime_mode: dry-run
+runtime:
+  vllm_port: 8100
+  hf_cache_dir: /var/lib/twinspark/hf-cache
+  compile_cache_dir: /var/cache/twinspark/compile

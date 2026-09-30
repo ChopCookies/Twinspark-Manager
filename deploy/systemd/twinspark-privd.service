@@ -1,0 +1,15 @@
+[Unit]
+Description=TwinSpark privileged helper (drop page cache, headless switch)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/opt/twinspark/venv/bin/tsm serve privd --socket /run/twinspark/privd.sock --group twinspark
+Restart=on-failure
+User=root
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

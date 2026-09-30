@@ -1,0 +1,35 @@
+# /etc/twinspark/controller.yaml — Node A (Controller + Gateway)
+node: {node_id: A, role: controller, hostname: spark-a}
+db_path: /var/lib/twinspark/state.db
+secrets_dir: /etc/twinspark/secrets
+
+# Management API: localhost only. Reach it via `ssh -L 8443:localhost:8443 spark-a`
+# or bind to the Tailscale IP (100.x.y.z) instead.
+listener: {bind: 127.0.0.1, port: 8443}
+# Stable OpenAI endpoint for clients. Requires inference_api_key (tsm init).
+gateway_listener: {bind: 0.0.0.0, port: 8000}
+
+nodes:
+  A:
+    agent_url: http://127.0.0.1:9443
+    qsfp_ip: 192.168.100.1          # IP on the direct QSFP link
+    qsfp_iface: enp1s0f1np1         # check with `ip -br addr`
+    rdma_hcas: [rocep1s0f1, roceP2p1s0f1]   # both PCIe halves — `tsm rdma` prints yours
+    ib_gid_index: 3                          # RoCE v2 IPv4 GID
+  B:
+    agent_url: http://192.168.100.2:9443   # agent on B, reached over the QSFP link
+    qsfp_ip: 192.168.100.2
+    qsfp_iface: enp1s0f1np1
+    ssh_user: twinspark             # rsync target user for weight sync A -> B
+    rdma_hcas: [rocep1s0f1, roceP2p1s0f1]   # both PCIe halves — `tsm rdma` prints yours
+    ib_gid_index: 3                          # RoCE v2 IPv4 GID
+
+runtime:
+  vllm_port: 8100                   # internal; must NOT collide with a hand-started vLLM
+  hf_cache_dir: /var/lib/twinspark/hf-cache
+  compile_cache_dir: /var/cache/twinspark/compile
+  health_timeout_s: 1800
+  drain_timeout_s: 30
+
+autostart: true                     # re-activate / adopt the last healthy model at boot
+auto_rollback: true

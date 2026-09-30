@@ -1,0 +1,65 @@
+{
+  "name": "smollm2-135m-pp2",
+  "description": "Small development checkpoint; eager, 1K context.",
+  "simple": {
+    "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "quantization": "bf16",
+    "topology": "pp2",
+    "context_length": 1024,
+    "memory_strategy": "balanced",
+    "concurrency": 1,
+    "thinking": false,
+    "tool_calling": false,
+    "api_alias": "dev"
+  },
+  "behaviour": {
+    "reasoning_parser": null,
+    "tool_call_parser": null,
+    "chat_template": null,
+    "chat_template_kwargs": {},
+    "temperature": null,
+    "top_p": null,
+    "top_k": null,
+    "min_p": null,
+    "repetition_penalty": null,
+    "max_tokens": null
+  },
+  "advanced": {
+    "dtype": "bfloat16",
+    "kv_dtype": null,
+    "attention_backend": null,
+    "weight_loader": "safetensors",
+    "eager_mode": true,
+    "chunked_prefill": null,
+    "prefix_cache": false,
+    "max_num_seqs": null,
+    "max_num_batched_tokens": 1024,
+    "gpu_memory_utilization": 0.025,
+    "trust_remote_code": false,
+    "speculative_config": null,
+    "env": {
+      "NCCL_IB_HCA": "rocep1s0f1",
+      "NCCL_IB_GID_INDEX": "3",
+      "NCCL_IB_DISABLE": "0",
+      "VLLM_USE_V2_MODEL_RUNNER": "0"
+    },
+    "extra_vllm_flags": {
+      "kv-cache-memory-bytes": 33554432
+    }
+  },
+  "runtime_adapter": "eugr",
+  "distributed_backend": "auto",
+  "verification": "experimental",
+  "tags": [],
+  "identity": {
+    "model_repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+    "model_revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+    "quantization": "bf16",
+    "image": "vllm-node-b12x",
+    "image_digest": "sha256:d43f15877df4176dfc70b7ebca336d5de698e1696da02fc3738b0338a65f5db2",
+    "image_source": "local",
+    "vllm_version": "0.1.dev19023+g30038602b.d20260805",
+    "cuda_version": "13.0.2",
+    "pytorch_version": "2.12.0+cu130"
+  }
+}

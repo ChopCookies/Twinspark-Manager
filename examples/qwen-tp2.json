@@ -1,0 +1,32 @@
+{
+  "name": "qwen-flash-tp2",
+  "description": "Example only — replace repo, commit sha, image and digest with verified values",
+  "simple": {
+    "model": "ORG/MODEL-NVFP4",
+    "quantization": "nvfp4",
+    "topology": "tp2",
+    "context_length": 131072,
+    "concurrency": 4,
+    "thinking": true,
+    "tool_calling": true,
+    "api_alias": "default"
+  },
+  "behaviour": {
+    "reasoning_parser": "qwen3",
+    "tool_call_parser": "hermes",
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20
+  },
+  "advanced": {"kv_dtype": "fp8", "prefix_cache": true},
+  "runtime_adapter": "eugr",
+  "distributed_backend": "auto",
+  "identity": {
+    "model_repo": "ORG/MODEL-NVFP4",
+    "model_revision": "0000000000000000000000000000000000000000",
+    "quantization": "nvfp4",
+    "image": "docker.io/ORG/spark-vllm",
+    "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "vllm_version": "FILL-ME"
+  }
+}
