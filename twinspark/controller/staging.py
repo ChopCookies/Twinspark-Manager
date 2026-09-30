@@ -113,7 +113,13 @@ class WeightsStager:
                     task["task_id"], timeout=3 * 3600, poll=self.poll,
                     on_progress=self._progress(job, step, f"node {target}: "),
                     cancel_check=cancel_check)
-                if (res.get("result") or {}).get("verified"):
+                result = res.get("result") or {}
+                if result.get("dry_run"):
+                    notes.append(f"verification simulated on {target}")
+                elif result.get("verified"):
                     notes.append(f"verified on {target}")
+                else:
+                    raise StageError(f"verification failed on node {target}: "
+                                     f"{result.get('note') or 'no verified checksum result'}")
             notes.append(f"copied {src}→{target}")
         return f"{repo}@{rev[:8]} on {', '.join(nodes)} ({'; '.join(notes)})"
