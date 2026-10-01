@@ -28,7 +28,7 @@ include = ["twinspark*"]
 
 [tool.setuptools.package-data]
 twinspark = ["cookbook/recipes/*.json", "cookbook/recipes/*.yaml", "cookbook/recipes/*.yml",
-             "web/dist/*.html", "web/dist/css/*.css", "web/dist/js/*.js"]
+             "web/dist/*.html", "web/dist/css/*.css", "web/dist/js/*.js", "web/dist/vendor/*"]
 
 [tool.ruff]
 line-length = 120
@@ -40,6 +40,7 @@ ignore = ["B008"]                    # FastAPI's Depends() in argument defaults
 
 [tool.ruff.lint.per-file-ignores]
 "twinspark/api/*" = ["B904"]         # HTTPException re-raised from the handler is intended
+"scripts/*" = ["E402", "B905"]       # dev scripts put the repo on sys.path before importing it
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

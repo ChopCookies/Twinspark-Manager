@@ -357,6 +357,7 @@ async function viewDashboard() {
     ]);
     let job = null;
     if (st.current_job) job = await GET("/api/v1/jobs/" + enc(st.current_job)).catch(() => null);
+    if (!profs.length && !st.active && !S.startSeen) { S.startSeen = true; go("#/start"); return; }
     render(g, dashboardHtml(st, series, profs, job));
   };
   onAct({
@@ -390,6 +391,7 @@ function dashboardHtml(st, series, profs, job) {
     </div></div>`;
 
   if (job) html += jobBanner(job);
+  if (!act && !job) html += `<div class="callout info"><div><b>New here?</b> The <a href="#/start">Get started</a> checklist shows what is set up and what is next.</div></div>`;
   if (["running", "failed"].includes(st.maintenance?.state)) html += `<div class="callout warn"><div><b>Cluster reserved for maintenance</b> · ${esc(st.maintenance.phase)}${st.maintenance.error ? ` · ${esc(st.maintenance.error)}` : ""} <a href="#/updates">Open update progress</a></div></div>`;
   if (down) html += `<div class="callout bad"><div><b>Model is down:</b> ${esc(down.down_reason)}${inc && inc.action ? ` — ${esc(inc.action)}` : ""}</div></div>`;
   else if (inc && Date.now() / 1000 - inc.at < 3600) html += `<div class="callout warn"><div><b>Incident ${esc(ago(inc.at))}:</b> ${esc(inc.problem)} → ${esc(inc.action)}</div></div>`;

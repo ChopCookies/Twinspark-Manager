@@ -100,6 +100,10 @@ class RuntimeSettings(BaseModel):
     verify_hashes: bool = True             # sha256 vs. the Hub's LFS metadata
     sync_streams: int = Field(default=4, ge=1, le=16)   # parallel rsync over QSFP
     ssh_cipher: str = "aes128-gcm@openssh.com"
+    # Dedicated key + known_hosts for A -> B weight sync (written by `tsm setup`). Unset: the
+    # service user's default ~/.ssh identities are used.
+    ssh_key: Optional[str] = None
+    ssh_known_hosts: Optional[str] = None
 
     @field_validator("shm_size")
     @classmethod

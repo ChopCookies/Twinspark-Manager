@@ -1,5 +1,5 @@
 [Unit]
-Description=TwinSpark privileged helper (drop page cache, headless switch)
+Description=TwinSpark privileged helper (drop page cache, headless mode, node power)
 After=local-fs.target
 
 [Service]

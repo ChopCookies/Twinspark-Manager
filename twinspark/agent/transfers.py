@@ -167,6 +167,10 @@ def ssh_command(rt: "RuntimeSettings") -> list[str]:
            "-o", "ServerAliveCountMax=6", "-o", "Compression=no", "-T"]
     if rt.ssh_cipher:
         cmd += ["-c", rt.ssh_cipher]
+    if rt.ssh_key:
+        cmd += ["-i", rt.ssh_key, "-o", "IdentitiesOnly=yes"]
+    if rt.ssh_known_hosts:
+        cmd += ["-o", f"UserKnownHostsFile={rt.ssh_known_hosts}"]
     return cmd
 
 

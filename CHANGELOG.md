@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — quick start, error testing, remote management
+
+### Setup and first run (milestone 1)
+
+- `install.sh` + `tsm setup`: one command per node. Detects the QSFP interface, RoCE devices and GID
+  index, an existing Hugging Face cache, docker access, the Tailscale address and taken ports; writes
+  validated `controller.yaml` / `agent.yaml`, the secret vault, a dedicated SSH sync key and systemd units.
+  Starts in dry-run. `--yes` for unattended installs, `--dry` to preview, `--root DIR` for a sandbox.
+- Node B joins with a single pasted **join code** (`tsm setup --join …`, `tsm join-code` prints it again):
+  shared secrets, addresses and node A's sync key (authorised only from node A's QSFP address).
+- `tsm go-live [--revert]`, `tsm rdma --apply`, `tsm --version`.
+- **Get started** page + `GET /api/v1/system/onboarding`: live checklist with the exact next command.
+- `tsm demo` / `twinspark.demo.DemoCluster`: the whole stack (two agents, controller, gateway, GUI) on
+  loopback for trying the product and for process-level tests.
+- New `runtime.ssh_key` / `runtime.ssh_known_hosts` settings; generated systemd units keep the model
+  cache and sync key writable under `ProtectSystem=strict` (the previous example unit could not write
+  `known_hosts`, which breaks weight sync when the agent runs under systemd).
+- README rewritten around the quick start; development notes moved to `docs/development.md`.
+
 ## 0.4.1 — 2026-10-01
 
 - Prepare pinned recipes in a background job without stopping the active model:

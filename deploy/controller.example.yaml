@@ -1,3 +1,4 @@
+# Reference only — `sudo tsm setup` writes this file for you (and keeps it up to date).
 # /etc/twinspark/controller.yaml — Node A (Controller + Gateway)
 node: {node_id: A, role: controller, hostname: spark-a}
 db_path: /var/lib/twinspark/state.db

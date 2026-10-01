@@ -1,3 +1,4 @@
+# Reference only — `sudo tsm setup` writes this file for you (and keeps it up to date).
 # /etc/twinspark/agent.yaml — Node A
 node: {node_id: A, role: agent}
 listener: {bind: 127.0.0.1, port: 9443}      # controller runs on the same box

@@ -34,6 +34,8 @@ from typing import Any, Optional
 
 import httpx
 
+from . import __version__
+
 DEFAULT_API = "http://127.0.0.1:8443"
 DEFAULT_SECRETS = "/etc/twinspark/secrets"
 
@@ -743,6 +745,32 @@ def cmd_rdma(args, api: Api):
             print(f"  note: {r['suggestion']['note']}")
         if not r.get("perftest"):
             print("  (install perftest for `tsm link --mode rdma`)")
+    if getattr(args, "apply", False):
+        _rdma_apply(args, res)
+
+
+def _rdma_apply(args, res: dict) -> None:
+    from .provision import Layout, SetupError, set_node_fields
+    path = Path(args.config) if args.config else Layout(Path(args.root)).controller_yaml
+    if not path.exists():
+        sys.exit(f"{path} not found — run this on the controller node (or pass --config)")
+    changed = []
+    for n, r in sorted(res.items()):
+        sug = r.get("suggestion") if isinstance(r, dict) else None
+        if not sug or not sug.get("hcas"):
+            why = (r or {}).get("error") or (sug or {}).get("note") or "no RoCE device"
+            print(f"node {n}: nothing to apply ({why})")
+            continue
+        try:
+            if set_node_fields(path, n, sug["hcas"], sug["gid_index"]):
+                changed.append(n)
+        except SetupError as exc:
+            sys.exit(str(exc))
+    if changed:
+        print(f"updated {path} for node(s) {', '.join(changed)}")
+        print("restart to apply: sudo systemctl restart twinspark-controller")
+    else:
+        print("controller.yaml already matches the discovered values")
 
 
 def cmd_link(args, api: Api):
@@ -879,6 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key", default=None, help="management API key (default: $TSM_KEY or the local vault)")
     p.add_argument("--secrets-dir", default=os.environ.get("TSM_SECRETS", DEFAULT_SECRETS))
     p.add_argument("--json", action="store_true", help="print raw JSON")
+    p.add_argument("--version", action="version", version=f"tsm {__version__}")
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
 
     def cmd(name, fn, help_, aliases=()):
@@ -978,7 +1007,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--nodes")
 
     cmd("doctor", cmd_doctor, "check everything a fast, stable dual-Spark setup needs")
-    cmd("rdma", cmd_rdma, "discover RoCE devices / GID index and compare with controller.yaml")
+    s = cmd("rdma", cmd_rdma, "discover RoCE devices / GID index and compare with controller.yaml")
+    s.add_argument("--apply", action="store_true", help="write the discovered values into controller.yaml")
+    s.add_argument("--config", help="controller.yaml (default /etc/twinspark/controller.yaml)")
+    s.add_argument("--root", default="/")
     s = cmd("link", cmd_link, "QSFP link test between the nodes")
     s.add_argument("--mode", choices=["tcp", "rdma"], default="tcp")
     s.add_argument("--duration", type=float, default=5.0)
@@ -999,6 +1031,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ref")
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
+
+    from . import cli_setup
+    cli_setup.add_parsers(sub, cmd)
+    from . import demo
+    demo.add_parsers(sub, cmd)
     return p
 
 
@@ -1010,7 +1047,8 @@ def main(argv=None) -> int:
         return 0
     if args.fn is cmd_serve and args.what in ("controller", "agent") and not args.config:
         p.error("serve controller|agent needs --config")
-    api = None if args.fn in (cmd_init, cmd_serve) else Api(args.api, _key(args), args.json)
+    api = None if getattr(args.fn, "local", False) or args.fn in (cmd_init, cmd_serve) \
+        else Api(args.api, _key(args), args.json)
     args.fn(args, api)
     return 0
 

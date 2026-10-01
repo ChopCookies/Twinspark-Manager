@@ -1,3 +1,4 @@
+# Reference only — `sudo tsm setup` writes this file for you (and keeps it up to date).
 # /etc/twinspark/agent.yaml — Node B
 node: {node_id: B, role: agent}
 listener: {bind: 192.168.100.2, port: 9443}  # QSFP IP only — not reachable from the LAN

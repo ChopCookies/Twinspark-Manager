@@ -37,7 +37,9 @@ function client() {
     window: { addEventListener: (name, fn) => events.set(name, fn) },
     document: { addEventListener() {}, querySelector: element },
   });
-  vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js/app.js"), "utf8"), context);
+  for (const file of ["app.js", "start.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js", file), "utf8"), context, { filename: file });
+  }
   return { context, element, events, storage, run: code => vm.runInContext(code, context) };
 }
 
@@ -180,4 +182,32 @@ test("pasting text alongside a URL requires choosing the intended source", () =>
   c.element("#paste-text").value = "command: vllm serve org/model";
   c.element("#paste-url").value = "https://example.com/recipe.yaml";
   assert.throws(() => c.run("pasteBody()"), /either a recipe URL or pasted text/);
+});
+
+test("get-started checklist highlights the next step, escapes node errors and shows commands", () => {
+  const c = client();
+  const html = c.run(`startHtml(${JSON.stringify({
+    done: 1, total: 3, complete: false, next: "link", dry_run: true,
+    steps: [
+      { id: "nodes", title: "Both Sparks are connected", status: "done", detail: "A and B reachable", required: true, fix: null },
+      { id: "link", title: "QSFP link", status: "todo", detail: "<img src=x onerror=alert(1)>", required: true,
+        fix: { command: "sudo tsm rdma --apply", href: "#/diagnostics/link", label: "Run a link test" } },
+      { id: "live", title: "Real containers", status: "todo", detail: "dry-run on A", required: false, fix: null },
+      { id: "recipe", title: "Import a recipe", status: "todo", detail: "later", required: true, fix: null },
+    ],
+  })})`);
+  assert.match(html, /1 of 3 required steps done/);
+  assert.match(html, /Dry-run mode/);
+  assert.match(html, /sudo tsm rdma --apply/);
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(html, /&lt;img src=x/);
+  assert.equal((html.match(/class="card start-step [a-z]+ accent"/g) || []).length, 1);   // exactly one highlighted step
+  assert.match(html, />suggested</);                                                        // optional todo is not "next"
+  assert.match(html, />later</);
+});
+
+test("navigation lists Get started first and routes to it", () => {
+  const c = client();
+  assert.equal(c.run("NAV[0][0]"), "start");
+  assert.ok(c.run("ROUTES[0][0].test('/start')"));
 });
