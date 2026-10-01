@@ -23,6 +23,7 @@ from ..controller.controller import BusyError, Controller, DuplicateProfileError
 from ..controller.integration import IntegrationRequest, RetryRequest, integrate, retry
 from ..cookbook import RecipeImportError, build_draft, import_text, list_recipes, recipe_detail
 from ..cookbook.remote import RemoteError, fetch_text, list_source
+from ..cookbook.updates import check_updates
 from ..schemas.job import Job
 from .deps import controller_dep, require_auth
 
@@ -138,3 +139,16 @@ async def retry_integration(job_id: str, req: RetryRequest, ctrl: Controller = D
         raise HTTPException(409, str(exc))
     except ValueError as exc:
         raise HTTPException(422, str(exc))
+
+
+@router.get("/updates")
+async def recipe_updates(profile: Optional[str] = None, ctrl: Controller = Depends(controller_dep)):
+    """Compare imported recipes with upstream; retain local edits and never overwrite a profile."""
+    if profile:
+        selected = ctrl.get_profile(profile)
+        if selected is None:
+            raise HTTPException(404, "profile not found")
+        profiles = [selected]
+    else:
+        profiles = ctrl.list_profiles()
+    return {"updates": await check_updates(ctrl, profiles)}

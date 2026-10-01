@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import re
 import time
+from copy import deepcopy
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -41,7 +43,7 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
     key = f"list:{src}"
     hit = _cache.get(key)
     if hit and not refresh and time.time() - hit[0] < _TTL:
-        return hit[1]
+        return deepcopy(hit[1])
     owner, repo, path, ref = parse_source(src)
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     c = _client(client)
@@ -59,7 +61,15 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
         raise RemoteError(f"{owner}/{repo}:{path} not found")
     if r.status_code != 200:
         raise RemoteError(f"GitHub returned HTTP {r.status_code}")
-    items = r.json() if isinstance(r.json(), list) else []
+    try:
+        items = r.json()
+    except ValueError as exc:
+        raise RemoteError("GitHub returned an invalid recipe listing") from exc
+    if not isinstance(items, list):
+        raise RemoteError("recipe source must point to a GitHub folder, not a file")
+    if any(not isinstance(it, dict) or not isinstance(it.get("name"), str)
+           or not isinstance(it.get("path"), str) for it in items):
+        raise RemoteError("GitHub returned an invalid recipe listing")
     files = [{"name": it["name"], "path": it["path"], "size": it.get("size"),
               "url": it.get("html_url"), "download_url": it.get("download_url"),
               "sha": it.get("sha")}
@@ -68,24 +78,47 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
              and not it["name"].lower().endswith(".meta.json")]
     out = {"source": src, "repo": f"{owner}/{repo}", "path": path, "ref": ref, "files": files,
            "fetched_at": time.time()}
-    _cache[key] = (time.time(), out)
+    files.sort(key=lambda item: item["name"].lower())
+    _cache[key] = (time.time(), deepcopy(out))
     return out
 
 
-def fetch_text(url: str, client: Optional[httpx.Client] = None) -> str:
-    url = raw_url(url)
-    if not url.startswith("https://"):
+def _recipe_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise RemoteError("invalid recipe URL") from exc
+    if parsed.scheme != "https" or not parsed.hostname:
         raise RemoteError("only https:// recipe URLs are accepted")
+    if parsed.username or parsed.password:
+        raise RemoteError("recipe URLs must not contain credentials")
+    return url
+
+
+def fetch_text(url: str, client: Optional[httpx.Client] = None) -> str:
+    url = _recipe_url(raw_url(url))
     c = _client(client)
     try:
-        with c.stream("GET", url) as r:
-            if r.status_code != 200:
-                raise RemoteError(f"{url} returned HTTP {r.status_code}")
-            buf = bytearray()
-            for chunk in r.iter_bytes():
-                buf += chunk
-                if len(buf) > MAX_RECIPE_BYTES:
-                    raise RemoteError("recipe file larger than 512 KiB")
+        for _ in range(6):
+            with c.stream("GET", url, follow_redirects=False) as r:
+                if r.is_redirect:
+                    if not r.headers.get("location"):
+                        raise RemoteError("recipe redirect has no destination")
+                    target = str(r.url.join(r.headers["location"]))
+                    if urlsplit(target).scheme != "https":
+                        raise RemoteError("recipe redirect must stay on https://")
+                    url = _recipe_url(target)
+                    continue
+                if r.status_code != 200:
+                    raise RemoteError(f"{url} returned HTTP {r.status_code}")
+                buf = bytearray()
+                for chunk in r.iter_bytes():
+                    buf += chunk
+                    if len(buf) > MAX_RECIPE_BYTES:
+                        raise RemoteError("recipe file larger than 512 KiB")
+                break
+        else:
+            raise RemoteError("too many recipe redirects")
     except httpx.HTTPError as exc:
         raise RemoteError(f"cannot fetch {url} ({type(exc).__name__})") from exc
     finally:

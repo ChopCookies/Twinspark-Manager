@@ -188,6 +188,38 @@ test("automatic preparation ignores profile responses arriving after navigation"
   assert.equal(c.run("destination"), undefined);
 });
 
+test("recipe update review shows retained conflicts and escapes source changes", () => {
+  const c = client();
+  const html = c.run("recipeUpdateHtml({profile:'chat',previous_sha256:'a'.repeat(64),sha256:'b'.repeat(64),preserved:['simple.context_length'],conflicts:['simple.context_length'],changes:[{field:'image_hint',before:'old',after:'<new>'}]})");
+  assert.match(html, /separate profile/);
+  assert.match(html, /Both you and upstream changed/);
+  assert.match(html, /Your values are retained/);
+  assert.match(html, /&lt;new&gt;/);
+  assert.doesNotMatch(html, /<new>/);
+});
+
+test("source update preparation uses its merged snapshot without a second fetch", async () => {
+  const c = client();
+  c.run(`
+    var calls = [], destination;
+    busy = (btn, fn) => fn(); toast = () => {}; go = hash => { destination = hash; };
+    api = async (method,path,body) => {
+      calls.push({path,body});
+      if (path.includes('/updates')) return {updates:[{profile:'chat',status:'changed',previous_sha256:'aaa',sha256:'bbb',preserved:[],conflicts:[],changes:[],preview:{draft:{name:'chat-update',simple:{model:'org/new'},advanced:{mods:[]}},report:{}}}]};
+      return {job_id:'updated-job'};
+    };
+    modal = async options => {
+      await options.actions[2].validate({querySelector:()=>({value:'chat-update',reportValidity:()=>true})});
+      return {value:'prepared'};
+    };
+  `);
+  await c.run("checkRecipeUpdate('chat', null)");
+  const calls = JSON.parse(c.run('JSON.stringify(calls)'));
+  assert.deepEqual(calls.map(x => x.path), ['/api/v1/cookbook/updates?profile=chat','/api/v1/cookbook/integrate']);
+  assert.equal(calls[1].body.draft.simple.model, 'org/new');
+  assert.equal(c.run('destination'), '#/jobs/updated-job');
+});
+
 test("late recipe previews cannot open over a different view", async () => {
   const c = client();
   c.run("api = async () => { S.gen++; return {}; }; var opened = false; importDraft = () => { opened = true; };");

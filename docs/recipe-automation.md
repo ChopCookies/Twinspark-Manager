@@ -26,6 +26,34 @@ tag. If pinning failed, it is attempted again. If the profile was edited, reload
 it and use **Pin & prepare** instead; retries cannot overwrite those edits.
 Interrupted jobs are recorded as failed on controller restart and can be retried.
 
+## Recipe updates
+
+Imports now record the recipe's SHA-256, actual import source, template overrides,
+and original settings. Built-in receipts also track sidecar metadata. Pasted and
+local-file imports record a fingerprint but have no upstream URL to check.
+
+Open **Cookbook → Recipe updates** to check imported sources automatically, or
+use **Check recipe updates** on an individual profile. Requests sharing a source
+use one fetch per check; at most four remote fetches run at once. One unreachable
+or malformed source does not prevent other recipes from being checked.
+
+If upstream changed, TwinSpark compares the original imported settings, your
+current working draft, and the new recipe. It applies upstream changes to fields
+you have not customized, retains your local settings, and flags fields changed
+on both sides. The review shows the resulting changes and retained conflicts.
+Arrays, including raw flags and patch lists, are kept as whole settings.
+
+**Import & prepare** creates a uniquely named `<profile>-update` experiment from
+that reviewed result. The original profile, immutable revisions, and running
+deployment are preserved. Updates remain experimental until runtime tests pass.
+Existing imports without receipts can be re-imported to enable tracking.
+
+Headless clients can use `GET /api/v1/cookbook/updates` or
+`GET /api/v1/cookbook/updates?profile=<name>`. Each entry reports `current`,
+`changed`, `untracked`, or `error`; changed entries include a reviewed draft,
+changed fields, preserved customizations, and conflicts. Submit that draft to the
+integration API below to prepare it without fetching its source again.
+
 ## Management API
 
 The authenticated API supports the same workflow without a browser:

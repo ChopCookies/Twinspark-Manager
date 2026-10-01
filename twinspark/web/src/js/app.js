@@ -643,6 +643,14 @@ async function automateRecipe(name, btn) {
   });
   if (job && current(g)) { toast("pinning and preparing recipe…"); go("#/jobs/" + enc(job.job_id)); }
 }
+async function checkRecipeUpdate(name, btn) {
+  const g = S.gen;
+  const data = await busy(btn, () => GET('/api/v1/cookbook/updates' + qs({profile:name})));
+  if (!current(g)) return;
+  const update = data.updates[0];
+  if (update.status === 'changed') await importDraft({...update.preview, update});
+  else toast(update.message || 'Recipe source is up to date', update.status === 'error' ? 'bad' : 'good');
+}
 async function pinFlow(name) {
   const p = await GET(`/api/v1/profiles/${enc(name)}`);
   const d = p.draft || {}; const id = d.identity;
@@ -677,11 +685,13 @@ async function viewProfile(name, tab) {
       <button class="btn" data-act="prepare" ${st.busy ? "disabled" : ""}>${last && !hasEdits ? "Prepare recipe" : "Pin &amp; prepare"}</button>
       <button class="btn ${last ? "" : "primary"}" data-act="pin">${icon("pin")}${last ? "Re-pin" : "Pin"}</button>
       <button class="btn" data-act="duplicate">Duplicate</button>
+      ${d?.source?.receipt ? '<button class="btn" data-act="recipe-update">Check recipe updates</button>' : ''}
       <button class="btn danger" data-act="delete" ${isActive ? "disabled" : ""}>Delete</button>
     </div></div>
     ${hasEdits ? `<div class="callout warn"><div><b>Your draft has unpinned changes.</b> Re-pin to run these settings. Switching to the latest revision uses the previously pinned settings.</div></div>` : ""}
     <div class="tabs">${tabs.map(([id, l]) => `<a href="#/profiles/${enc(name)}/${id}" class="${tab === id ? "active" : ""}">${esc(l)}</a>`).join("")}</div>`;
   const common = {
+    'recipe-update': el => checkRecipeUpdate(name, el),
     prepare: async (el) => {
       if (!last || hasEdits) await automateRecipe(name, el);
       else await prepareFlow(name, el);
@@ -979,7 +989,7 @@ async function viewAudit() {
 /* ============================== cookbook ============================== */
 async function viewCookbook(tab) {
   const g = S.gen;
-  const tabs = [["builtin", "Built-in recipes"], ["community", "Community (GitHub)"], ["paste", "Paste / URL"]];
+  const tabs = [["builtin", "Built-in recipes"], ["community", "Community (GitHub)"], ["paste", "Paste / URL"], ["updates", "Recipe updates"]];
   const head = `<div class="view-head"><div><p class="eyebrow">Discover · adapt · experiment</p><h1>Cookbook</h1><p>A starting point for your two Sparks. Browse a recipe, make it your own, and keep each experiment reproducible.</p></div><a class="btn" href="#/profiles">Your profiles →</a></div>
     <ol class="recipe-steps" aria-label="Recipe workflow"><li><span>1</span><div><b>Import a recipe</b><small>Review settings and requirements</small></div></li><li><span>2</span><div><b>Make it yours</b><small>Adjust and pin a profile</small></div></li><li><span>3</span><div><b>Plan, then run</b><small>Check both nodes before switching</small></div></li></ol>
     <div class="tabs">${tabs.map(([id, l]) => `<a href="#/cookbook/${id}" class="${tab === id ? "active" : ""}">${esc(l)}</a>`).join("")}</div>`;
@@ -998,6 +1008,7 @@ async function viewCookbook(tab) {
     "paste-preview": (el) => busy(el, () => previewImport(pasteBody(), $("#paste-name").value.trim())),
   };
   onAct(acts);
+  if (tab === 'updates') return viewRecipeUpdates(g, head);
   if (tab === "community") return viewCookbookCommunity(g, head, false);
   if (tab === "paste") {
     render(g, `<div class="view">${head}<div class="card"><div class="form" style="grid-template-columns:2fr 1fr">
@@ -1032,6 +1043,35 @@ async function viewCookbookCommunity(g, head, refresh) {
   render(g, `<div class="view">${head}${data.sources.map(src => `<div class="card"><div class="card-head"><h2 class="mono">${esc(src.source)}</h2><button class="btn sm" data-act="refresh">Refresh</button></div>
     ${src.error ? `<div class="callout warn"><div>${esc(src.error)}</div></div>` : src.files.length ? `<div class="table-wrap"><table><tbody>${src.files.map(f => `<tr><td class="mono">${esc(f.name)}</td><td class="num small muted">${bytes(f.size)}</td><td class="actions">${f.url ? `<a class="btn sm ghost" href="${esc(f.url)}" target="_blank" rel="noopener">GitHub</a>` : ""}<button class="btn sm primary" data-act="preview" data-url="${esc(f.download_url || f.url)}" data-name="${esc(f.name)}">Preview &amp; import</button></td></tr>`).join("")}</tbody></table></div>` : empty("No recipe files")}
     </div>`).join("")}<p class="small muted">Add more folders with <span class="mono">recipe_sources</span> in controller.yaml (owner/repo:path[@ref]).</p></div>`);
+}
+async function viewRecipeUpdates(g, head) {
+  let updates = [];
+  const draw = async () => {
+    if (!current(g)) return;
+    render(g, `<div class="view">${head}<div class="card"><div class="loading"><span class="spin"></span> checking imported recipe sources…</div></div></div>`);
+    try {
+      const data = await GET('/api/v1/cookbook/updates');
+      if (!current(g)) return;
+      updates = data.updates;
+      render(g, `<div class="view">${head}<div class="card"><div class="card-head"><h2>Imported recipe sources</h2><button class="btn" data-act="updates-check">Check again</button></div>
+        <p class="small muted">Local settings are retained. Updates create a separate experiment; your existing profiles and running deployment stay in place. Conflicts are shown before import.</p>
+        ${updates.length ? `<div class="table-wrap"><table><thead><tr><th>Profile</th><th>Source status</th><th>Changes</th><th></th></tr></thead><tbody>${updates.map((u,i) => `<tr><td><a href="#/profiles/${enc(u.profile)}">${esc(u.profile)}</a><div class="sub mono">${esc(u.ref || 'No tracked source')}</div></td><td>${tag({current:'Up to date',changed:'Update found',error:'Check failed',untracked:'Local recipe'}[u.status] || u.status,{current:'good',changed:'info',error:'warn'}[u.status] || 'muted')}</td><td>${u.status === 'changed' ? `${num(u.changes.length)} settings${u.conflicts.length ? ` · ${num(u.conflicts.length)} conflicts kept local` : ''}` : esc(u.message || '')}</td><td>${u.status === 'changed' ? `<button class="btn sm primary" data-act="update-review" data-index="${i}">Review &amp; prepare</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : empty('No imported recipes','Import a recipe from the Cookbook or a URL to track its source.')}</div></div>`);
+    } catch (e) {
+      if (current(g)) render(g, `<div class="view">${head}<div class="callout warn">${esc(e.message)} <button class="btn" data-act="updates-check">Try again</button></div></div>`);
+    }
+  };
+  onAct({ 'updates-check': draw, 'update-review': el => {
+    const update = updates[Number(el.dataset.index)];
+    return importDraft({...update.preview, update});
+  } });
+  await draw();
+}
+function recipeUpdateHtml(update) {
+  if (!update) return '';
+  return `<div class="callout info"><div>Updated source for <b>${esc(update.profile)}</b> · ${esc(sha(update.previous_sha256))} → ${esc(sha(update.sha256))}. This becomes a separate profile.</div></div>
+    ${update.preserved.length ? `<p class="small">Your adjustments are retained: ${update.preserved.map(esc).join(', ')}.</p>` : ''}
+    ${update.conflicts.length ? `<div class="callout warn"><div><b>Both you and upstream changed these settings.</b> Your values are retained: ${update.conflicts.map(esc).join(', ')}. Review the complete profile before preparing.</div></div>` : ''}
+    ${update.changes.length ? `<details open><summary>Settings changed (${update.changes.length})</summary><div class="table-wrap"><table><thead><tr><th>Setting</th><th>Current</th><th>Updated</th></tr></thead><tbody>${update.changes.map(c => `<tr><td class="mono">${esc(c.field)}</td><td class="mono small">${esc(JSON.stringify(c.before))}</td><td class="mono small">${esc(JSON.stringify(c.after))}</td></tr>`).join('')}</tbody></table></div></details>` : '<p class="small muted">Source content changed; your effective settings are retained.</p>'}`;
 }
 function pasteBody() {
   const url = $("#paste-url").value.trim(), text = $("#paste-text").value;
@@ -1087,6 +1127,7 @@ async function importDraft(pv, suggested) {
     body: `${pv.exists ? `<div class="callout warn"><div>A profile named <b>${esc(name)}</b> exists — choose another name.</div></div>` : ""}
       <label class="field"><span>Profile name</span><input id="imp-name" required maxlength="63" pattern="[a-z0-9][a-z0-9._\\-]{0,62}" value="${esc(suggested || (pv.exists ? name.slice(0, 61) + "-2" : name))}"/><span class="help">Lowercase letters, numbers, dots, underscores and hyphens.</span></label>
       <div class="callout info"><div>Import &amp; prepare automatically pins the models and image, checks both nodes, and downloads missing weights. The current deployment keeps serving. You can also import only and customize first. Required patches must already be installed.</div></div>
+      ${recipeUpdateHtml(pv.update)}
       ${reportHtml(pv.report, pv.draft)}
       ${(pv.draft.source?.requirements || []).length ? `<div class="section-title">Requirements</div><ul class="plain">${pv.draft.source.requirements.map(r => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}
       <details><summary>All profile settings</summary>${codeBlock(JSON.stringify(pv.draft, null, 2))}</details>`,
