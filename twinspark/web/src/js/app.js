@@ -187,7 +187,7 @@ async function confirmBox(title, text, { label = "Confirm", danger = false, type
   return value === true;
 }
 /** form modal: fields [{id,label,value,placeholder,help,type,options}] → values or null */
-async function formBox(title, fields, { label = "OK", intro = "", wide = false } = {}) {
+async function formBox(title, fields, { label = "OK", intro = "", wide = false, validate = null } = {}) {
   const body = (intro ? `<div>${intro}</div>` : "") + fields.map(f => {
     if (f.type === "check") return `<label class="check"><input type="checkbox" id="f-${f.id}" ${f.value ? "checked" : ""}/> ${esc(f.label)}</label>`;
     if (f.type === "select") return `<label class="field"><span>${esc(f.label)}</span><select id="f-${f.id}">${f.options.map(o => `<option value="${esc(o[0])}" ${o[0] === f.value ? "selected" : ""}>${esc(o[1])}</option>`).join("")}</select>${f.help ? `<span class="help">${esc(f.help)}</span>` : ""}</label>`;
@@ -199,10 +199,10 @@ async function formBox(title, fields, { label = "OK", intro = "", wide = false }
     title, body, wide,
     actions: [{ label: "Cancel", value: false }, {
       label, value: true, cls: "primary",
-      validate: (root) => {
+      validate: async (root) => {
         values = {};
         fields.forEach(f => { const el = root.querySelector("#f-" + f.id); values[f.id] = f.type === "check" ? el.checked : el.value.trim(); });
-        return true;
+        return validate ? await validate(values) : true;
       },
     }],
   });
@@ -573,7 +573,7 @@ async function viewProfiles() {
     const state = p.active ? tag("active", "good") : p.pinned ? tag("pinned " + (p.latest?.label || ""), "info") : tag("draft — not pinned", "warn");
     return `<div class="item ${p.active ? "active" : ""}"><div class="l">
         <div class="t"><a href="#/profiles/${enc(p.name)}">${esc(p.name)}</a> ${state} ${p.draft_differs ? tag("unpinned edits", "warn") : ""} ${verifTag(p.verification)} ${p.latest?.known_good ? tag("known-good", "good") : ""}</div>
-        <div class="d mono">${esc(p.model)} · ${esc(p.topology)} · ${esc(p.quantization)}${p.mods.length ? " · mods: " + esc(p.mods.join(", ")) : ""}</div>
+        <div class="d mono">${esc(p.model)}${p.secondary_model ? " + " + esc(p.secondary_model) : ""} · ${esc(p.topology)} · ${esc(p.quantization)}${p.mods.length ? " · mods: " + esc(p.mods.join(", ")) : ""}</div>
         ${p.description ? `<div class="d">${esc(p.description)}</div>` : ""}
         ${(p.warnings || []).filter(w => !w.startsWith("not pinned")).map(w => `<div class="d" style="color:var(--warn)">⚠ ${esc(w)}</div>`).join("")}
       </div><div class="actions">
@@ -583,7 +583,7 @@ async function viewProfiles() {
       </div></div>`;
   };
   if (!render(g, `<div class="view"><div class="view-head"><div><p class="eyebrow">Your experiments</p><h1>Profiles</h1><p>Keep a baseline, duplicate it, and try a new configuration. Pin a draft when it is ready to run.</p></div>
-    <div class="row"><a class="btn" href="#/cookbook">Import from cookbook</a><button class="btn" data-act="new">New from JSON</button></div></div>
+    <div class="row"><a class="btn" href="#/cookbook">Import from cookbook</a><button class="btn" data-act="split">Combine two recipes</button><button class="btn" data-act="new">New from JSON</button></div></div>
     ${libraryToolbar("profiles", "Search model, profile or topology…", [["all", "All profiles"], ["active", "Active"], ["draft", "Not pinned"], ["pinned", "Pinned"], ["edited", "Unpinned edits"]])}
     <div class="list" id="profiles-items"></div></div>`)) return;
   bindLibrary("profiles", rows, item, (p, filter) => filter === "all" ||
@@ -591,6 +591,7 @@ async function viewProfiles() {
     (filter === "pinned" && p.pinned) || (filter === "edited" && p.draft_differs),
     empty("Your first experiment starts with a recipe", "Open the Cookbook to import a configuration, then adjust it here."));
   onAct({
+    split: () => splitFlow(rows),
     activate: (el) => activateFlow(el.dataset.name, "latest", el),
     pin: (el) => pinFlow(el.dataset.name).then(ok => ok && route()),
     new: async () => {
@@ -610,6 +611,26 @@ async function activateFlow(name, revision = "latest", btn = null) {
   const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/activate${qs({ revision })}`));
   toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
 }
+async function splitFlow(rows) {
+  const choices = rows.filter(p => p.topology !== "split").map(p => [p.name, `${p.name} · ${p.model}`]);
+  if (!choices.length) throw new Error("Import a recipe first, then combine two profiles.");
+  const v = await formBox("Two models across both nodes", [
+    { id: "name", label: "Combined profile name", value: "dual-model" },
+    { id: "node_a", label: "Recipe on node A", type: "select", options: choices },
+    { id: "alias_a", label: "Model name for node A", value: "default" },
+    { id: "node_b", label: "Recipe on node B", type: "select", options: choices, value: choices[Math.min(1, choices.length - 1)][0] },
+    { id: "alias_b", label: "Model name for node B", value: "secondary" },
+  ], { label: "Combine", intro: "Each node gets its own model, image, settings and API model name. The recipes are copied into this profile; later edits of the originals stay independent.",
+    validate: async (values) => {
+      if (values.alias_a === values.alias_b) throw new Error("Use different model names for A and B.");
+      return await POST("/api/v1/profiles/compose/split", values);
+    } });
+  if (v) go("#/profiles/" + enc(v.name));
+}
+async function prepareFlow(name, btn) {
+  const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/prepare`));
+  toast("checking recipe and staging weights…"); go("#/jobs/" + enc(job.job_id));
+}
 async function pinFlow(name) {
   const p = await GET(`/api/v1/profiles/${enc(name)}`);
   const d = p.draft || {}; const id = d.identity;
@@ -617,7 +638,7 @@ async function pinFlow(name) {
     { id: "model_ref", label: "Model revision", value: "", placeholder: id ? `keep ${sha(id.model_revision, 12)} (or: main / a 40-char sha)` : "main (or a branch / 40-char sha)", help: `Resolved against the Hub for ${d.simple?.model || "the model"} — the exact commit gets recorded.` },
     { id: "image", label: "Container image", value: "", placeholder: d.image_hint || (id ? `keep ${id.image}` : "ghcr.io/org/image:tag or local tag"), help: "Registry refs are pinned to their multi-arch digest; a local tag (eugr build) is pinned to its image ID, which must match on both nodes." },
     { id: "note", label: "Note (optional)", value: "" },
-  ], { label: "Pin", intro: `<div class="small muted">Pinning turns the working draft into an immutable revision you can switch to. Extra models (drafters) are pinned too.</div>` });
+  ], { label: "Pin", intro: `<div class="small muted">Pinning turns the working draft into an immutable revision you can switch to. Extra models (drafters) are pinned too.${d.secondary ? " Both models are pinned together. These overrides apply to A; B uses the image and revision in its settings." : ""}</div>` });
   if (!v) return false;
   const body = {}; if (v.model_ref) body.model_ref = v.model_ref; if (v.image) body.image = v.image; if (v.note) body.note = v.note;
   toast("pinning — resolving commit and image…");
@@ -641,6 +662,7 @@ async function viewProfile(name, tab) {
       <h1>${esc(name)} ${isActive ? tag("active", "good") : last ? tag("pinned " + last.label, "info") : tag("draft", "warn")} ${d ? verifTag(d.verification) : ""}</h1><p>${esc(p.description || d?.description || "")}</p></div>
     <div class="row">
       ${last ? `<button class="btn primary" data-act="activate" ${isActive || st.busy ? "disabled" : ""}>${icon("play")}Switch to latest</button>` : ""}
+      <button class="btn" data-act="prepare" ${st.busy ? "disabled" : ""}>${last && !hasEdits ? "Prepare recipe" : "Pin &amp; prepare"}</button>
       <button class="btn ${last ? "" : "primary"}" data-act="pin">${icon("pin")}${last ? "Re-pin" : "Pin"}</button>
       <button class="btn" data-act="duplicate">Duplicate</button>
       <button class="btn danger" data-act="delete" ${isActive ? "disabled" : ""}>Delete</button>
@@ -648,6 +670,10 @@ async function viewProfile(name, tab) {
     ${hasEdits ? `<div class="callout warn"><div><b>Your draft has unpinned changes.</b> Re-pin to run these settings. Switching to the latest revision uses the previously pinned settings.</div></div>` : ""}
     <div class="tabs">${tabs.map(([id, l]) => `<a href="#/profiles/${enc(name)}/${id}" class="${tab === id ? "active" : ""}">${esc(l)}</a>`).join("")}</div>`;
   const common = {
+    prepare: async (el) => {
+      if ((!last || hasEdits) && !await pinFlow(name)) return;
+      await prepareFlow(name, el);
+    },
     activate: (el) => activateFlow(name, "latest", el),
     pin: () => pinFlow(name).then(ok => ok && route()),
     duplicate: async () => {
@@ -677,6 +703,10 @@ async function profileOverview(name, p, d) {
   if (s.thinking && !b.reasoning_parser) warnings.push("thinking is on but no reasoning parser is set");
   if (s.tool_calling && !b.tool_call_parser) warnings.push("tool calling is on but no tool-call parser is set");
   let html = "";
+  if (d.secondary) {
+    const second = d.secondary;
+    html += `<div class="card accent"><h2>Two independent models</h2><div class="kv"><b>Node A</b><span class="mono">${esc(s.model)} · ${esc(s.api_alias)}</span><b>Node B</b><span class="mono">${esc(second.simple.model)} · ${esc(second.simple.api_alias)}</span><b>B image</b><span class="mono">${esc(second.identity?.image || second.image_hint || "not pinned")}</span><b>B context</b><span>${esc(second.simple.context_length)} tokens</span></div><p class="small muted">Quick settings apply to A. Edit the secondary section in Full draft for B. Prepare checks both nodes and stages each model on its assigned node.</p>${(second.source?.requirements || []).length ? `<h3>Node B requirements</h3><ul class="plain">${second.source.requirements.map(r => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}</div>`;
+  }
   if (!p.revisions.length) html += `<div class="callout warn"><div><b>Not pinned yet.</b> Pin resolves the model commit and the image digest (and checks a local image is identical on both nodes). Then it can be switched to.</div></div>`;
   if (warnings.length) html += `<div class="callout warn"><div>${warnings.map(esc).join("<br>")}</div></div>`;
   html += `<div class="grid cols-2"><div class="card"><h2>What gets served</h2><div class="kv">
@@ -709,6 +739,7 @@ async function profileOverview(name, p, d) {
 }
 function fitHtml(fit) {
   if (!fit) return empty("Unavailable");
+  if (fit.nodes) return Object.entries(fit.nodes).map(([node, detail]) => `<div class="section-title">Node ${esc(node)} · ${esc(detail.model)}</div>${fitHtml(detail)}`).join('<hr class="sep">');
   let h = "";
   if (!fit.known) h += `<p class="muted small">${esc(fit.note || "model size unknown")}</p>`;
   else {
@@ -779,7 +810,7 @@ async function profilePlan(name, p, ref) {
   const plan = data.plan;
   let h = `<div class="card"><div class="card-head"><h2>Exact commands</h2><div class="row"><span class="small muted">render</span><select id="plan-src" style="width:auto"><option value="draft" ${src === "draft" ? "selected" : ""}>working draft</option>${revs.length ? `<option value="latest" ${src === "latest" ? "selected" : ""}>latest revision</option>` : ""}${revs.map(r => `<option value="${esc(r)}" ${src === r ? "selected" : ""}>${esc(r)}</option>`).join("")}</select></div></div>`;
   if (data.unpinned) h += `<div class="callout warn" style="margin-bottom:12px"><div>Draft — the model sha and image digest below are placeholders until you pin.</div></div>`;
-  h += `<div class="kv" style="margin-bottom:12px"><b>Backend</b><span>${esc(plan.backend)}</span><b>GPU memory util.</b><span>${esc(plan.gpu_memory_utilization)}</span><b>Routes</b><span>${Object.entries(plan.routes).map(([a, u]) => `${tag(a, "info")} → <span class="mono">${esc(u.join(", "))}</span>`).join("<br>")}</span></div>`;
+  h += `<div class="kv" style="margin-bottom:12px"><b>Backend</b><span>${esc(plan.backend)}</span><b>GPU memory util.</b><span>${Object.entries(plan.node_utilization || {}).map(([n,v]) => `Node ${esc(n)}: ${esc(v)}`).join(" · ") || esc(plan.gpu_memory_utilization)}</span><b>Routes</b><span>${Object.entries(plan.routes).map(([a, u]) => `${tag(a, "info")} → <span class="mono">${esc(plan.route_models?.[a] || plan.served_model_name)} @ ${esc(u.join(", "))}</span>`).join("<br>")}</span></div>`;
   if (plan.notes.length) h += `<ul class="plain" style="margin-bottom:12px">${plan.notes.map(n => `<li class="${n.startsWith("WARNING") ? "" : "muted"}" ${n.startsWith("WARNING") ? 'style="color:var(--warn)"' : ""}>${esc(n)}</li>`).join("")}</ul>`;
   plan.start_order.forEach((wave, i) => {
     wave.forEach(cname => {
@@ -856,6 +887,10 @@ async function viewJob(id) {
   onAct({
     cancel: async () => { const r = await POST(`/api/v1/jobs/${enc(id)}/cancel`); toast(r.note); },
     logs: () => go("#/logs"),
+    "prepared-activate": async (el) => {
+      const job = await GET(`/api/v1/jobs/${enc(id)}`);
+      await activateFlow(job.payload.profile, job.profile_revision, el);
+    },
   });
   if (await draw()) {
     const t = setInterval(async () => { if (!current(g)) return clearInterval(t); try { if (!await draw()) clearInterval(t); } catch (e) { } }, 1500);
@@ -866,9 +901,9 @@ function jobHtml(job) {
   const running = ["running", "pending"].includes(job.state);
   const activation = ["activation", "rollback", "recovery"].includes(job.kind);
   const done = Object.fromEntries((job.steps || []).map(s => [s.stage, s]));
-  const stages = activation ? STAGES : (job.steps || []).map(s => s.stage);
+  const stages = activation ? STAGES : job.kind === "prepare" ? STAGES.slice(0, 4) : (job.steps || []).map(s => s.stage);
   const pl = job.payload || {};
-  const title = activation ? `${job.kind === "activation" ? "Switch to" : job.kind === "rollback" ? "Roll back to" : "Recover"} ${pl.profile || ""} ${pl.label || ""}` : job.kind === "stage" ? `Stage ${pl.repo || ""}@${sha(pl.revision, 8)}` : job.kind;
+  const title = activation ? `${job.kind === "activation" ? "Switch to" : job.kind === "rollback" ? "Roll back to" : "Recover"} ${pl.profile || ""} ${pl.label || ""}` : job.kind === "prepare" ? `Prepare ${pl.profile || ""} ${pl.revision || ""}` : job.kind === "stage" ? `Stage ${pl.repo || ""}@${sha(pl.revision, 8)}` : job.kind;
   let h = `<div class="view"><div class="view-head"><div><div class="crumbs"><a href="#/jobs">Jobs</a> / <span class="mono">${esc(job.job_id)}</span></div>
     <h1>${esc(title)} ${tag(job.state, { completed: "good", failed: "bad", running: "info", cancelled: "muted" }[job.state] || "muted")}</h1><p>started ${esc(when(job.created_at))} · ${esc(dur(job.created_at, running ? null : job.updated_at))}</p></div>
     <div class="row">${running ? `<button class="btn danger" data-act="cancel">Cancel</button>` : ""}${activation ? `<button class="btn" data-act="logs">Container logs</button>` : ""}${pl.profile ? `<a class="btn" href="#/profiles/${enc(pl.profile)}">Profile</a>` : ""}</div></div>`;
@@ -877,6 +912,7 @@ function jobHtml(job) {
   } else if (job.state === "completed" && activation) {
     h += `<div class="callout good"><div><b>Serving.</b> ${pl.kv && pl.kv.kv_cache_tokens ? `KV pool ${num(pl.kv.kv_cache_tokens)} tokens. ` : ""}${pl.max_model_len ? `max_model_len ${num(pl.max_model_len)}.` : ""}</div></div>`;
   }
+  if (job.kind === "prepare") h += `<div class="callout ${job.state === "completed" ? "good" : "info"}"><div><b>${job.state === "completed" ? "Preparation complete." : "Preparing recipe."}</b> Images, patches and weights are checked without switching the current deployment.${pl.dry_run ? " This was a simulation; real hardware still needs testing." : ""}${job.state === "completed" ? '<div class="row" style="margin-top:10px"><button class="btn primary" data-act="prepared-activate">Switch to prepared revision</button></div>' : ""}</div></div>`;
   for (const w of pl.warnings || []) h += `<div class="callout warn"><div>${esc(w)}</div></div>`;
   h += `<div class="card"><div class="timeline">`;
   for (const st of stages) {
@@ -949,9 +985,13 @@ async function viewCookbook(tab) {
     render(g, `<div class="view">${head}<div class="card"><div class="form" style="grid-template-columns:2fr 1fr">
       <label class="field"><span>Recipe URL (GitHub blob/raw or any https)</span><input id="paste-url" placeholder="https://github.com/eugr/spark-vllm-docker/blob/main/recipes/….yaml"/></label>
       <label class="field"><span>Profile name (optional)</span><input id="paste-name" placeholder="from the recipe"/></label></div>
+      <label class="field" style="margin-top:12px"><span>Open a recipe file</span><input id="recipe-file" type="file" accept=".yaml,.yml,.json"/><span class="help">YAML or JSON, up to 512 KiB. You can review and edit it below.</span></label>
       <label class="field" style="margin-top:12px"><span>…or paste an eugr YAML recipe / TwinSpark JSON</span><textarea id="paste-text" rows="16" spellcheck="false" placeholder="name: …&#10;container: vllm-node&#10;command: |&#10;  vllm serve org/model --tensor-parallel-size 2 …"></textarea></label>
       <label class="field" style="margin-top:12px"><span>Template overrides (eugr defaults, one key=value per line — like run-recipe -e)</span><textarea id="paste-over" rows="3" spellcheck="false" placeholder="max_model_len=262144"></textarea></label>
       <div class="row end" style="margin-top:12px"><button class="btn primary" data-act="paste-preview">Preview mapping</button></div></div></div>`);
+    $("#recipe-file").onchange = async (event) => {
+      try { await loadRecipeFile(event.target.files[0]); } catch (e) { toast(e.message, "bad"); }
+    };
     return;
   }
   const data = await GET("/api/v1/cookbook");
@@ -988,6 +1028,16 @@ function pasteBody() {
     Object.defineProperty(overrides, k, { value: /^-?\d+(\.\d+)?$/.test(v) ? Number(v) : v, enumerable: true });
   });
   return url ? { url, overrides } : { text, overrides };
+}
+async function loadRecipeFile(file) {
+  if (!file) return;
+  if (file.size > 512 * 1024) throw new Error("Recipe is too large. Use a YAML or JSON file under 512 KiB.");
+  const g = S.gen;
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+  if (!current(g)) return;
+  $("#paste-text").value = text;
+  $("#paste-url").value = "";
+  toast(`Loaded ${file.name} — preview before importing`);
 }
 function reportHtml(rep, draft) {
   rep = rep || {}; const s = draft.simple, a = draft.advanced;

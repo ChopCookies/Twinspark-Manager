@@ -225,6 +225,10 @@ def cmd_show(args, api: Api):
     print(f"  model        {s.get('model')}  ({s.get('quantization')}, {s.get('topology')})")
     print(f"  context      {s.get('context_length')}   concurrency {a.get('max_num_seqs') or s.get('concurrency')}")
     print(f"  aliases      {', '.join([s.get('api_alias', 'default')] + (s.get('extra_aliases') or []))}")
+    if d.get("secondary"):
+        second = d["secondary"]
+        print(f"  node B model {second['simple']['model']} ({second['simple']['api_alias']})")
+        print(f"  node B image {(second.get('identity') or {}).get('image') or second.get('image_hint')}")
     print(f"  parsers      reasoning={b.get('reasoning_parser')} tools={b.get('tool_call_parser')}")
     if a.get("speculative_config"):
         print(f"  speculative  {json.dumps(a['speculative_config'])}")
@@ -249,7 +253,10 @@ def cmd_show(args, api: Api):
     if not p["revisions"]:
         print("    (none — `tsm pin " + p["name"] + "`)")
     fit = api("GET", f"/api/v1/profiles/{args.profile}/fit")
-    if fit.get("known"):
+    if fit.get("nodes"):
+        for node, detail in fit["nodes"].items():
+            print(f"  node {node} memory: " + json.dumps(detail))
+    elif fit.get("known"):
         print(f"  memory       weights {fit['weights_gib_per_node']} GiB/node, KV pool ≈ "
               f"{fit['kv_pool_gib_per_node']} GiB/node ≈ {fit['est_kv_tokens']:,} tokens "
               f"({fit['kv_bytes_per_token_source']} KV size){'' if fit['fits'] else '  — DOES NOT FIT'}")
@@ -258,6 +265,11 @@ def cmd_show(args, api: Api):
 def cmd_fit(args, api: Api):
     fit = api("GET", f"/api/v1/profiles/{args.profile}/fit")
     if _out(api, fit):
+        return
+    if fit.get("nodes"):
+        for node, detail in fit["nodes"].items():
+            print(f"node {node}: {detail['model']}")
+            print(json.dumps(detail, indent=2))
         return
     if not fit.get("known"):
         print(fit.get("note"))
@@ -288,6 +300,10 @@ def cmd_pin(args, api: Api):
     print(f"pinned {args.profile} {rev['label']}")
     print(f"  model  {res['resolved']['model']}")
     print(f"  image  {res['resolved']['image']} ({res['resolved']['image_source']})")
+    if res["resolved"].get("secondary"):
+        second = res["resolved"]["secondary"]
+        print(f"  node B model  {second['model']}")
+        print(f"  node B image  {second['image']} ({second['image_source']})")
     for x in res["resolved"].get("extra_models") or []:
         print(f"  extra  {x}")
     for n in res.get("notes", []):
@@ -327,6 +343,8 @@ def cmd_export(args, api: Api):
     draft = p.get("draft") or (p["revisions"][-1]["draft"] if p["revisions"] else None)
     if draft is not None and not args.with_identity:
         draft.pop("identity", None)
+        if draft.get("secondary"):
+            draft["secondary"].pop("identity", None)
     print(json.dumps(draft, indent=2))
 
 
@@ -412,6 +430,23 @@ def cmd_activate(args, api: Api):
     for w in job.get("payload", {}).get("warnings", []):
         print("  warning:", w)
     print("\nOK — serving.")
+
+
+def cmd_prepare(args, api: Api):
+    job = api("POST", f"/api/v1/profiles/{args.profile}/prepare", params={"revision": args.revision})
+    print(f"preparation job {job['job_id']} — current deployment keeps serving")
+    if not args.no_wait:
+        job = _follow(api, job["job_id"])
+        _report(job)
+        print(f"prepared {job['profile_revision']} — activate this revision when ready")
+
+
+def cmd_split(args, api: Api):
+    p = api("POST", "/api/v1/profiles/compose/split", json={
+        "name": args.name, "node_a": args.node_a, "node_b": args.node_b,
+        "alias_a": args.alias_a, "alias_b": args.alias_b})
+    print(f"created {p['name']} — A: {args.node_a} ({args.alias_a}), B: {args.node_b} ({args.alias_b})")
+    print(f"review with `tsm show {p['name']}`, then pin and prepare")
 
 
 def cmd_cancel(args, api: Api):
@@ -892,11 +927,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("profile")
     s.add_argument("revision", nargs="?", default="latest")
     s.add_argument("--no-wait", action="store_true")
+    s = cmd("prepare", cmd_prepare, "check images/patches and stage a recipe without switching")
+    s.add_argument("profile")
+    s.add_argument("revision", nargs="?", default="latest")
+    s.add_argument("--no-wait", action="store_true")
+    s = cmd("split", cmd_split, "combine two recipes into one split profile")
+    s.add_argument("name")
+    s.add_argument("node_a")
+    s.add_argument("node_b")
+    s.add_argument("--alias-a", default="default")
+    s.add_argument("--alias-b", default="secondary")
     s = cmd("cancel", cmd_cancel, "cancel a running activation/staging job")
     s.add_argument("job")
     cmd("stop", cmd_stop, "drain and stop the active model")
     s = cmd("jobs", cmd_jobs, "recent jobs")
-    s.add_argument("--kind", choices=["activation", "rollback", "recovery", "stage", "stop"])
+    s.add_argument("--kind", choices=["activation", "rollback", "recovery", "stage", "prepare", "stop"])
     s.add_argument("--limit", type=int, default=30)
     s = cmd("job", cmd_job, "follow / show one job")
     s.add_argument("job")

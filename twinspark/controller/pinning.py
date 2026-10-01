@@ -24,7 +24,7 @@ from ..resolver import (
     spec_from_resolved,
     split_image_ref,
 )
-from ..schemas.profile import ImmutableIdentity
+from ..schemas.profile import ImmutableIdentity, ProfileDraft
 from .agent_client import AgentActionError
 
 if TYPE_CHECKING:
@@ -77,15 +77,8 @@ async def _registry_image(ctrl: "Controller", ref: str, nodes: list[str]) -> dic
     return {"image": name, "digest": digest, "source": "registry", "versions": versions}
 
 
-async def pin_profile(ctrl: "Controller", name: str, model_ref: Optional[str] = None,
-                      image: Optional[str] = None, local_image: Optional[str] = None,
-                      label_note: Optional[str] = None) -> dict[str, Any]:
-    p = ctrl.get_profile(name)
-    if p is None:
-        raise PinError(f"unknown profile: {name}")
-    draft = p.working_draft()
-    if draft is None:
-        raise PinError(f"profile {name} has no draft to pin")
+async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
+                     image=None, local_image=None, nodes=None) -> tuple[ProfileDraft, dict, list[str]]:
     repo = draft.simple.model
     notes: list[str] = []
     # ---- model -----------------------------------------------------------------
@@ -123,8 +116,8 @@ async def pin_profile(ctrl: "Controller", name: str, model_ref: Optional[str] = 
             else:
                 raise PinError(str(exc)) from exc
     # ---- image -----------------------------------------------------------------
-    nodes = ["A", "B"] if draft.simple.topology.value not in ("single-a", "single-b") else \
-        (["A"] if draft.simple.topology.value == "single-a" else ["B"])
+    nodes = nodes or (["A", "B"] if draft.simple.topology.value not in ("single-a", "single-b") else \
+        (["A"] if draft.simple.topology.value == "single-a" else ["B"]))
     nodes = [n for n in nodes if n in ctrl.config.nodes] or nodes
     img: Optional[dict[str, Any]] = None
     if local_image:
@@ -176,17 +169,39 @@ async def pin_profile(ctrl: "Controller", name: str, model_ref: Optional[str] = 
         cuda_version=str(versions.get("CUDA_VERSION") or "unknown"),
         pytorch_version=str(versions.get("PYTORCH_VERSION") or "unknown"),
     )
-    same = (p.latest() is not None and p.latest().identity == identity
-            and p.latest().draft.model_dump(exclude={"identity"}) == draft.model_dump(exclude={"identity"}))
-    if same:
+    pinned = draft.model_copy(update={"identity": identity}, deep=True)
+    return pinned, {"model": f"{repo}@{sha}", "image": identity.image_ref,
+                    "image_source": identity.image_source, "extra_models": extras}, notes
+
+
+async def pin_profile(ctrl: "Controller", name: str, model_ref: Optional[str] = None,
+                      image: Optional[str] = None, local_image: Optional[str] = None,
+                      label_note: Optional[str] = None) -> dict[str, Any]:
+    p = ctrl.get_profile(name)
+    if p is None:
+        raise PinError(f"unknown profile: {name}")
+    draft = p.working_draft()
+    if draft is None:
+        raise PinError(f"profile {name} has no draft to pin")
+    original = draft.model_dump(mode="json")
+    pinned, resolved, notes = await _pin_draft(
+        ctrl, draft, model_ref, image, local_image, nodes=["A"] if draft.secondary else None)
+    if draft.secondary:
+        secondary, result_b, notes_b = await _pin_draft(ctrl, draft.secondary, nodes=["B"])
+        pinned = pinned.model_copy(update={"secondary": secondary})
+        resolved["secondary"] = result_b
+        notes.extend(f"node B: {note}" for note in notes_b)
+    # Hub/image lookups may take time; do not overwrite edits made during them.
+    current = ctrl.get_profile(name)
+    if current is None or current.working_draft().model_dump(mode="json") != original:
+        raise PinError("profile changed while pinning — retry with the current draft")
+    p = current
+    if p.latest() and p.latest().draft == pinned:
         rev = p.latest()
         notes.append("nothing changed — latest revision already has these pins")
     else:
-        rev = p.add_revision(draft, identity)
+        rev = p.add_revision(pinned, pinned.identity)
         ctrl.store.save_profile(p)
         ctrl._audit("user", "profile.pin", f"profile/{name}",
-                    {"revision": rev.label, "model": f"{repo}@{sha[:12]}",
-                     "image": identity.image_ref, "note": label_note})
-    return {"revision": rev.model_dump(mode="json"), "notes": notes,
-            "resolved": {"model": f"{repo}@{sha}", "image": identity.image_ref,
-                         "image_source": identity.image_source, "extra_models": extras}}
+                    {"revision": rev.label, "resolved": resolved, "note": label_note})
+    return {"revision": rev.model_dump(mode="json"), "notes": notes, "resolved": resolved}

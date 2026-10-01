@@ -94,6 +94,9 @@ class LaunchPlan(BaseModel):
     served_model_name: str
     containers: list[ContainerSpec]
     routes: dict[str, list[str]]                     # alias -> backend base URLs
+    route_models: dict[str, str] = Field(default_factory=dict)
+    node_utilization: dict[str, float] = Field(default_factory=dict)
+    model_requirements: list[dict[str, Any]] = Field(default_factory=list)
     start_order: list[list[str]]                     # waves of container names
     wave_delays_s: list[float] = Field(default_factory=list)   # pause AFTER each wave
     gpu_memory_utilization: float
@@ -202,7 +205,31 @@ class LaunchPlanner:
         return b
 
     def plan(self, rev: ProfileRevision, gpu_memory_utilization: float,
-             backend_api_key_set: bool = True) -> LaunchPlan:
+             backend_api_key_set: bool = True,
+             node_utilization: Optional[dict[str, float]] = None) -> LaunchPlan:
+        if rev.draft.secondary:
+            plans = [self.plan(part, (node_utilization or {}).get(node) or
+                               part.draft.advanced.gpu_memory_utilization or gpu_memory_utilization,
+                               backend_api_key_set)
+                     for node, part in zip(("A", "B"), rev.parts(), strict=True)]
+            containers = [c for p in plans for c in p.containers]
+            for c in containers:
+                c.name = f"tsm-{rev.profile_name}-{c.node.lower()}-{rev.revision_id.rsplit('-', 1)[-1]}"
+                c.labels["org.twinspark.profile"] = rev.profile_name
+            return LaunchPlan(
+                revision_id=rev.revision_id, backend=DistributedBackend.NATIVE,
+                served_model_name=plans[0].served_model_name,
+                containers=containers, routes={a: u for p in plans for a, u in p.routes.items()},
+                route_models={a: m for p in plans for a, m in p.route_models.items()},
+                start_order=[[c.name for c in containers]], wave_delays_s=[0.0],
+                gpu_memory_utilization=plans[0].gpu_memory_utilization,
+                node_utilization={n: u for p in plans for n, u in p.node_utilization.items()},
+                model_requirements=[m for p in plans for m in p.model_requirements],
+                mods=list(dict.fromkeys(m for p in plans for m in p.mods)),
+                model_repo=rev.identity.model_repo, model_revision=rev.identity.model_revision,
+                notes=["split: independent models on A and B, routed by separate aliases"] +
+                      [f"node {p.nodes[0]}: {note}" for p in plans for note in p.notes],
+            )
         cfg, rt = self.config, self.config.runtime
         simple, topo = rev.draft.simple, rev.draft.simple.topology
         adv = rev.draft.advanced
@@ -300,7 +327,8 @@ class LaunchPlanner:
             head_url = f"http://{api_host('A')}:{rt.vllm_port}"
 
             if backend == DistributedBackend.NATIVE:
-                dist = ["--nnodes", "2", "--master-addr", a_ip, "--master-port", str(rt.master_port)]
+                dist = ["--distributed-executor-backend", "mp", "--nnodes", "2",
+                        "--master-addr", a_ip, "--master-port", str(rt.master_port)]
                 head_cmd = serve_args("A") + par + dist + ["--node-rank", "0"]
                 # the worker must use the same model/parallel args, no API server
                 worker_cmd = base_args + par + dist + ["--node-rank", "1", "--headless"]
@@ -346,6 +374,13 @@ class LaunchPlanner:
         return LaunchPlan(
             revision_id=rev.revision_id, backend=backend, served_model_name=served,
             containers=containers, routes=routes, start_order=order, wave_delays_s=delays,
+            route_models={alias: served for alias in routes},
+            node_utilization={n: gpu_memory_utilization for n in rev.required_nodes()},
+            model_requirements=[{"repo": rev.identity.model_repo,
+                                 "revision": rev.identity.model_revision,
+                                 "include": list(adv.download_include), "nodes": rev.required_nodes()}] +
+                               [{"repo": ref.split("@", 1)[0], "revision": ref.partition("@")[2],
+                                 "include": [], "nodes": rev.required_nodes()} for ref in adv.extra_models],
             gpu_memory_utilization=gpu_memory_utilization, mods=list(adv.mods),
             model_repo=rev.identity.model_repo, model_revision=rev.identity.model_revision,
             notes=notes,

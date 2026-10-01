@@ -356,10 +356,11 @@ class AgentActions:
     # ---- weights ------------------------------------------------------------
     def weights_present(self, params: dict) -> dict:
         repo, rev = self._repo_rev(params)
+        include = self._globs(params.get("include"))
         snap = hf_repo_dir(self.rt.hf_cache_dir, repo) / "snapshots" / rev
         if self.dry_run:
             return {"present": True, "path": str(snap), "dry_run": True}
-        return {"present": snapshot_complete(snap), "path": str(snap)}
+        return {"present": snapshot_complete(snap, include), "path": str(snap)}
 
     def weights_inventory(self, params: dict) -> dict:
         inv = scan_cache(self.rt.hf_cache_dir)

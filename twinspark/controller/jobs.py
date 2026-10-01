@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
@@ -67,6 +68,7 @@ class ActivationCoordinator:
                  gateway: "Gateway", planner: MemoryPlanner,
                  persist: Callable[[Job], None],
                  model_spec: Optional[ModelSpec] = None,
+                 model_specs: Optional[dict[str, ModelSpec]] = None,
                  poll_interval: float = 5.0,
                  cancel_check: Optional[Callable[[], bool]] = None,
                  staging_wait: Optional[Callable[[str, str], "asyncio.Future | None"]] = None):
@@ -77,6 +79,7 @@ class ActivationCoordinator:
         self.launch = LaunchPlanner(config)
         self.persist = persist
         self.model_spec = model_spec
+        self.model_specs = model_specs or {}
         self.poll = poll_interval
         self.plan: Optional[LaunchPlan] = None
         self.dry_run = False
@@ -108,14 +111,9 @@ class ActivationCoordinator:
         return await handler(job, rev, step)
 
     # ---- helpers -------------------------------------------------------------
-    def _models(self, rev: ProfileRevision) -> list[tuple[str, str, list[str]]]:
-        """(repo, sha, include-globs) for the main model and every extra (drafter) model."""
-        a = rev.draft.advanced
-        out = [(rev.identity.model_repo, rev.identity.model_revision, list(a.download_include))]
-        for ref in a.extra_models:
-            repo, _, sha = ref.partition("@")
-            out.append((repo, sha, []))
-        return out
+    def _models(self, rev: ProfileRevision):
+        return [(m["repo"], m["revision"], m["include"], m["nodes"])
+                for m in self.plan.model_requirements]
 
     def _util(self, rev: ProfileRevision, mem_total: Optional[float]) -> float:
         return rev.draft.advanced.gpu_memory_utilization or self.planner.gpu_memory_utilization(
@@ -123,49 +121,59 @@ class ActivationCoordinator:
 
     # ---- stages -----------------------------------------------------------
     async def _validate(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
-        util = rev.draft.advanced.gpu_memory_utilization
-        notes = []
-        for ref in rev.draft.advanced.extra_models:
-            if not re.match(r"^[^@\s]+/[^@\s]+@[0-9a-f]{40}$", ref):
-                raise RuntimeError(f"extra model {ref!r} is not pinned to a commit sha — pin the profile")
-        if self.model_spec is not None:
-            s = rev.draft.simple
-            common = dict(spec=self.model_spec, quant=s.quantization, topology=s.topology,
-                          backend=self.launch.resolve_backend(rev),
-                          kv_dtype=rev.draft.advanced.kv_dtype,
-                          using_cuda_graphs=not rev.draft.advanced.eager_mode,
-                          mem_total_gib=job.payload.get("mem_total_gib"))
-            budget = self.planner.estimate(
-                context_length=s.planning_context(),
-                concurrency=rev.draft.advanced.max_num_seqs or s.concurrency, **common)
-            auto_util = self.planner.gpu_memory_utilization(budget)
-            use_util = util or auto_util
-            fits, headroom = self.planner.fits(budget, use_util)
-            job.payload["memory_estimate"] = budget.as_dict()
-            if not fits:
-                # vLLM sizes the KV pool to whatever is left; it only refuses to start
-                # when the weights (+ one max-length sequence) do not fit.
-                one_ctx = s.context_length if isinstance(s.context_length, int) else 4096
-                single = self.planner.estimate(context_length=one_ctx, concurrency=1, **common)
-                ok1, head1 = self.planner.fits(single, use_util)
-                if not ok1:
-                    raise RuntimeError(
-                        f"estimated not to fit: weights {single.model_weights:.1f} GiB/node + one "
-                        f"sequence are {-head1:.1f} GiB short per node (out of memory expected)")
-                notes.append(f"KV estimate for {budget.kv_cache:.1f} GiB exceeds the pool by "
-                             f"{-headroom:.1f} GiB/node — vLLM fits fewer parallel sequences")
-            util = use_util
-            notes.append(f"estimated headroom {headroom:.1f} GiB/node")
-        else:
-            notes.append("no model spec registered — memory fit check skipped (pin the profile to fetch it)")
-        util = util or self._util(rev, job.payload.get("mem_total_gib"))
+        notes, node_utils = [], {}
+        for part in rev.parts():
+            s, a = part.draft.simple, part.draft.advanced
+            for ref in a.extra_models:
+                if not re.match(r"^[^@\s]+/[^@\s]+@[0-9a-f]{40}$", ref):
+                    raise RuntimeError(f"extra model {ref!r} is not pinned to a commit sha — pin the profile")
+            spec = self.model_specs.get(part.identity.model_repo)
+            if not rev.draft.secondary:
+                spec = spec or self.model_spec
+            nodes = part.required_nodes()
+            totals = [(job.payload.get("node_mem_total") or {}).get(n) for n in nodes]
+            totals = [t for t in totals if t]
+            mem_total = min(totals) if totals else job.payload.get("mem_total_gib")
+            util = self._util(part, mem_total)
+            if spec is not None:
+                if rev.draft.secondary:
+                    spec = replace(spec, kv_bytes_per_token=part.draft.source.get("kv_bytes_per_token"))
+                if s.topology.value in ("tp2", "tp-ep") and spec.num_attention_heads % 2:
+                    raise RuntimeError(f"{part.profile_name}: {spec.num_attention_heads} attention heads "
+                                       "cannot split over TP2 — use pp2 or a single node")
+                common = dict(spec=spec, quant=s.quantization, topology=s.topology,
+                              backend=self.launch.resolve_backend(part), kv_dtype=a.kv_dtype,
+                              using_cuda_graphs=not a.eager_mode, mem_total_gib=mem_total)
+                budget = self.planner.estimate(context_length=s.planning_context(),
+                                               concurrency=a.max_num_seqs or s.concurrency, **common)
+                util = a.gpu_memory_utilization or self.planner.gpu_memory_utilization(budget)
+                fits, headroom = self.planner.fits(budget, util)
+                job.payload.setdefault("memory_estimates", {})[part.profile_name] = budget.as_dict()
+                if not rev.draft.secondary:
+                    job.payload["memory_estimate"] = budget.as_dict()
+                if not fits:
+                    one_ctx = s.context_length if isinstance(s.context_length, int) else 4096
+                    single = self.planner.estimate(context_length=one_ctx, concurrency=1, **common)
+                    ok1, head1 = self.planner.fits(single, util)
+                    if not ok1:
+                        raise RuntimeError(f"{part.profile_name}: estimated not to fit: weights "
+                                           f"{single.model_weights:.1f} GiB/node + one sequence are "
+                                           f"{-head1:.1f} GiB short per node (out of memory expected)")
+                    notes.append(f"{part.profile_name}: KV estimate exceeds pool by {-headroom:.1f} "
+                                 "GiB/node — vLLM fits fewer parallel sequences")
+                notes.append(f"{part.profile_name}: estimated headroom {headroom:.1f} GiB/node")
+            else:
+                notes.append(f"{part.profile_name}: no model spec registered — memory check skipped")
+            node_utils.update({n: util for n in nodes})
         try:
-            self.plan = self.launch.plan(rev, util)
+            self.plan = self.launch.plan(rev, node_utils[rev.required_nodes()[0]],
+                                         node_utilization=node_utils)
         except LaunchError as exc:
             raise RuntimeError(str(exc)) from exc
         job.payload["launch_plan"] = self.plan.model_dump(mode="json")
         job.payload["warnings"] = [n for n in self.plan.notes if n.startswith("WARNING")]
-        return f"plan ready (gpu_memory_utilization={util:.2f}); " + "; ".join(notes)
+        return "plan ready (" + ", ".join(f"{n}: gpu_memory_utilization={u:.2f}"
+                                          for n, u in node_utils.items()) + "); " + "; ".join(notes)
 
     async def _resolve(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         nodes = self.plan.nodes
@@ -177,11 +185,15 @@ class ActivationCoordinator:
             hcas = self.config.nodes[n].rdma_hcas if multi else []
             pre = await self.agent(n).call("preflight", allow_owned_port=True,
                                            need_disk_gib=job.payload.get("need_disk_gib", 0),
-                                           mods=self.plan.mods, need_rdma=multi, hcas=hcas)
+                                           mods=sorted({m for c in self.plan.containers
+                                                        if c.node == n for m in c.mods}),
+                                           need_rdma=multi, hcas=hcas)
             if not pre["ok"]:
                 raise RuntimeError(f"node {n} preflight: " + "; ".join(pre["problems"]))
             warnings += [f"{n}: {w}" for w in pre.get("warnings", [])]
         self.dry_run = any(f.get("runtime_mode") == "dry-run" for f in facts.values())
+        if self.dry_run and any(f.get("runtime_mode") != "dry-run" for f in facts.values()):
+            raise RuntimeError("cannot mix simulated and real nodes in the same deployment")
         job.payload["hardware"] = {n: {k: v for k, v in f.items() if k != "foreign_inference"}
                                    for n, f in facts.items()}
         job.payload["dry_run"] = self.dry_run
@@ -190,7 +202,7 @@ class ActivationCoordinator:
             if len({d for d in drivers.values() if d}) > 1:
                 warnings.append(f"NVIDIA driver differs between nodes {drivers} — mismatched "
                                 f"drivers have cost 2x+ throughput on dual-Spark setups")
-            if self.plan.mods:
+            if multi and self.plan.mods:
                 st = {n: (await self.agent(n).call("mods_status", names=self.plan.mods))["status"]
                       for n in nodes}
                 for m in self.plan.mods:
@@ -200,9 +212,9 @@ class ActivationCoordinator:
                                            f"`tsm mods install` so both run identical patches")
         step.message = "pulling image if needed"
         self.persist(job)
-        for n in nodes:
-            await self.agent(n).call("image_ensure", image_ref=rev.identity.image_ref, timeout=3600)
-        if rev.identity.image_source == "local" and len(nodes) > 1:
+        for c in self.plan.containers:
+            await self.agent(c.node).call("image_ensure", image_ref=c.image_ref, timeout=3600)
+        if rev.identity.image_source == "local" and len(nodes) > 1 and not rev.draft.secondary:
             ids = {n: (await self.agent(n).call("image_inspect", ref=rev.identity.image_ref)).get("id")
                    for n in nodes}
             if len(set(ids.values())) > 1:
@@ -218,7 +230,7 @@ class ActivationCoordinator:
         stager = WeightsStager(self.config, self.agents, self.persist, poll=min(self.poll, 2.0),
                                dry_run=self.dry_run)
         msgs = []
-        for repo, sha, include in self._models(rev):
+        for repo, sha, include, nodes in self._models(rev):
             if self.staging_wait:
                 pending = self.staging_wait(repo, sha)
                 if pending is not None:
@@ -226,7 +238,7 @@ class ActivationCoordinator:
                     self.persist(job)
                     await pending
             try:
-                msgs.append(await stager.ensure(job, step, repo, sha, self.plan.nodes,
+                msgs.append(await stager.ensure(job, step, repo, sha, nodes,
                                                 include=include,
                                                 download_node=self.config.download_node,
                                                 cancel_check=self.cancel_check))
@@ -237,9 +249,9 @@ class ActivationCoordinator:
     async def _sync(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         # weights are staged on every plan node by DOWNLOADING; this double-checks
         # completeness right before the old model is stopped
-        for repo, sha, _ in self._models(rev):
-            for n in self.plan.nodes:
-                ok = (await self.agent(n).call("weights_present", repo=repo, revision=sha))["present"]
+        for repo, sha, include, nodes in self._models(rev):
+            for n in nodes:
+                ok = (await self.agent(n).call("weights_present", repo=repo, revision=sha, include=include))["present"]
                 if not ok:
                     raise RuntimeError(f"{repo}@{sha[:8]} is not complete on node {n}")
         return f"weights verified present on {', '.join(self.plan.nodes)}"
@@ -248,7 +260,7 @@ class ActivationCoordinator:
         # One deployment at a time: stopping owned containers takes down every
         # alias, so every serving alias is drained.
         aliases = [a for a, st in self.gateway.routes.items() if st.backends]
-        aliases = sorted(set(aliases) | set(rev.draft.simple.aliases))
+        aliases = sorted(set(aliases) | set(rev.draft.aliases))
         for a in aliases:
             self.gateway.begin_drain(a, retry_after=30)
         self.drained = aliases
@@ -287,7 +299,8 @@ class ActivationCoordinator:
                     break
                 await asyncio.sleep(min(self.poll, 3))
             total = tel.get("mem_total_gib") or 0
-            need = self.plan.gpu_memory_utilization * total
+            util = self.plan.node_utilization.get(n, self.plan.gpu_memory_utilization)
+            need = util * total
             line = f"{n}: {tel.get('mem_available_gib', 0):.1f} GiB available"
             if rec.get("dropped"):
                 freed = rec.get("privd", {}).get("freed_page_cache_gib", 0)
@@ -300,7 +313,7 @@ class ActivationCoordinator:
                     raise RuntimeError(
                         f"node {n}: only {tel['mem_available_gib']:.1f} GiB available but vLLM will "
                         f"claim {need:.1f} GiB (gpu_memory_utilization "
-                        f"{self.plan.gpu_memory_utilization:.2f} x {total:.1f} GiB) — out of memory "
+                        f"{util:.2f} x {total:.1f} GiB) — out of memory "
                         f"expected; stop other processes or lower gpu_memory_utilization")
                 if tel.get("mem_free_gib", need) + 0.5 < need:
                     report.append(f"{n}: WARNING free memory {tel['mem_free_gib']:.1f} GiB < "
@@ -344,6 +357,8 @@ class ActivationCoordinator:
                 results.append(r["healthy"])
             if all(results):
                 break
+            head = next((c for c, healthy in zip(self.plan.containers, results, strict=True)
+                         if c.health_url and not healthy), head)
             if time.monotonic() > deadline:
                 tail = (await self.agent(head.node).call("container_logs", name=head.name, tail=80))["log"]
                 err = RuntimeError(f"not healthy after {self.config.runtime.health_timeout_s}s")
@@ -364,13 +379,20 @@ class ActivationCoordinator:
                                 max(60.0, self.config.runtime.health_timeout_s / 3))
             self.persist(job)
             await asyncio.sleep(self.poll)
-        try:
-            full = (await self.agent(head.node).call("container_logs", name=head.name, tail=2000))["log"]
-            kv = kv_facts_from_log(full)
-            if kv:
-                job.payload.setdefault("kv", {}).update(kv)
-        except AgentActionError:
-            pass
+        for container in [c for c in self.plan.containers if c.health_url]:
+            try:
+                full = (await self.agent(container.node).call(
+                    "container_logs", name=container.name, tail=2000))["log"]
+                kv = kv_facts_from_log(full)
+                model = next(self.plan.route_models[a] for a, urls in self.plan.routes.items()
+                             if container.health_url in urls)
+                job.payload.setdefault("models", {}).setdefault(model, {})["kv"] = kv
+                if kv and not rev.draft.secondary:
+                    job.payload.setdefault("kv", {}).update(kv)
+            except AgentActionError:
+                pass
+        if rev.draft.secondary:
+            job.payload.pop("kv", None)
         kv = job.payload.get("kv") or {}
         extra = f"; KV pool {kv['kv_cache_tokens']:,} tokens" if kv.get("kv_cache_tokens") else ""
         return f"healthy after {time.monotonic() - started:.0f}s{extra}"
@@ -381,27 +403,34 @@ class ActivationCoordinator:
         headers = self.gateway.backend_headers()
         out = []
         async with httpx.AsyncClient(timeout=180) as client:
-            for url in {u for urls in self.plan.routes.values() for u in urls}:
+            endpoints = {(url, self.plan.route_models.get(alias, self.plan.served_model_name))
+                         for alias, urls in self.plan.routes.items() for url in urls}
+            for url, model in sorted(endpoints):
                 t0 = time.perf_counter()
                 r = await client.post(f"{url}/v1/completions", headers=headers, json={
-                    "model": self.plan.served_model_name, "prompt": "Hello", "max_tokens": 8,
+                    "model": model, "prompt": "Hello", "max_tokens": 8,
                     "temperature": 0})
                 if r.status_code != 200:
                     raise RuntimeError(f"smoke test on {url} returned {r.status_code}: {r.text[:300]}")
                 out.append(f"{(time.perf_counter() - t0) * 1000:.0f} ms")
                 try:
                     m = (await client.get(f"{url}/v1/models", headers=headers)).json()
-                    mml = m["data"][0].get("max_model_len")
+                    entry = next((item for item in m["data"] if item.get("id") == model), {})
+                    mml = entry.get("max_model_len")
                     if mml:
-                        job.payload["max_model_len"] = mml
+                        job.payload.setdefault("models", {}).setdefault(model, {})["max_model_len"] = mml
+                        if not rev.draft.secondary:
+                            job.payload["max_model_len"] = mml
                 except (httpx.HTTPError, ValueError, KeyError, IndexError):
                     pass
         return "test completion ok (" + ", ".join(out) + ")"
 
     async def _route(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         for alias, backends in self.plan.routes.items():
-            self.gateway.set_route(alias, backends, self.plan.served_model_name, rev.revision_id,
-                                   max_model_len=job.payload.get("max_model_len"))
+            model = self.plan.route_models.get(alias, self.plan.served_model_name)
+            self.gateway.set_route(alias, backends, model, rev.revision_id,
+                                   max_model_len=(job.payload.get("models") or {}).get(model, {}).get(
+                                       "max_model_len", job.payload.get("max_model_len")))
         self.drained = [a for a in self.drained if a not in self.plan.routes]
         return "routing " + ", ".join(self.plan.routes)
 

@@ -38,8 +38,9 @@ class WeightsStager:
             raise StageError(f"node {node} is not configured / agent unreachable")
         return self.agents[node]
 
-    async def present(self, node: str, repo: str, rev: str) -> bool:
-        return bool((await self.agent(node).call("weights_present", repo=repo, revision=rev))["present"])
+    async def present(self, node: str, repo: str, rev: str, include=None) -> bool:
+        return bool((await self.agent(node).call(
+            "weights_present", repo=repo, revision=rev, include=include or []))["present"])
 
     async def hf_home(self, node: str) -> str:
         if node not in self._hf_home:
@@ -66,14 +67,14 @@ class WeightsStager:
                      cancel_check: Optional[Callable[[], bool]] = None) -> str:
         include = list(include or [])
         verify = self.config.runtime.verify_hashes if verify is None else verify
-        have = {n: await self.present(n, repo, rev) for n in nodes}
+        have = {n: await self.present(n, repo, rev, include) for n in nodes}
         if all(have.values()):
             return f"{repo}@{rev[:8]} already on {', '.join(nodes)}"
         sources = [n for n in nodes if have[n]]
         if not sources:
             # another configured node may hold it even if it does not serve this plan
             for n in self.agents:
-                if n not in nodes and await self.present(n, repo, rev):
+                if n not in nodes and await self.present(n, repo, rev, include):
                     sources.append(n)
         notes = []
         if not sources:
@@ -85,7 +86,7 @@ class WeightsStager:
             await self.agent(dn).wait_task(task["task_id"], timeout=12 * 3600, poll=self.poll,
                                            on_progress=self._progress(job, step, f"node {dn}: "),
                                            cancel_check=cancel_check)
-            if not await self.present(dn, repo, rev):
+            if not await self.present(dn, repo, rev, include):
                 raise StageError(f"download finished but the snapshot is incomplete on node {dn}")
             sources = [dn]
             have[dn] = True
@@ -105,7 +106,7 @@ class WeightsStager:
             await self.agent(src).wait_task(task["task_id"], timeout=6 * 3600, poll=self.poll,
                                             on_progress=self._progress(job, step, f"{src}→{target}: "),
                                             cancel_check=cancel_check)
-            if not await self.present(target, repo, rev):
+            if not await self.present(target, repo, rev, include):
                 raise StageError(f"copy to node {target} finished but the snapshot is not complete there")
             if verify and not self.dry_run:
                 task = await self.agent(target).call("verify", repo=repo, revision=rev)

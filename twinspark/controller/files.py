@@ -32,7 +32,7 @@ def _profile_refs(ctrl: "Controller") -> dict[tuple[str, str], list[str]]:
     for p in ctrl.list_profiles():
         seen: set[tuple[str, str]] = set()
         drafts = [r.draft for r in p.revisions] + ([p.draft] if p.draft else [])
-        for d in drafts:
+        for d in [part for draft in drafts for part in draft.parts()]:
             if d.identity:
                 seen.add((d.identity.model_repo, d.identity.model_revision))
             for x in d.advanced.extra_models:
@@ -55,10 +55,11 @@ async def inventory(ctrl: "Controller") -> dict[str, Any]:
     active = ctrl.active_revision()
     active_models = set()
     if active:
-        active_models.add((active.identity.model_repo, active.identity.model_revision))
-        for x in active.draft.advanced.extra_models:
-            repo, _, sha = x.partition("@")
-            active_models.add((repo, sha))
+        for part in active.parts():
+            active_models.add((part.identity.model_repo, part.identity.model_revision))
+            for x in part.draft.advanced.extra_models:
+                repo, _, sha = x.partition("@")
+                active_models.add((repo, sha))
     models: dict[str, dict[str, Any]] = {}
     for n, inv in per_node.items():
         for repo in inv.get("repos", []) if isinstance(inv, dict) else []:
@@ -99,10 +100,13 @@ async def inventory(ctrl: "Controller") -> dict[str, Any]:
 
 async def delete_model(ctrl: "Controller", repo: str, revision: Optional[str], nodes: list[str],
                        force: bool = False, preview: bool = False) -> dict[str, Any]:
+    if ctrl.busy() and not preview:
+        raise FilesError("cluster is busy preparing, switching or maintaining a deployment")
     active = ctrl.active_revision()
     if active is not None:
-        used = {(active.identity.model_repo, active.identity.model_revision)} | {
-            tuple(x.split("@", 1)) for x in active.draft.advanced.extra_models if "@" in x}
+        used = {(part.identity.model_repo, part.identity.model_revision) for part in active.parts()} | {
+            tuple(x.split("@", 1)) for part in active.parts()
+            for x in part.draft.advanced.extra_models if "@" in x}
         if any(r == repo and (revision is None or s == revision) for r, s in used):
             raise FilesError(f"{repo} is used by the active deployment — stop or switch first")
     if (repo, revision) in {(r, s) for (r, s) in ctrl._staging} or \
@@ -198,7 +202,7 @@ async def mods_overview(ctrl: "Controller") -> dict[str, Any]:
     used: dict[str, list[str]] = {}
     for p in ctrl.list_profiles():
         d = p.working_draft()
-        for m in (d.advanced.mods if d else []):
+        for m in {m for part in d.parts() for m in part.advanced.mods} if d else []:
             used.setdefault(m, []).append(p.name)
     rows = []
     for name in names:
@@ -219,6 +223,8 @@ async def mods_overview(ctrl: "Controller") -> dict[str, Any]:
 
 async def install_mod(ctrl: "Controller", name: str, archive_b64: str,
                       nodes: Optional[list[str]] = None) -> dict[str, Any]:
+    if ctrl.busy():
+        raise FilesError("cluster is busy — wait before changing recipe patches")
     results = {}
     for n in nodes or sorted(ctrl.agents):
         try:
@@ -234,10 +240,13 @@ async def install_mod(ctrl: "Controller", name: str, archive_b64: str,
 
 
 async def remove_mod(ctrl: "Controller", name: str) -> dict[str, Any]:
+    if ctrl.busy():
+        raise FilesError("cluster is busy — wait before changing recipe patches")
     users = [p.name for p in ctrl.list_profiles()
-             if p.working_draft() and name in p.working_draft().advanced.mods]
+             if p.working_draft() and any(name in part.advanced.mods
+                                          for part in p.working_draft().parts())]
     act = ctrl.active_revision()
-    if act and name in act.draft.advanced.mods:
+    if act and any(name in part.draft.advanced.mods for part in act.parts()):
         raise FilesError(f"mod {name} is used by the active deployment")
     results = {}
     for n, agent in ctrl.agents.items():

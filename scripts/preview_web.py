@@ -78,7 +78,9 @@ def demo_agents(config, folder):
             "rdma_active": ["qsfp0"],
         }
         actions.registry["hardware_facts"] = lambda params, facts=facts: facts
-        config.nodes[n] = NodeEndpoint(agent_url=f"http://preview-{n}")
+        config.nodes[n] = NodeEndpoint(agent_url=f"http://preview-{n}",
+                                       qsfp_ip="10.0.0.1" if n == "A" else "10.0.0.2",
+                                       qsfp_iface="qsfp0", ssh_user="preview")
         app = build_agent_app(cfg, actions, token="preview")
         client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=f"http://preview-{n}")
         agents[n] = AgentClient(n, f"http://preview-{n}", "preview", client=client)

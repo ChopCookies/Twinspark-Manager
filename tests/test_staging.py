@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 
 from twinspark.controller.staging import StageError, WeightsStager

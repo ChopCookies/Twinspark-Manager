@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1 — 2026-10-01
+
+- Prepare pinned recipes in a background job without stopping the active model:
+  check memory, images, mods, then stage and check main/drafter weights.
+- Support split profiles with separate models, images, settings, memory fractions
+  and aliases on A/B. Pin both together; snapshot source recipes when composing.
+  Route and smoke-test each backend with its own served model name, restore both
+  routes on restart, and protect both models and mods from deletion while active.
+- Add local recipe-file import, a Combine two recipes dialog, Pin & prepare,
+  per-node fit/launch-plan displays, and a switch to the exact prepared revision.
+  Add `tsm split` and `tsm prepare` commands.
+- Track recipe download includes in snapshot manifests. Download newly required
+  files instead of reusing an incomplete cache; reject patterns matching no files.
+  Fail staging when copied weights have no successful checksum verification.
+- Explicitly select vLLM's `mp` executor for native two-node launches and reject
+  TP2 when a known attention-head count cannot divide across the two GPUs.
+- Add split/preparation/cancellation/rollback/restart/backend-routing regressions,
+  distributed TP2/PP2/TP-EP checks, and recipe-file/cache tests. Hardware tuning
+  and real inference on the Sparks are deliberately deferred to on-site work.
+- Local validation: **147 Python tests passed, 5 platform-related skips**, and
+  **13 web-client tests passed**. Recipe-file import, split composition and
+  preparation were checked in the browser; the 0.4.1 wheel builds successfully.
+
 ## Unreleased — v0.4 fixes
 
 ### Monitoring and maintenance

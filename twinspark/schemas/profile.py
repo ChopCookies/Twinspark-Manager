@@ -20,6 +20,7 @@ keep their key path verbatim; only the flag part is canonicalised.
 from __future__ import annotations
 
 import copy
+import math
 import re
 import secrets
 from datetime import datetime, timezone
@@ -337,6 +338,8 @@ class ProfileDraft(BaseModel):
     # Provenance for recipes: {"recipe": ..., "url": ..., "requirements": [...], ...}
     source: dict[str, Any] = Field(default_factory=dict)
     identity: Optional[ImmutableIdentity] = None
+    # For split deployments the outer settings serve node A; this snapshot serves B.
+    secondary: Optional["ProfileDraft"] = None
 
     @field_validator("name")
     @classmethod
@@ -347,17 +350,41 @@ class ProfileDraft(BaseModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> "ProfileDraft":
+        kv = self.source.get("kv_bytes_per_token")
+        if kv is not None and (isinstance(kv, bool) or not isinstance(kv, (int, float))
+                               or not math.isfinite(kv) or kv <= 0):
+            raise ValueError("source.kv_bytes_per_token must be a positive finite number")
         if self.identity is not None:
             if self.identity.quantization != self.simple.quantization:
                 raise ValueError("identity.quantization and simple.quantization disagree")
             if self.identity.model_repo != self.simple.model:
                 raise ValueError("identity.model_repo and simple.model disagree")
         if self.simple.topology == Topology.SPLIT:
-            raise ValueError(
-                "topology 'split' needs two models; create two single-a/single-b "
-                "profiles with different aliases instead (split profiles: not supported yet)"
-            )
+            if self.secondary is None or self.secondary.simple.topology != Topology.SINGLE_B:
+                raise ValueError("split needs a secondary profile with topology 'single-b'")
+            if self.secondary.secondary is not None:
+                raise ValueError("nested split profiles are not supported")
+            if set(self.simple.aliases) & set(self.secondary.simple.aliases):
+                raise ValueError("split models must have different API aliases")
+        elif self.secondary is not None:
+            raise ValueError("secondary is only allowed with topology 'split'")
         return self
+
+    def parts(self) -> list["ProfileDraft"]:
+        if self.secondary is None:
+            return [self]
+        primary = self.model_copy(update={
+            "secondary": None,
+            "simple": self.simple.model_copy(update={"topology": Topology.SINGLE_A}),
+        }, deep=True)
+        return [primary, self.secondary]
+
+    @property
+    def aliases(self) -> list[str]:
+        return [alias for part in self.parts() for alias in part.simple.aliases]
+
+    def fully_pinned(self) -> bool:
+        return all(part.identity is not None for part in self.parts())
 
     def warnings(self) -> list[str]:
         """Non-fatal problems worth surfacing in the GUI/CLI."""
@@ -368,6 +395,8 @@ class ProfileDraft(BaseModel):
             out.append("tool calling is on but no tool_call_parser is set")
         if self.identity is None:
             out.append("not pinned yet — pin a model commit and image digest to activate")
+        if self.secondary:
+            out.extend(f"node B: {w}" for w in self.secondary.warnings())
         return out
 
 
@@ -382,6 +411,19 @@ class ProfileRevision(BaseModel):
     identity: ImmutableIdentity
     pinned: bool = False
     known_good: bool = False
+
+    @model_validator(mode="after")
+    def _all_pinned(self) -> "ProfileRevision":
+        if self.draft.secondary and not self.draft.secondary.identity:
+            raise ValueError("pin both split models before saving a revision")
+        return self
+
+    def parts(self) -> list["ProfileRevision"]:
+        if not self.draft.secondary:
+            return [self]
+        return [self.model_copy(update={"draft": part, "identity": part.identity,
+                                        "profile_name": f"{self.profile_name}-{node.lower()}"})
+                for node, part in zip(("A", "B"), self.draft.parts(), strict=True)]
 
     def required_nodes(self) -> list[str]:
         t = self.draft.simple.topology
@@ -402,6 +444,7 @@ class ProfileRevision(BaseModel):
             "advanced": self.draft.advanced.model_dump(mode="json"),
             "runtime_adapter": self.draft.runtime_adapter.value,
             "distributed_backend": self.draft.distributed_backend.value,
+            "secondary": self.draft.secondary.model_dump(mode="json") if self.draft.secondary else None,
         }
 
 

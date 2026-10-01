@@ -67,6 +67,8 @@ async def run_download(reg: "TaskRegistry", tid: str, rt: "RuntimeSettings", rep
     reg.update(tid, phase="listing", detail=f"reading file list of {repo}@{rev[:8]}")
     info = await asyncio.to_thread(HfApi(token=token).model_info, repo, revision=rev,
                                    files_metadata=True)
+    snap = hf_repo_dir(rt.hf_cache_dir, repo) / "snapshots" / rev
+    include = sorted(set(include) | set((_manifest(snap) or {}).get("include", [])))
     files = select_files(info.siblings, include)
     total = sum(files.values())
     if rt.max_download_gib is not None and total > rt.max_download_gib * 1024 ** 3:
@@ -131,7 +133,7 @@ async def run_download(reg: "TaskRegistry", tid: str, rt: "RuntimeSettings", rep
         verified = await asyncio.to_thread(
             verify_snapshot, snap, expected_hashes(info.siblings), files,
             lambda d, t: reg.progress(tid, d, t, vstart, "verifying", "verifying hashes"))
-    write_manifest(snap, files, verified, tag=tid)
+    write_manifest(snap, files, verified, tag=tid, include=include)
     return {"repo": repo, "revision": rev, "files": len(files), "bytes": total,
             "verified": bool(verified), "downloaded_bytes": missing}
 
@@ -150,12 +152,12 @@ async def run_verify(reg: "TaskRegistry", tid: str, rt: "RuntimeSettings", repo:
         return {"verified": False, "note": "no recorded hashes (download was not verified)"}
     # drop cached records: every byte is re-read on this node
     man.pop("verified", None)
-    write_manifest(snap, files, None, tag=tid)
+    write_manifest(snap, files, None, tag=tid, include=man.get("include", []))
     vstart = time.time()
     verified = await asyncio.to_thread(
         verify_snapshot, snap, expected, files,
         lambda d, t: reg.progress(tid, d, t, vstart, "verifying", "verifying hashes"))
-    write_manifest(snap, files, verified, tag=tid)
+    write_manifest(snap, files, verified, tag=tid, include=man.get("include", []))
     return {"verified": True, "files": len(verified)}
 
 

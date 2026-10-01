@@ -42,12 +42,13 @@ def _summary(p: Profile, ctrl: Controller) -> dict:
     return {
         "name": p.name, "description": p.description,
         "model": d.simple.model if d else None,
+        "secondary_model": d.secondary.simple.model if d and d.secondary else None,
         "topology": d.simple.topology.value if d else None,
         "quantization": d.simple.quantization.value if d else None,
         "alias": d.simple.api_alias if d else None,
         "verification": d.verification.value if d else None,
         "image_hint": d.image_hint if d else None,
-        "mods": d.advanced.mods if d else [],
+        "mods": list(dict.fromkeys(m for part in d.parts() for m in part.advanced.mods)) if d else [],
         "source": (d.source or {}) if d else {},
         "revisions": len(p.revisions),
         "latest": None if last is None else {
@@ -117,6 +118,24 @@ class PinRequest(BaseModel):
     image: Optional[str] = None         # registry ref (pinned to digest) or local tag
     local_image: Optional[str] = None   # force a local image tag / sha256 ID
     note: Optional[str] = None
+
+
+class SplitRequest(BaseModel):
+    name: str
+    node_a: str
+    node_b: str
+    alias_a: str = "default"
+    alias_b: str = "secondary"
+
+
+@router.post("/compose/split", response_model=Profile, status_code=201)
+def compose_split(req: SplitRequest, ctrl: Controller = Depends(controller_dep)):
+    try:
+        return ctrl.compose_split(**req.model_dump())
+    except DuplicateProfileError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 @router.post("/{name}/pin")
@@ -199,18 +218,36 @@ def draft_launch_plan(name: str, ctrl: Controller = Depends(controller_dep)):
         model_repo=d.simple.model, model_revision=_PLACEHOLDER_SHA,
         quantization=d.simple.quantization, image="unpinned", image_digest=_PLACEHOLDER_DIGEST,
         image_source="local")
+    preview = d.model_copy(update={"identity": ident}, deep=True)
+    if preview.secondary and not preview.secondary.identity:
+        secondary = preview.secondary
+        secondary.identity = ImmutableIdentity(
+            model_repo=secondary.simple.model, model_revision=_PLACEHOLDER_SHA,
+            quantization=secondary.simple.quantization, image="unpinned",
+            image_digest=_PLACEHOLDER_DIGEST, image_source="local")
     rev = ProfileRevision(revision_id=f"{name}-draft-00000000", profile_name=name, label="draft",
-                          draft=d.model_copy(update={"identity": ident}), identity=ident)
+                          draft=preview, identity=ident)
     try:
         plan = ctrl.launch_plan(rev)
     except LaunchError as e:
         raise HTTPException(422, str(e))
     out = _plan_payload(plan)
-    out["unpinned"] = d.identity is None
+    out["unpinned"] = not d.fully_pinned()
     return out
 
 
 # ---- activation ------------------------------------------------------------------
+@router.post("/{name}/prepare", response_model=Job, status_code=202)
+async def prepare(name: str, revision: str = "latest", ctrl: Controller = Depends(controller_dep)):
+    from ..controller.preparation import prepare as prepare_recipe
+    try:
+        return await prepare_recipe(ctrl, name, revision)
+    except BusyError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
 @router.post("/{name}/activate", response_model=Job, status_code=202)
 async def activate(name: str, revision: str = "latest", ctrl: Controller = Depends(controller_dep)):
     try:

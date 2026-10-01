@@ -15,7 +15,7 @@ from twinspark.agent.transfers import run_download
 from twinspark.controller.launch import LaunchPlanner, docker_run_argv
 from twinspark.resolver import resolve_hf_revision
 from twinspark.schemas.config import AgentConfig, NodeIdentity
-from twinspark.weights import MANIFEST, inference_file, select_files, snapshot_complete, sync_files
+from twinspark.weights import MANIFEST, inference_file, select_files, snapshot_complete, sync_files, write_manifest
 
 
 def test_select_only_inference_files():
@@ -38,6 +38,30 @@ def test_partial_multishard_cache_is_not_complete(tmp_path):
     assert not snapshot_complete(tmp_path)
     (tmp_path / 'model-00002.safetensors').write_bytes(b'weights')
     assert snapshot_complete(tmp_path)
+
+
+def test_recipe_includes_are_part_of_snapshot_completeness(tmp_path):
+    snap = tmp_path / ("a" * 40)
+    snap.mkdir()
+    files = {"config.json": 2, "model.safetensors": 7}
+    for name, size in files.items():
+        (snap / name).write_bytes(b"x" * size)
+    write_manifest(snap, files)
+    assert snapshot_complete(snap)
+    assert not snapshot_complete(snap, ["dflash/*"])
+    (snap / "dflash").mkdir()
+    (snap / "dflash/config.json").write_bytes(b"{}")
+    files["dflash/config.json"] = 2
+    write_manifest(snap, files, include=["dflash/*"])
+    assert snapshot_complete(snap, ["dflash/*"])
+    (snap / "dflash/config.json").unlink()
+    assert not snapshot_complete(snap, ["dflash/*"])
+
+
+def test_misspelled_recipe_include_is_rejected():
+    with pytest.raises(ValueError, match="matches no files"):
+        select_files([SimpleNamespace(rfilename=n, size=2) for n in
+                      ("config.json", "model.safetensors")], ["missing-drafter/*"])
 
 
 def test_manifest_catches_truncated_weights_and_sync_scopes_revision(tmp_path, require_symlinks):

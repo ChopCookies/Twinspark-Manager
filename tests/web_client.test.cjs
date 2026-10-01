@@ -32,7 +32,7 @@ function client() {
     return elements.get(id);
   };
   const context = vm.createContext({
-    console, URLSearchParams, setTimeout, clearInterval, setInterval,
+    console, URLSearchParams, TextDecoder, setTimeout, clearInterval, setInterval,
     sessionStorage: { getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k) },
     window: { addEventListener: (name, fn) => events.set(name, fn) },
     document: { addEventListener() {}, querySelector: element },
@@ -49,6 +49,53 @@ test("keyless sessions navigate; locked sessions ignore navigation", () => {
   c.run("S.unlocked = false");
   c.events.get("hashchange")();
   assert.equal(c.run("navigations"), 1);
+});
+
+test("loading a recipe file clears the URL and preserves its contents for review", async () => {
+  const c = client();
+  c.context.recipeBytes = new TextEncoder().encode('name: example\ncommand: vllm serve org/model');
+  c.run("toast = () => {}; document.querySelector('#paste-url').value = 'https://old/recipe';");
+  await c.run("loadRecipeFile({name:'recipe.yaml', size:recipeBytes.byteLength, arrayBuffer:async()=>recipeBytes.buffer})");
+  assert.equal(c.element("#paste-url").value, "");
+  assert.match(c.element("#paste-text").value, /vllm serve org\/model/);
+  await assert.rejects(c.run("loadRecipeFile({size:512*1024+1})"), /too large/);
+});
+
+test("late recipe file reads cannot change a different view", async () => {
+  const c = client();
+  c.context.recipeBytes = new TextEncoder().encode("new recipe");
+  await c.run("loadRecipeFile({size:10, arrayBuffer:async()=>{S.gen++; return recipeBytes.buffer;}})");
+  assert.equal(c.element("#paste-text").value, "");
+});
+
+test("split composition validates distinct names before creating a snapshot", async () => {
+  const c = client();
+  c.run(`
+    var calls = [], destination;
+    api = async (method, path, body) => { calls.push({path,body}); return {name:body.name}; };
+    formBox = async (title, fields, options) => {
+      const values = {name:'duo',node_a:'chat',node_b:'coder',alias_a:'default',alias_b:'default'};
+      try { await options.validate(values); } catch (e) { if (!e.message.includes('different')) throw e; }
+      if (calls.length) throw new Error('created before validation');
+      values.alias_b = 'code'; await options.validate(values); return values;
+    };
+    go = hash => { destination = hash; };
+  `);
+  await c.run("splitFlow([{name:'chat',model:'org/chat',topology:'single-a'},{name:'coder',model:'org/code',topology:'single-b'}])");
+  const calls = JSON.parse(c.run("JSON.stringify(calls)"));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, "/api/v1/profiles/compose/split");
+  assert.equal(calls[0].body.alias_b, "code");
+  assert.equal(c.run("destination"), "#/profiles/duo");
+});
+
+test("preparation progress shows the simulation limit and exact-revision switch", () => {
+  const c = client();
+  const html = c.run("jobHtml({job_id:'prepare-1', kind:'prepare', state:'completed', steps:[], payload:{profile:'duo', revision:'r2',dry_run:true}})");
+  assert.match(html, /Preparation complete/);
+  assert.match(html, /real hardware still needs testing/);
+  assert.match(html, /Switch to prepared revision/);
+  assert.doesNotMatch(html, /<b>Serving\./);
 });
 
 test("connection errors keep the login gate closed without saving the key", async () => {

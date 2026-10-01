@@ -55,6 +55,9 @@ def select_files(siblings, include: Iterable[str] = ()) -> dict[str, int]:
             files[name] = size
     if "config.json" not in files or not any(n.endswith(".safetensors") for n in files):
         raise ValueError("model needs config.json and a root safetensors checkpoint")
+    for pattern in include:
+        if not any(fnmatch.fnmatch(n, pattern) for n in files):
+            raise ValueError(f"recipe download_include matches no files: {pattern}")
     return files
 
 
@@ -78,11 +81,13 @@ def _manifest(snapshot: Path) -> Optional[dict]:
         return None
 
 
-def snapshot_complete(snapshot: Path) -> bool:
+def snapshot_complete(snapshot: Path, include: Iterable[str] = ()) -> bool:
     try:
         if not (snapshot / "config.json").is_file():
             return False
         doc = _manifest(snapshot)
+        if include and not set(include).issubset((doc or {}).get("include", [])):
+            return False
         if doc is not None:
             files = doc["files"]
             return (doc["revision"] == snapshot.name and "config.json" in files
@@ -108,8 +113,8 @@ def snapshot_complete(snapshot: Path) -> bool:
 
 
 def write_manifest(snapshot: Path, files: dict[str, int], verified: Optional[dict] = None,
-                   tag: str = "") -> None:
-    doc = {"revision": snapshot.name, "files": files}
+                   tag: str = "", include: Iterable[str] = ()) -> None:
+    doc = {"revision": snapshot.name, "files": files, "include": list(include)}
     if verified:
         doc["verified"] = verified
     tmp = snapshot / f"{MANIFEST}.{tag or os.getpid()}.tmp"

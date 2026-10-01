@@ -100,7 +100,10 @@ class ModInstall(BaseModel):
 @router.post("/mods")
 async def install_mod(req: ModInstall, ctrl: Controller = Depends(controller_dep)):
     """Install (or replace) a mod on every node — identical content everywhere."""
-    return await ctrl.install_mod(req.name, req.archive_b64, _nodes(ctrl, req.nodes))
+    try:
+        return await ctrl.install_mod(req.name, req.archive_b64, _nodes(ctrl, req.nodes))
+    except FilesError as e:
+        raise HTTPException(409, str(e))
 
 
 @router.delete("/mods/{name}")

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import secrets
 import time
+from dataclasses import replace
 from typing import Any, Optional
 
 from ..gateway.gateway import Gateway
@@ -82,7 +83,7 @@ class Controller:
         if self.store.load_profile(draft.name):
             raise DuplicateProfileError(f"profile already exists: {draft.name}")
         p = Profile(name=draft.name, description=draft.description, draft=draft)
-        if draft.identity is not None:
+        if draft.fully_pinned():
             p.add_revision(draft, draft.identity)
         self.store.save_profile(p)
         self._audit("user", "profile.create", f"profile/{p.name}",
@@ -132,7 +133,7 @@ class Controller:
         return p
 
     def resolve_identity(self, draft: ProfileDraft) -> ImmutableIdentity:
-        if draft.identity is None:
+        if not draft.fully_pinned():
             raise ValueError("the draft is not pinned yet — pin it (`tsm pin <profile>`) or give "
                              "an explicit identity (model commit sha + image digest)")
         return draft.identity
@@ -149,6 +150,36 @@ class Controller:
     async def pin_profile(self, name: str, **kw) -> dict:
         from .pinning import pin_profile
         return await pin_profile(self, name, **kw)
+
+    def compose_split(self, name: str, node_a: str, node_b: str,
+                      alias_a: str, alias_b: str) -> Profile:
+        """Snapshot two working recipes; future edits of the sources stay independent."""
+        parts = []
+        for source, node, alias in ((node_a, "A", alias_a), (node_b, "B", alias_b)):
+            p = self.get_profile(source)
+            d = p.working_draft() if p else None
+            if d is None:
+                raise ValueError(f"profile not found: {source}")
+            if d.secondary:
+                raise ValueError("choose two individual recipes, not an existing split")
+            doc = d.model_dump(mode="json")
+            doc["simple"].update(topology=f"single-{node.lower()}", api_alias=alias, extra_aliases=[])
+            if d.simple.topology.value in ("tp2", "pp2", "tp-ep"):
+                doc["source"].pop("kv_bytes_per_token", None)
+                doc["source"]["notes"] = doc["source"].get("notes", []) + [
+                    "Per-node KV measurements from the distributed recipe do not apply here."]
+            doc["verification"] = "experimental"
+            parts.append(doc)
+        doc = parts[0]
+        doc.update(name=name, description=f"{node_a} on A + {node_b} on B", secondary=parts[1])
+        doc["simple"]["topology"] = "split"
+        original_source = dict(doc.get("source", {}))
+        doc["source"] = {**original_source, "recipe": "split", "profiles": [node_a, node_b],
+                         "notes": original_source.get("notes", []) + [
+                             "Both source recipes now run on a single node each. Check memory fit "
+                             "and recipe requirements before preparing."],
+                         "node_a": original_source, "node_b": parts[1].get("source", {})}
+        return self.create_profile(ProfileDraft.model_validate(doc))
 
     def set_pinned(self, name: str, ref: str) -> ProfileRevision:
         p = self.get_profile(name)
@@ -204,21 +235,34 @@ class Controller:
         d = rev.draft if rev else p.working_draft()
         if d is None:
             raise ValueError("profile has no draft")
-        s, a = d.simple, d.advanced
-        out: dict[str, Any] = {"profile": name, "model": s.model, "known": False}
+        if d.secondary:
+            fits = {node: self._draft_fit(part, [node], recipe_kv=True)
+                    for node, part in zip(("A", "B"), d.parts(), strict=True)}
+            return {"profile": name, "topology": "split", "nodes": fits,
+                    "known": all(f["known"] for f in fits.values()),
+                    "fits": all(f.get("fits", False) for f in fits.values())}
+        out = self._draft_fit(d, rev.required_nodes() if rev else None)
+        out["profile"] = name
         if rev is None and p.latest():
             rev = p.latest()
         if rev is not None:
             out["observed"] = self.store.kv_get(f"observed:{rev.revision_id}")
+        return out
+
+    def _draft_fit(self, d: ProfileDraft, nodes=None, recipe_kv=False) -> dict:
+        s, a = d.simple, d.advanced
+        out = {"model": s.model, "known": False}
         spec = self.model_spec(s.model)
         if spec is None:
             out["note"] = "model size unknown — pin the profile (or Resolve the model) first"
             return out
+        if recipe_kv:
+            spec = replace(spec, kv_bytes_per_token=d.source.get("kv_bytes_per_token"))
         ctx, conc = s.planning_context(), a.max_num_seqs or s.concurrency
         budget = self.planner.estimate(spec=spec, quant=s.quantization, context_length=ctx,
                                        concurrency=conc, topology=s.topology,
                                        kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
-                                       mem_total_gib=self._mem_total())
+                                       mem_total_gib=self._mem_total(nodes))
         util = a.gpu_memory_utilization or self.planner.gpu_memory_utilization(budget)
         fits, headroom = self.planner.fits(budget, util)
         fixed = budget.vllm_needed - budget.kv_cache           # weights + scratch + graphs + comms
@@ -244,11 +288,15 @@ class Controller:
     # ---- transparency ------------------------------------------------------------
     def launch_plan(self, rev: ProfileRevision) -> LaunchPlan:
         util = rev.draft.advanced.gpu_memory_utilization or self.planner.gpu_memory_utilization(
-            self.planner.reserve_budget(mem_total_gib=self._mem_total()))
-        return LaunchPlanner(self.config).plan(rev, util)
+            self.planner.reserve_budget(mem_total_gib=self._mem_total(rev.parts()[0].required_nodes())))
+        node_utils = {n: part.draft.advanced.gpu_memory_utilization or
+                      self.planner.gpu_memory_utilization(self.planner.reserve_budget(
+                          mem_total_gib=self._mem_total(part.required_nodes())))
+                      for part in rev.parts() for n in part.required_nodes()}
+        return LaunchPlanner(self.config).plan(rev, util, node_utilization=node_utils)
 
-    def _mem_total(self) -> Optional[float]:
-        totals = [(self.store.kv_get(f"hardware:{n}") or {}).get("mem_total_gib") for n in self.agents]
+    def _mem_total(self, nodes=None) -> Optional[float]:
+        totals = [(self.store.kv_get(f"hardware:{n}") or {}).get("mem_total_gib") for n in (nodes or self.agents)]
         totals = [t for t in totals if t]
         return min(totals) if totals else None
 
@@ -286,6 +334,10 @@ class Controller:
                       "image": rev.identity.image_ref, "topology": rev.draft.simple.topology.value,
                       "context_length": rev.draft.simple.context_length,
                       "observed": self.store.kv_get(f"observed:{rev.revision_id}")}
+            detail["models"] = [{"node": part.required_nodes(), "model": part.identity.model_repo,
+                                 "model_revision": part.identity.model_revision,
+                                 "image": part.identity.image_ref, "aliases": part.draft.simple.aliases}
+                                for part in rev.parts()]
         return {
             "active": act,
             "active_detail": detail,
@@ -378,11 +430,14 @@ class Controller:
                 config=self.config, agents=self.agents, gateway=self.gateway,
                 planner=self.planner, persist=self._persist,
                 model_spec=self.model_spec(rev.identity.model_repo),
+                model_specs={part.identity.model_repo: self.model_spec(part.identity.model_repo)
+                             for part in rev.parts()},
                 poll_interval=self.poll_interval, cancel_check=cancel_check,
                 staging_wait=self._staging_wait,
             )
             job.payload["_revision"] = rev
             job.payload["mem_total_gib"] = self._mem_total()
+            job.payload["node_mem_total"] = {n: self._mem_total([n]) for n in self.agents}
             try:
                 await ActivationStateMachine(job, coord.handle, self._persist,
                                              cancel_check=cancel_check).run()
@@ -390,10 +445,11 @@ class Controller:
                 self.store.kv_set("active", {"profile": rev.profile_name,
                                              "revision_id": rev.revision_id, "label": rev.label,
                                              "alias": rev.draft.simple.api_alias,
-                                             "aliases": rev.draft.simple.aliases,
+                                             "aliases": rev.draft.aliases,
                                              "since": time.time()})
                 self._mark_known_good(rev.profile_name, rev.revision_id, {
                     "kv": job.payload.get("kv"), "max_model_len": job.payload.get("max_model_len"),
+                    "models": job.payload.get("models"),
                     "load_seconds": _stage_seconds(job, "loading"), "at": time.time()})
                 self.watch_state["unhealthy_streak"] = 0
             except StageFailed as exc:
@@ -504,8 +560,10 @@ class Controller:
             return False
         observed = self.store.kv_get(f"observed:{rev.revision_id}") or {}
         for alias, backends in plan.routes.items():
-            self.gateway.set_route(alias, backends, plan.served_model_name, rev.revision_id,
-                                   max_model_len=observed.get("max_model_len"))
+            model = plan.route_models.get(alias, plan.served_model_name)
+            self.gateway.set_route(alias, backends, model, rev.revision_id,
+                                   max_model_len=(observed.get("models") or {}).get(model, {}).get(
+                                       "max_model_len", observed.get("max_model_len")))
         self._audit("controller", "deployment.adopt", f"profile/{rev.profile_name}", {})
         return True
 
@@ -612,10 +670,11 @@ class Controller:
         act = self.active()
         if not act or self.busy():
             return None
-        st = self.gateway.routes.get(act.get("alias", "default"))
-        if not st or not st.backends:
+        backends = {b for alias in act.get("aliases", [act.get("alias", "default")])
+                    if alias in self.gateway.routes for b in self.gateway.routes[alias].backends}
+        if not backends:
             return None
-        snaps = [await scrape_metrics(b, headers=self.gateway.backend_headers()) for b in st.backends]
+        snaps = [await scrape_metrics(b, headers=self.gateway.backend_headers()) for b in sorted(backends)]
         return self.sampler.add(combine_snapshots(snaps), act.get("revision_id"))
 
     # ---- delegated feature areas ---------------------------------------------------

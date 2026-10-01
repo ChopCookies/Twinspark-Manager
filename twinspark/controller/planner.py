@@ -62,6 +62,7 @@ class ModelSpec:
     # attention (DeepSeek V4 CSA/HCA, GLM-5.3 KDA+DSA, Qwen3.8 DeltaNet, MiMo SWA)
     # makes the textbook formula useless, so a measured number always wins.
     kv_bytes_per_token: Optional[float] = None
+    num_attention_heads: int = 0
 
     @property
     def is_mla(self) -> bool:
@@ -258,6 +259,7 @@ def make_spec_from_hf(config: dict, weight_bytes: Optional[int] = None) -> Model
     return ModelSpec(
         num_params=num_params, layers=layers, num_kv_heads=kv_heads, head_dim=head_dim,
         weight_bytes=weight_bytes, is_moe=experts > 0, num_experts=experts,
+        num_attention_heads=int(cfg.get("num_attention_heads") or 0),
         kv_lora_rank=int(cfg.get("kv_lora_rank") or 0),
         qk_rope_head_dim=int(cfg.get("qk_rope_head_dim") or 0),
     )

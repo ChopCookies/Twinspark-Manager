@@ -1,6 +1,6 @@
 # TwinSpark Manager — Alpha 0.4
 
-> **0.4.0** — see [CHANGELOG.md](CHANGELOG.md). Quick start on the GX10 pair:
+> **0.4.1** — see [CHANGELOG.md](CHANGELOG.md). Quick start on the GX10 pair:
 > `tsm doctor` → `tsm rdma` (paste the suggested `rdma_hcas`/`ib_gid_index` into controller.yaml)
 > → `tsm foreign ls` (stop hand-started vLLM) → `tsm mods import-eugr ~/spark-vllm-docker`
 > → `tsm cookbook import deepseek-v4-flash-0731-b12x` → `tsm pin …` → `tsm plan …` → `tsm activate …`.
@@ -48,7 +48,7 @@ its [two-node startup commands](DEEPSEEK-TWO-NODE-STARTUP.md) restore the origin
 
 ## Not in this alpha
 
-`split` profiles (two models in one profile), mTLS between nodes (bearer token
+mTLS between nodes (bearer token
 over the direct QSFP link for now), and web GUI OAuth / multi-user (single
 management API key). One-click pinning is available in the Profiles view.
 
@@ -152,6 +152,18 @@ configuration, measurement limits, and recovery instructions.
 Profiles and built-in recipes support search and filters that persist while
 navigating. Recipe imports review the settings before saving; name conflicts
 remain in the dialog so you can correct them without starting over.
+
+Import recipes by URL, pasted text, or a local YAML/JSON file. **Pin & prepare**
+resolves an immutable revision, checks images and patches, and stages weights
+without switching the current deployment. The completed job can switch to that
+exact prepared revision.
+
+**Combine two recipes** creates a split profile: A and B each run an independent
+model, image and settings, with separate API model names. TP2, PP2 and TP + expert
+parallel still distribute one model across both nodes. See the
+[recipe and split-model guide](docs/recipe-workflow.md) for CLI commands, limits
+and the on-site test checklist. The 0.4.1 changes have been tested locally with
+simulated agents; validation on the Sparks remains pending.
 
 ```bash
 python scripts/build_web.py
