@@ -1066,12 +1066,30 @@ async function viewRecipeUpdates(g, head) {
   } });
   await draw();
 }
+function recipeSettingLabel(field) {
+  const node = field.startsWith('secondary.') ? 'Node B · ' : '';
+  const key = field.replace(/^secondary\./, '');
+  const labels = {
+    'description':'Description', 'simple.model':'Model', 'simple.context_length':'Context length',
+    'simple.api_alias':'API model name', 'simple.topology':'Node arrangement',
+    'simple.quantization':'Model precision', 'identity.model_repo':'Model repository',
+    'identity.model_revision':'Model commit', 'identity.image':'Container image',
+    'identity.image_digest':'Image version', 'image_hint':'Container image',
+    'advanced.mods':'Patches', 'advanced.extra_models':'Extra models',
+    'advanced.gpu_memory_utilization':'GPU memory allocation',
+  };
+  return node + (labels[key] || key.replace(/_/g, ' ').replace(/\./g, ' / '));
+}
+function recipeChangeValue(value) {
+  if (value == null) return '—';
+  return esc(typeof value === 'string' ? value : typeof value === 'number' ? num(value, 6) : JSON.stringify(value));
+}
 function recipeUpdateHtml(update) {
   if (!update) return '';
   return `<div class="callout info"><div>Updated source for <b>${esc(update.profile)}</b> · ${esc(sha(update.previous_sha256))} → ${esc(sha(update.sha256))}. This becomes a separate profile.</div></div>
-    ${update.preserved.length ? `<p class="small">Your adjustments are retained: ${update.preserved.map(esc).join(', ')}.</p>` : ''}
-    ${update.conflicts.length ? `<div class="callout warn"><div><b>Both you and upstream changed these settings.</b> Your values are retained: ${update.conflicts.map(esc).join(', ')}. Review the complete profile before preparing.</div></div>` : ''}
-    ${update.changes.length ? `<details open><summary>Settings changed (${update.changes.length})</summary><div class="table-wrap"><table><thead><tr><th>Setting</th><th>Current</th><th>Updated</th></tr></thead><tbody>${update.changes.map(c => `<tr><td class="mono">${esc(c.field)}</td><td class="mono small">${esc(JSON.stringify(c.before))}</td><td class="mono small">${esc(JSON.stringify(c.after))}</td></tr>`).join('')}</tbody></table></div></details>` : '<p class="small muted">Source content changed; your effective settings are retained.</p>'}`;
+    ${update.preserved.length ? `<p class="small">Your adjustments are retained: ${update.preserved.map(p => esc(recipeSettingLabel(p))).join(', ')}.</p>` : ''}
+    ${update.conflicts.length ? `<div class="callout warn"><div><b>Both you and upstream changed these settings.</b> Your values are retained: ${update.conflicts.map(p => esc(recipeSettingLabel(p))).join(', ')}. Review the complete profile before preparing.</div></div>` : ''}
+    ${update.changes.length ? `<details open><summary>Settings changed (${update.changes.length})</summary><div class="table-wrap recipe-changes"><table><thead><tr><th>Setting</th><th>Current</th><th>Updated</th></tr></thead><tbody>${update.changes.map(c => `<tr><td>${esc(recipeSettingLabel(c.field))}</td><td class="mono small">${recipeChangeValue(c.before)}</td><td class="mono small">${recipeChangeValue(c.after)}</td></tr>`).join('')}</tbody></table></div></details>` : '<p class="small muted">Source content changed; your effective settings are retained.</p>'}`;
 }
 function pasteBody() {
   const url = $("#paste-url").value.trim(), text = $("#paste-text").value;
