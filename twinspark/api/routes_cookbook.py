@@ -19,9 +19,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-from ..controller.controller import Controller, DuplicateProfileError
+from ..controller.controller import BusyError, Controller, DuplicateProfileError
+from ..controller.integration import IntegrationRequest, RetryRequest, integrate, retry
 from ..cookbook import RecipeImportError, build_draft, import_text, list_recipes, recipe_detail
 from ..cookbook.remote import RemoteError, fetch_text, list_source
+from ..schemas.job import Job
 from .deps import controller_dep, require_auth
 
 router = APIRouter(prefix="/api/v1/cookbook", tags=["cookbook"],
@@ -115,3 +117,24 @@ async def import_any(req: ImportRequest, ctrl: Controller = Depends(controller_d
     if req.preview:
         return {"ok": True, "preview": True, **out}
     return {"ok": True, "preview": False, "profile": _create(ctrl, draft), **out}
+
+
+@router.post("/integrate", response_model=Job, status_code=202)
+async def integrate_recipe(req: IntegrationRequest, ctrl: Controller = Depends(controller_dep)):
+    """Import the reviewed snapshot, pin models/images, validate and stage both nodes."""
+    try:
+        return await integrate(ctrl, req)
+    except (BusyError, DuplicateProfileError) as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@router.post("/integration/{job_id}/retry", response_model=Job, status_code=202)
+async def retry_integration(job_id: str, req: RetryRequest, ctrl: Controller = Depends(controller_dep)):
+    try:
+        return await retry(ctrl, job_id, req)
+    except (BusyError, DuplicateProfileError) as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))

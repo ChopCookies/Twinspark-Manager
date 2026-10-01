@@ -631,6 +631,18 @@ async function prepareFlow(name, btn) {
   const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/prepare`));
   toast("checking recipe and staging weights…"); go("#/jobs/" + enc(job.job_id));
 }
+function recipeRequestId() {
+  return globalThis.crypto?.randomUUID?.() || `recipe-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+async function automateRecipe(name, btn) {
+  const g = S.gen;
+  const job = await busy(btn, async () => {
+    const p = await GET(`/api/v1/profiles/${enc(name)}`);
+    if (!current(g)) return null;
+    return POST('/api/v1/cookbook/integrate', {draft:p.draft, existing:true, request_id:recipeRequestId()});
+  });
+  if (job && current(g)) { toast("pinning and preparing recipe…"); go("#/jobs/" + enc(job.job_id)); }
+}
 async function pinFlow(name) {
   const p = await GET(`/api/v1/profiles/${enc(name)}`);
   const d = p.draft || {}; const id = d.identity;
@@ -671,8 +683,8 @@ async function viewProfile(name, tab) {
     <div class="tabs">${tabs.map(([id, l]) => `<a href="#/profiles/${enc(name)}/${id}" class="${tab === id ? "active" : ""}">${esc(l)}</a>`).join("")}</div>`;
   const common = {
     prepare: async (el) => {
-      if ((!last || hasEdits) && !await pinFlow(name)) return;
-      await prepareFlow(name, el);
+      if (!last || hasEdits) await automateRecipe(name, el);
+      else await prepareFlow(name, el);
     },
     activate: (el) => activateFlow(name, "latest", el),
     pin: () => pinFlow(name).then(ok => ok && route()),
@@ -891,6 +903,10 @@ async function viewJob(id) {
       const job = await GET(`/api/v1/jobs/${enc(id)}`);
       await activateFlow(job.payload.profile, job.profile_revision, el);
     },
+    "integration-retry": async (el) => {
+      const job = await busy(el, () => POST(`/api/v1/cookbook/integration/${enc(id)}/retry`, {request_id:recipeRequestId()}));
+      go("#/jobs/" + enc(job.job_id));
+    },
   });
   if (await draw()) {
     const t = setInterval(async () => { if (!current(g)) return clearInterval(t); try { if (!await draw()) clearInterval(t); } catch (e) { } }, 1500);
@@ -900,10 +916,11 @@ async function viewJob(id) {
 function jobHtml(job) {
   const running = ["running", "pending"].includes(job.state);
   const activation = ["activation", "rollback", "recovery"].includes(job.kind);
+  const preparation = ["prepare", "integration"].includes(job.kind);
   const done = Object.fromEntries((job.steps || []).map(s => [s.stage, s]));
-  const stages = activation ? STAGES : job.kind === "prepare" ? STAGES.slice(0, 4) : (job.steps || []).map(s => s.stage);
+  const stages = activation ? STAGES : preparation ? [...(job.kind === "integration" ? ["pinning"] : []), ...STAGES.slice(0, 4)] : (job.steps || []).map(s => s.stage);
   const pl = job.payload || {};
-  const title = activation ? `${job.kind === "activation" ? "Switch to" : job.kind === "rollback" ? "Roll back to" : "Recover"} ${pl.profile || ""} ${pl.label || ""}` : job.kind === "prepare" ? `Prepare ${pl.profile || ""} ${pl.revision || ""}` : job.kind === "stage" ? `Stage ${pl.repo || ""}@${sha(pl.revision, 8)}` : job.kind;
+  const title = activation ? `${job.kind === "activation" ? "Switch to" : job.kind === "rollback" ? "Roll back to" : "Recover"} ${pl.profile || ""} ${pl.label || ""}` : preparation ? `Prepare ${pl.profile || ""} ${pl.revision || ""}` : job.kind === "stage" ? `Stage ${pl.repo || ""}@${sha(pl.revision, 8)}` : job.kind;
   let h = `<div class="view"><div class="view-head"><div><div class="crumbs"><a href="#/jobs">Jobs</a> / <span class="mono">${esc(job.job_id)}</span></div>
     <h1>${esc(title)} ${tag(job.state, { completed: "good", failed: "bad", running: "info", cancelled: "muted" }[job.state] || "muted")}</h1><p>started ${esc(when(job.created_at))} · ${esc(dur(job.created_at, running ? null : job.updated_at))}</p></div>
     <div class="row">${running ? `<button class="btn danger" data-act="cancel">Cancel</button>` : ""}${activation ? `<button class="btn" data-act="logs">Container logs</button>` : ""}${pl.profile ? `<a class="btn" href="#/profiles/${enc(pl.profile)}">Profile</a>` : ""}</div></div>`;
@@ -912,7 +929,8 @@ function jobHtml(job) {
   } else if (job.state === "completed" && activation) {
     h += `<div class="callout good"><div><b>Serving.</b> ${pl.kv && pl.kv.kv_cache_tokens ? `KV pool ${num(pl.kv.kv_cache_tokens)} tokens. ` : ""}${pl.max_model_len ? `max_model_len ${num(pl.max_model_len)}.` : ""}</div></div>`;
   }
-  if (job.kind === "prepare") h += `<div class="callout ${job.state === "completed" ? "good" : "info"}"><div><b>${job.state === "completed" ? "Preparation complete." : "Preparing recipe."}</b> Images, patches and weights are checked without switching the current deployment.${pl.dry_run ? " This was a simulation; real hardware still needs testing." : ""}${job.state === "completed" ? '<div class="row" style="margin-top:10px"><button class="btn primary" data-act="prepared-activate">Switch to prepared revision</button></div>' : ""}</div></div>`;
+  if (preparation) h += `<div class="callout ${job.state === "completed" ? "good" : "info"}"><div><b>${job.state === "completed" ? "Preparation complete." : job.state === "failed" ? "Preparation stopped." : "Preparing recipe."}</b> Images, patches and weights are checked without switching the current deployment.${pl.dry_run ? " This was a simulation; real hardware still needs testing." : ""}${job.state === "completed" ? '<div class="row" style="margin-top:10px"><button class="btn primary" data-act="prepared-activate">Switch to prepared revision</button></div>' : job.kind === "integration" && job.state === "failed" ? '<div class="row" style="margin-top:10px"><button class="btn" data-act="integration-retry">Retry preparation</button><a class="btn" href="#/mods">Check patches</a></div>' : ""}</div></div>`;
+  if (job.kind === "integration" && pl.resolved) h += `<div class="card"><h2>Recorded pins</h2><div class="kv">${[pl.resolved, pl.resolved.secondary].filter(Boolean).map((r,i) => `<b>${i ? "Node B" : pl.resolved.secondary ? "Node A" : "Model"}</b><span class="mono">${esc(r.model)}<br>${esc(r.image)}</span>`).join("")}</div>${(pl.pin_notes || []).map(n => `<p class="small muted">${esc(n)}</p>`).join("")}</div>`;
   for (const w of pl.warnings || []) h += `<div class="callout warn"><div>${esc(w)}</div></div>`;
   h += `<div class="card"><div class="timeline">`;
   for (const st of stages) {
@@ -940,7 +958,7 @@ async function viewJobs() {
   const draw = async () => {
     const jobs = await GET("/api/v1/jobs" + qs({ limit: 60, kind }));
     render(g, `<div class="view"><div class="view-head"><div><h1>Jobs</h1><p>Switches, rollbacks, recoveries, staging and stops — newest first.</p></div>
-      <div class="row"><select id="job-kind" style="width:auto">${["", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
+      <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
       <div class="card">${jobs.length ? `<div class="table-wrap"><table><thead><tr><th>Job</th><th>Kind</th><th>Target</th><th>State</th><th>Stage</th><th>Started</th><th>Took</th></tr></thead><tbody>
       ${jobs.map(j => `<tr class="clickable" data-act="open" data-id="${esc(j.job_id)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.kind)}</td><td>${esc(j.payload.profile ? j.payload.profile + " " + (j.payload.label || "") : j.payload.repo || "")}</td>
         <td>${tag(j.state, { completed: "good", failed: "bad", running: "info" }[j.state] || "muted")}${j.error ? `<div class="sub">${esc(j.error.slice(0, 120))}</div>` : ""}</td><td>${esc(j.stage || "")}</td><td>${esc(ago(j.created_at))}</td><td>${esc(dur(j.created_at, ["running", "pending"].includes(j.state) ? null : j.updated_at))}</td></tr>`).join("")}
@@ -1043,6 +1061,7 @@ function reportHtml(rep, draft) {
   rep = rep || {}; const s = draft.simple, a = draft.advanced;
   const mapped = Object.entries(rep.mapped || {});
   return `<div class="kv"><b>Model</b><span class="mono">${esc(s.model)}</span><b>Topology</b><span>${esc(s.topology)} · ${esc(draft.distributed_backend)}</span><b>Context</b><span>${esc(s.context_length)}</span><b>Image</b><span class="mono">${esc(draft.image_hint || "—")}</span>${a.mods.length ? `<b>Mods</b><span>${a.mods.map(m => tag(m, "muted")).join(" ")}</span>` : ""}</div>
+    ${draft.secondary ? `<div class="section-title">Model on node B · ${esc(draft.secondary.simple.api_alias)}</div>${reportHtml({}, draft.secondary)}` : ""}
     ${mapped.length ? `<div class="section-title">Mapped to settings</div><div class="chip-row">${mapped.map(([k, v]) => tag(`--${k}${v === true ? "" : " " + (typeof v === "object" ? JSON.stringify(v) : v)}`, "info")).join("")}</div>` : ""}
     ${(rep.raw || []).length ? `<div class="section-title">Kept verbatim (raw vLLM args)</div><pre class="code wrap">${esc(rep.raw.join(" "))}</pre>` : ""}
     ${(rep.dropped || []).length ? `<div class="section-title">Dropped — TwinSpark sets these</div><div class="chip-row">${rep.dropped.map(x => tag(x, "muted")).join("")}</div>` : ""}
@@ -1057,23 +1076,32 @@ async function previewImport(body, suggested) {
 }
 async function importDraft(pv, suggested) {
   const name = pv.draft.name;
-  let created;
+  let created, prepared;
+  const requestId = recipeRequestId();
+  const snapshot = root => {
+    const input = $("#imp-name", root); input.value = input.value.trim();
+    return input.reportValidity() ? {...pv.draft, name:input.value} : null;
+  };
   const { value } = await modal({
     title: "Review and import", wide: true,
     body: `${pv.exists ? `<div class="callout warn"><div>A profile named <b>${esc(name)}</b> exists — choose another name.</div></div>` : ""}
       <label class="field"><span>Profile name</span><input id="imp-name" required maxlength="63" pattern="[a-z0-9][a-z0-9._\\-]{0,62}" value="${esc(suggested || (pv.exists ? name.slice(0, 61) + "-2" : name))}"/><span class="help">Lowercase letters, numbers, dots, underscores and hyphens.</span></label>
-      <div class="callout info"><div>This creates an editable profile. Review its settings and pin it before running.</div></div>
+      <div class="callout info"><div>Import &amp; prepare automatically pins the models and image, checks both nodes, and downloads missing weights. The current deployment keeps serving. You can also import only and customize first. Required patches must already be installed.</div></div>
       ${reportHtml(pv.report, pv.draft)}
       ${(pv.draft.source?.requirements || []).length ? `<div class="section-title">Requirements</div><ul class="plain">${pv.draft.source.requirements.map(r => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}
       <details><summary>All profile settings</summary>${codeBlock(JSON.stringify(pv.draft, null, 2))}</details>`,
-    actions: [{ label: "Cancel", value: null }, { label: "Import profile", value: "go", cls: "primary", validate: async (root) => {
-      const input = $("#imp-name", root); input.value = input.value.trim();
-      if (!input.reportValidity()) return false;
+    actions: [{ label: "Cancel", value: null }, { label: "Import only", value: "go", validate: async (root) => {
+      const draft = snapshot(root); if (!draft) return false;
       // Import the reviewed snapshot, not a URL that may have changed since preview.
-      created = await POST("/api/v1/profiles", { ...pv.draft, name: input.value });
+      created = await POST("/api/v1/profiles", draft);
+      return true;
+    } }, { label: "Import & prepare", value: "prepared", cls: "primary", validate: async root => {
+      const draft = snapshot(root); if (!draft) return false;
+      prepared = await POST("/api/v1/cookbook/integrate", {draft, request_id:requestId});
       return true;
     } }],
   });
+  if (value === "prepared") { toast("recipe imported — preparing automatically"); go("#/jobs/" + enc(prepared.job_id)); return; }
   if (value !== "go") return;
   toast(`Imported ${created.name} — ready to customize`, "good"); go("#/profiles/" + enc(created.name));
 }

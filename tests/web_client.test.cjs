@@ -134,6 +134,60 @@ test("recipe import saves the reviewed snapshot without fetching the URL again",
   assert.equal(c.run("destination"), "#/profiles/renamed");
 });
 
+test("automatic import prepares the reviewed snapshot with a stable request ID", async () => {
+  const c = client();
+  c.run(`
+    var calls = [], destination;
+    api = async (method, path, body) => {
+      calls.push({path,body});
+      if (path.endsWith('import-recipe')) return {draft:{name:'recipe',simple:{model:'org/reviewed'},advanced:{mods:[]}},report:{}};
+      return {job_id:'integration-1'};
+    };
+    modal = async options => {
+      const root = {querySelector:()=>({value:'my-recipe',reportValidity:()=>true})};
+      // Repeating after an uncertain response must not start a second job.
+      await options.actions[2].validate(root); await options.actions[2].validate(root);
+      return {value:'prepared'};
+    };
+    toast = () => {}; go = hash => { destination = hash; };
+  `);
+  await c.run("previewImport({url:'https://example.com/recipe.yaml'})");
+  const calls = JSON.parse(c.run("JSON.stringify(calls)"));
+  assert.deepEqual(calls.map(x => x.path), ['/api/v1/cookbook/import-recipe','/api/v1/cookbook/integrate','/api/v1/cookbook/integrate']);
+  assert.equal(calls[1].body.request_id, calls[2].body.request_id);
+  assert.equal(calls[1].body.draft.simple.model, 'org/reviewed');
+  assert.equal(calls[1].body.draft.name, 'my-recipe');
+  assert.equal(c.run('destination'), '#/jobs/integration-1');
+});
+
+test("integration progress exposes cancellation, retry and exact prepared pins", () => {
+  const c = client();
+  const running = c.run("jobHtml({job_id:'i1',kind:'integration',state:'running',steps:[],payload:{profile:'duo'}})");
+  assert.match(running, /pinning/);
+  assert.match(running, /data-act="cancel"/);
+  assert.doesNotMatch(running, /prepared-activate/);
+  const failed = c.run("jobHtml({job_id:'i1',kind:'integration',state:'failed',steps:[],error:'<offline>',payload:{profile:'duo'}})");
+  assert.match(failed, /Retry preparation/);
+  assert.match(failed, /&lt;offline&gt;/);
+  assert.doesNotMatch(failed, /Switch to prepared revision/);
+  const ready = c.run("jobHtml({job_id:'i1',kind:'integration',state:'completed',steps:[],payload:{profile:'duo',dry_run:true,resolved:{model:'org/a@123',image:'image@sha256:123',secondary:{model:'org/b@456',image:'image@sha256:456'}}}})");
+  assert.match(ready, /real hardware still needs testing/);
+  assert.match(ready, /Switch to prepared revision/);
+  assert.match(ready, /Node A/); assert.match(ready, /Node B/);
+});
+
+test("automatic preparation ignores profile responses arriving after navigation", async () => {
+  const c = client();
+  c.run(`
+    var calls = [], destination;
+    busy = (btn, fn) => fn(); toast = () => {}; go = hash => { destination = hash; };
+    api = async (method, path) => { calls.push(path); S.gen++; return {draft:{name:'duo'}}; };
+  `);
+  await c.run("automateRecipe('duo', null)");
+  assert.equal(c.run("calls.length"), 1);
+  assert.equal(c.run("destination"), undefined);
+});
+
 test("late recipe previews cannot open over a different view", async () => {
   const c = client();
   c.run("api = async () => { S.gen++; return {}; }; var opened = false; importDraft = () => { opened = true; };");

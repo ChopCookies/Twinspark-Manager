@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..resolver import (
     looks_like_registry_ref,
@@ -176,7 +176,9 @@ async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
 
 async def pin_profile(ctrl: "Controller", name: str, model_ref: Optional[str] = None,
                       image: Optional[str] = None, local_image: Optional[str] = None,
-                      label_note: Optional[str] = None) -> dict[str, Any]:
+                      label_note: Optional[str] = None, secondary: Optional[dict] = None,
+                      cancel_check: Callable[[], bool] = lambda: False,
+                      progress: Callable[[str], None] = lambda message: None) -> dict[str, Any]:
     p = ctrl.get_profile(name)
     if p is None:
         raise PinError(f"unknown profile: {name}")
@@ -184,13 +186,23 @@ async def pin_profile(ctrl: "Controller", name: str, model_ref: Optional[str] = 
     if draft is None:
         raise PinError(f"profile {name} has no draft to pin")
     original = draft.model_dump(mode="json")
+    if cancel_check():
+        raise PinError("cancelled by user")
+    progress(f"Resolving model and image for {'node A' if draft.secondary else draft.simple.topology.value}")
     pinned, resolved, notes = await _pin_draft(
         ctrl, draft, model_ref, image, local_image, nodes=["A"] if draft.secondary else None)
+    if cancel_check():
+        raise PinError("cancelled by user")
     if draft.secondary:
-        secondary, result_b, notes_b = await _pin_draft(ctrl, draft.secondary, nodes=["B"])
-        pinned = pinned.model_copy(update={"secondary": secondary})
+        progress("Resolving model and image for node B")
+        pinned_b, result_b, notes_b = await _pin_draft(ctrl, draft.secondary, nodes=["B"], **(secondary or {}))
+        pinned = pinned.model_copy(update={"secondary": pinned_b})
         resolved["secondary"] = result_b
         notes.extend(f"node B: {note}" for note in notes_b)
+    elif secondary:
+        raise PinError("node B pin overrides require a split profile")
+    if cancel_check():
+        raise PinError("cancelled by user")
     # Hub/image lookups may take time; do not overwrite edits made during them.
     current = ctrl.get_profile(name)
     if current is None or current.working_draft().model_dump(mode="json") != original:
