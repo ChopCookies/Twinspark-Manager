@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import getpass
 import io
 import json
 import os
@@ -13,12 +14,15 @@ import sys
 import tarfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from tests.test_setup_flow import answers_a, machine  # noqa: F401  (machine is used as a fixture)
-from twinspark import cli, cli_remote, provision
+from twinspark import cli, cli_remote, hostprobe, provision
+from twinspark.agent.privd import PrivClient
 from twinspark.demo import DemoCluster
 from twinspark.provision import Layout, Provisioner, SetupError
 from twinspark.remote import netboot, privops, termclient
@@ -43,8 +47,17 @@ def nothing_real_runs(monkeypatch):
     def refuse(argv):
         raise AssertionError(f"a real command would have run: {argv}")
 
+    def disabled_privilege(self, action, params=None):
+        raise HTTPException(409, "remote management is off in this test; sudo tsm remote enable reboot")
+
     monkeypatch.setattr(privops, "RUN", fake)
     monkeypatch.setattr(cli_remote, "_real_run", refuse)
+    monkeypatch.setattr(PrivClient, "available", lambda self: False)
+    monkeypatch.setattr(PrivClient, "call", disabled_privilege)
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0), raising=False)
+    if not hasattr(os, "getuid"):
+        # A Linux service username in the scratch demo, not the Windows login name.
+        monkeypatch.setattr(getpass, "getuser", lambda: "tester")
     fake.calls, fake.table = calls, table
     return fake
 
@@ -61,6 +74,21 @@ def box(tmp_path, monkeypatch):
     Provisioner(answers_a(tmp_path), lay, systemd=False).apply()
     monkeypatch.setattr(cli_remote, "_pick_priv", lambda cfg: _AlwaysRoot())
     return lay
+
+
+@pytest.fixture
+def spark_machine(request, monkeypatch):
+    """Use the fake Spark ports with canned Docker facts on every test host."""
+    ports = request.getfixturevalue("machine")
+    probe = hostprobe.probe_host
+
+    def simulated(*args, **kwargs):
+        report = probe(*args, **kwargs)
+        report.docker = {"installed": True, "reachable": True, "in_group": True, "detail": "fake Docker"}
+        return report
+
+    monkeypatch.setattr(hostprobe, "probe_host", simulated)
+    return ports
 
 
 class _AlwaysRoot(privops.LocalPriv):
@@ -138,7 +166,7 @@ def test_plug_token_goes_into_the_vault_not_the_config(tmp_path, capsys):
 
 
 # ---- the setup wizard ------------------------------------------------------------------------
-@pytest.mark.usefixtures("machine")
+@pytest.mark.usefixtures("spark_machine")
 def test_wizard_leaves_remote_management_off_when_unattended(tmp_path):
     root = tmp_path / "a"
     assert run_cli("setup", "--root", root, "--yes", "--service-user", "chopc", "--no-start",
@@ -149,7 +177,7 @@ def test_wizard_leaves_remote_management_off_when_unattended(tmp_path):
         json.loads((lay.etc / "remote-policy.json").read_text()).values())
 
 
-@pytest.mark.usefixtures("machine")
+@pytest.mark.usefixtures("spark_machine")
 def test_wizard_flag_turns_features_on_and_writes_the_terminal_unit(tmp_path, capsys):
     root = tmp_path / "a"
     assert run_cli("setup", "--root", root, "--yes", "--service-user", "chopc", "--no-start",
@@ -164,7 +192,7 @@ def test_wizard_flag_turns_features_on_and_writes_the_terminal_unit(tmp_path, ca
     assert "remote          terminal, reboot" in capsys.readouterr().out
 
 
-@pytest.mark.usefixtures("machine")
+@pytest.mark.usefixtures("spark_machine")
 def test_wizard_rejects_a_misspelt_feature_before_writing_anything(tmp_path):
     root = tmp_path / "a"
     with pytest.raises(SystemExit, match="unknown remote feature"):
@@ -219,8 +247,8 @@ def test_netboot_plan_is_locked_to_one_mac_and_writes_the_config(tmp_path, capsy
     ({"minutes": 100000}, "minutes"),
     ({"subnet": "300.1.1.1/8"}, "not a network"),
 ])
-def test_netboot_refuses_values_that_could_end_up_in_the_config(kw, msg):
-    args = {"mac": "aa:bb:cc:dd:ee:ff", "iface": "eth0", "bootfile": "snp.efi", "tftp_root": "/srv/tftp",
+def test_netboot_refuses_values_that_could_end_up_in_the_config(kw, msg, tmp_path):
+    args = {"mac": "aa:bb:cc:dd:ee:ff", "iface": "eth0", "bootfile": "snp.efi", "tftp_root": str(tmp_path / "tftp"),
             "subnet": "10.0.0.0/24"}
     args.update(kw)
     minutes = args.pop("minutes", 30)
@@ -238,7 +266,7 @@ def test_netboot_derives_the_network_from_the_port_and_warns_about_missing_piece
     assert any("does not exist" in w for w in plan.warnings) and any("dnsmasq is not installed" in w
                                                                        for w in plan.warnings)
     with pytest.raises(netboot.NetbootError, match="no IPv4"):
-        netboot.build_plan("aa:bb:cc:dd:ee:ff", "x0", "snp.efi", "/srv/tftp",
+        netboot.build_plan("aa:bb:cc:dd:ee:ff", "x0", "snp.efi", str(tmp_path / "t"),
                            list_ifaces=lambda: [Iface(name="x0")])
 
 
@@ -270,7 +298,9 @@ def test_netboot_serve_runs_dnsmasq_in_the_foreground_for_a_bounded_time_and_cle
 
     assert netboot.serve(plan, popen=Proc, which=lambda n: "/usr/sbin/dnsmasq") == 0
     assert seen["argv"][:2] == ["/usr/sbin/dnsmasq", "--keep-in-foreground"]
-    assert seen["text"] == plan.config and seen["mode"] == 0o600 and seen["terminated"]
+    assert seen["text"] == plan.config and seen["terminated"]
+    if os.name == "posix":
+        assert seen["mode"] == 0o600
     assert not seen["conf"].exists(), "the config must not outlive the helper"
     with pytest.raises(netboot.NetbootError, match="not installed"):
         netboot.serve(plan, popen=Proc, which=lambda n: None)
@@ -375,7 +405,8 @@ def test_ws_url_follows_the_api_scheme():
 
 @pytest.fixture
 async def demo():
-    async with DemoCluster(remote={"terminal": True}) as d:
+    remote = {"terminal": True} if sys.platform == "linux" else {}
+    async with DemoCluster(remote=remote) as d:
         yield d
 
 
@@ -447,19 +478,37 @@ async def test_client_escape_disconnects_and_keeps_what_follows_it_off_the_node(
     assert b"before42" in out and b"after-never" not in out
 
 
-async def test_client_reports_a_refused_ticket_plainly(demo):
-    bad = termclient.ws_url(demo.url, "/api/v1/remote/terminal/ws", "not-a-ticket")
+async def test_client_reports_a_refused_ticket_plainly():
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response
+
+    async def refused(*args, **kwargs):
+        raise InvalidStatus(Response(403, "Forbidden", Headers(), b""))
+
     with pytest.raises(termclient.TerminalClientError, match="refused the terminal"):
-        await drive(bad, b"")
+        await termclient.run_session("ws://controller/terminal", stdin_fd=-1, stdout_fd=-1,
+                                     size=lambda: (100, 30), raw=False, connect=refused)
 
 
-async def test_client_surfaces_an_error_frame_from_the_node(tmp_path):
-    from twinspark.remote.policy import write_policy
-    async with DemoCluster(remote={"terminal": True}) as d:
-        url = await open_ticket(d)
-        write_policy(d.b_layout.etc / "remote-policy.json", {"terminal": False}, chown_root=False)
-        with pytest.raises(termclient.TerminalClientError, match="sudo tsm remote enable terminal"):
-            await drive(url, b"")
+async def test_client_surfaces_an_error_frame_from_the_node(monkeypatch):
+    class Socket:
+        async def frames(self):
+            yield json.dumps({"type": "error", "error": "sudo tsm remote enable terminal"})
+
+        def __aiter__(self):
+            return self.frames()
+
+        async def close(self):
+            pass
+
+    async def connect(*args, **kwargs):
+        return Socket()
+
+    monkeypatch.setattr(termclient, "_start_reader", lambda loop, fd, queue: lambda: None)
+    with pytest.raises(termclient.TerminalClientError, match="sudo tsm remote enable terminal"):
+        await termclient.run_session("ws://controller/terminal", stdin_fd=-1, stdout_fd=-1,
+                                     size=lambda: (100, 30), raw=False, connect=connect)
 
 
 # ---- `tsm remote …` through a live controller ------------------------------------------------
@@ -501,3 +550,27 @@ async def test_remote_bundle_command_downloads_a_file(demo, tmp_path):
         assert any(m.name.endswith("tsm/vault-slots.txt") for m in t.getmembers())
     assert io.BytesIO(out.read_bytes()).read(2) == b"\x1f\x8b"
     assert base64 and time  # keep imports honest for linters
+
+
+def test_local_privileged_commands_explain_missing_unix_identity(tmp_path, monkeypatch):
+    monkeypatch.delattr(os, "geteuid", raising=False)
+    with pytest.raises(SystemExit, match="needs Linux"):
+        cli_remote._sudo_again(SimpleNamespace(root="/", dry=False))
+    with pytest.raises(SystemExit, match="need Linux"):
+        cli_remote._pick_priv(None)
+    with pytest.raises(SystemExit, match="netboot serve needs Linux"):
+        run_cli("netboot", "serve", "--mac", "aa:bb:cc:dd:ee:ff", "--iface", "lo",
+                "--subnet", "10.0.0.0/24", "--tftp-root", tmp_path / "tftp")
+    # A plan or sandbox does not require local privilege or a Linux installation.
+    cli_remote._sudo_again(SimpleNamespace(root=str(tmp_path), dry=False))
+    cli_remote._sudo_again(SimpleNamespace(root="/", dry=True))
+
+
+def test_linux_privilege_selection_preserves_root_and_privd_paths(monkeypatch):
+    from twinspark.agent.privd import PrivClient
+
+    config = SimpleNamespace(runtime=SimpleNamespace(privd_socket="/run/twinspark/privd.sock"))
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    assert isinstance(cli_remote._pick_priv(config), privops.LocalPriv)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    assert isinstance(cli_remote._pick_priv(config), PrivClient)

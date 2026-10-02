@@ -262,6 +262,61 @@ async def test_power_refuses_a_busy_cluster_unless_forced(ctl):
         assert r.status_code == 200
 
 
+@pytest.mark.parametrize("operation", ["power", "plug_cycle", "plug_on"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_remote_power_reserves_cluster_until_finished(ctl, monkeypatch, operation, outcome):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def pending(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        if outcome == "failure":
+            raise RemoteError("mock node unavailable", 502)
+        return {} if operation == "power" else 200
+
+    monkeypatch.setattr(ctl.remote, "_call", pending)
+    monkeypatch.setattr(ctl.remote, "_plug_call", pending)
+    monkeypatch.setattr(ctl.remote, "sleep", pending)
+    request = (ctl.remote.power("B", "reboot", "REBOOT B") if operation == "power" else
+               ctl.remote.plug("B", "cycle" if operation == "plug_cycle" else "on", "CUT POWER B"))
+    task = asyncio.create_task(request)
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert ctl.busy()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(ctl._lock.acquire(), 0.02)
+        if outcome == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            if outcome == "failure":
+                with pytest.raises(RemoteError, match="mock node unavailable"):
+                    await task
+            else:
+                await task
+        assert not ctl.busy(), "success, failure and cancellation must all release the reservation"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_forced_power_and_recovery_on_preserve_an_existing_reservation(ctl, monkeypatch):
+    async def plug_ok(*args):
+        return 200
+
+    monkeypatch.setattr(ctl.remote, "_plug_call", plug_ok)
+    await ctl._lock.acquire()
+    try:
+        await ctl.remote.power("B", "reboot", "REBOOT B", force=True)
+        await ctl.remote.plug("B", "off", "CUT POWER B", force=True)
+        await ctl.remote.plug("B", "on", "")
+        assert ctl._lock.locked(), "recovery requests cannot release another operation's reservation"
+    finally:
+        ctl._lock.release()
+
+
 async def test_remote_management_works_while_maintenance_has_the_cluster_reserved(ctl):
     """A failed update is exactly when you need a terminal; other changes stay blocked."""
     ctl.store.kv_set("maintenance", {"state": "failed"})

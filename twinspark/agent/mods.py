@@ -19,8 +19,10 @@ import hashlib
 import io
 import os
 import re
+import secrets
 import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 import threading
@@ -120,10 +122,22 @@ def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, 
                 if _exchange(tmp, final):
                     pass                                  # tmp now holds the old version; cleaned below
                 else:
-                    trash = root / f".trash-{name}-{os.getpid()}"
-                    final.rename(trash)
-                    tmp.rename(final)
-                    tmp = trash
+                    # A native exchange is unavailable on Windows. Retain the old
+                    # tree until publication succeeds, and restore it if rename fails.
+                    # Failed recovery backups are deliberately excluded from stale
+                    # temp sweeping so a later install cannot erase the only old copy.
+                    backup = root / f".backup-{name}-{secrets.token_hex(6)}"
+                    final.rename(backup)
+                    try:
+                        tmp.rename(final)
+                    except BaseException:
+                        try:
+                            backup.rename(final)
+                        except OSError as exc:
+                            raise ModError("mod replacement and rollback failed; previous version remains at "
+                                           f"{backup}") from exc
+                        raise
+                    tmp = backup
             else:
                 tmp.rename(final)
                 tmp = None
@@ -136,6 +150,8 @@ def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, 
 
 def _exchange(a: Path, b: Path) -> bool:
     """renameat2(RENAME_EXCHANGE): swap two directories atomically (Linux). False if unsupported."""
+    if sys.platform != "linux":
+        return False
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         return libc.renameat2(-100, os.fsencode(a), -100, os.fsencode(b), 2) == 0   # AT_FDCWD, EXCHANGE

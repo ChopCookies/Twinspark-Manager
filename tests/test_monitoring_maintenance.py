@@ -258,6 +258,84 @@ async def test_cluster_update_order_and_exact_revision_restore(cluster, monkeypa
     await c.aclose()
 
 
+def restoring_checkpoint(ctrl, previous):
+    state = {"run_id": "9" * 32, "state": "running", "phase": "restoring", "firmware": False,
+             "previous": previous, "order": ["B", "A"], "index": 2, "nodes": {},
+             "restore_job": None, "deadline": time.time() + 60}
+    ctrl.store.kv_set("maintenance", state)
+    for alias in list(ctrl.gateway.routes):
+        ctrl.gateway.clear_route(alias)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_restart_during_restore_rebuilds_exact_revision_routes_while_maintenance_is_reserved(cluster):
+    c = cluster.controller
+    c.create_profile(draft())
+    activation = await c.activate("qwen")
+    assert (await cluster.wait_job(activation.job_id)).state.value == "completed"
+    previous = c.active()
+    changed = draft()
+    changed.simple.context_length = 8192
+    newer = c.save_revision(changed)
+    state = restoring_checkpoint(c, previous)
+    assert c.busy()
+    await c.maintenance.tick(state)
+    assert c.maintenance.state()["state"] == "completed"
+    assert c.gateway.routes["default"].revision_id == previous["revision_id"] != newer.revision_id
+    assert c.active()["revision_id"] == previous["revision_id"] and not c.busy()
+    await c.aclose()
+
+
+@pytest.mark.asyncio
+async def test_restore_checkpoint_holds_cluster_if_any_model_container_is_unhealthy(cluster, monkeypatch):
+    c = cluster.controller
+    c.create_profile(draft())
+    activation = await c.activate("qwen")
+    await cluster.wait_job(activation.job_id)
+    restoring_checkpoint(c, c.active())
+    original = c.agents["B"].call
+
+    async def unhealthy(action, **params):
+        if action == "health_probe":
+            return {"healthy": False}
+        return await original(action, **params)
+
+    monkeypatch.setattr(c.agents["B"], "call", unhealthy)
+    c.maintenance.ensure_running()
+    await c.maintenance.task
+    assert c.maintenance.state()["state"] == "failed" and c.busy()
+    assert not c.gateway.routes["default"].backends
+    await c.aclose()
+
+
+@pytest.mark.asyncio
+async def test_restore_does_not_resurrect_routes_after_active_state_changes_during_health(cluster, monkeypatch):
+    c = cluster.controller
+    c.create_profile(draft())
+    activation = await c.activate("qwen")
+    await cluster.wait_job(activation.job_id)
+    state = restoring_checkpoint(c, c.active())
+    entered, allow = asyncio.Event(), asyncio.Event()
+    original = c.agents["A"].call
+
+    async def delayed_health(action, **params):
+        if action == "health_probe":
+            entered.set()
+            await allow.wait()
+        return await original(action, **params)
+
+    monkeypatch.setattr(c.agents["A"], "call", delayed_health)
+    tick = asyncio.create_task(c.maintenance.tick(state))
+    await entered.wait()
+    c.store.kv_set("active", None)
+    allow.set()
+    with pytest.raises(RuntimeError, match="restoring the model failed"):
+        await tick
+    assert c.active() is None and not c.gateway.routes["default"].backends
+    await c.aclose()
+
+
 @pytest.mark.asyncio
 async def test_foreign_workload_holds_cluster_without_updating(cluster):
     c = cluster.controller

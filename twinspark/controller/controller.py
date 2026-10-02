@@ -560,7 +560,11 @@ class Controller:
         if not active:
             return None
         await self._wait_for_agents(self.config.startup_wait_s)
+        if self.busy() or self.active() != active:
+            return None
         if await self._adopt_running(active):
+            return None
+        if self.busy() or self.active() != active:
             return None
         if not self.config.autostart:
             return None
@@ -603,6 +607,10 @@ class Controller:
                 if not r.get("healthy"):
                     return False
         except Exception:  # noqa: BLE001
+            return False
+        # Startup probes run while the GUI is available. Respect a stop, switch
+        # or maintenance request that arrived while waiting for node health.
+        if self.busy() or self.active() != active:
             return False
         observed = self.store.kv_get(f"observed:{rev.revision_id}") or {}
         for alias, backends in plan.routes.items():

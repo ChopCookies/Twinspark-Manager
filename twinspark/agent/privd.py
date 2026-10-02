@@ -131,11 +131,14 @@ class PrivClient:
         self.timeout = timeout
 
     def available(self) -> bool:
-        return os.path.exists(self.socket_path) and os.access(self.socket_path, os.R_OK | os.W_OK)
+        return (hasattr(socket, "AF_UNIX") and os.path.exists(self.socket_path)
+                and os.access(self.socket_path, os.R_OK | os.W_OK))
 
     def call(self, op: str, params: dict[str, Any] | None = None) -> Any:
         if op not in PRIV_OPS:
             raise ValueError(f"unknown privileged op: {op}")
+        if not hasattr(socket, "AF_UNIX"):
+            raise PrivdUnavailable("tsm-privd requires Unix sockets; privileged actions are unavailable on this host")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(self.timeout)

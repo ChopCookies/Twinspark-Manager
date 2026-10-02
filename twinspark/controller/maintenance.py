@@ -122,6 +122,44 @@ class Maintenance:
                 break
             await asyncio.sleep(max(0.01, self.ctrl.poll_interval))
 
+    async def _restore_running(self, previous, run_id):
+        """Verify the reserved maintenance restore without using startup adoption.
+
+        Startup adoption refuses a busy controller, while maintenance intentionally
+        remains busy through verification. Compare revision identity separately from
+        activation timestamps, and recheck state after awaiting node health.
+        """
+        c = self.ctrl
+        if c._lock.locked():
+            return False
+        active = c.active()
+        if active and any(active.get(key) != previous.get(key) for key in ("profile", "revision_id")):
+            return False
+        profile = c.get_profile(previous["profile"])
+        revision = profile.get_revision(previous["revision_id"]) if profile else None
+        if not revision:
+            return False
+        try:
+            plan = c.launch_plan(revision)
+            for container in plan.containers:
+                result = await c.agents[container.node].call(
+                    "health_probe", name=container.name, url=container.health_url)
+                if not result.get("healthy"):
+                    return False
+        except Exception:
+            return False
+        current = self.state()
+        if (c._lock.locked() or c.active() != active or current.get("run_id") != run_id
+                or current.get("state") != "running" or current.get("phase") != "restoring"):
+            return False
+        observed = c.store.kv_get(f"observed:{revision.revision_id}") or {}
+        for alias, backends in plan.routes.items():
+            model = plan.route_models.get(alias, plan.served_model_name)
+            c.gateway.set_route(alias, backends, model, revision.revision_id,
+                                max_model_len=(observed.get("models") or {}).get(model, {}).get(
+                                    "max_model_len", observed.get("max_model_len")))
+        return True
+
     async def tick(self, state):
         c = self.ctrl
         if time.time() > state["deadline"]:
@@ -195,7 +233,7 @@ class Maintenance:
         job = c.store.load_job(state["restore_job"]) if state.get("restore_job") else None
         if job and job.state.value in ("pending", "running"):
             return
-        if await c._adopt_running(previous):
+        if await self._restore_running(previous, rid):
             c.store.kv_set("active", previous)
             self.save(state, state="completed", phase="done")
             c._audit("controller", "maintenance.completed", "cluster", {"run_id": rid})

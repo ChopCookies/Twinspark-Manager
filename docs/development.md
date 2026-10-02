@@ -8,8 +8,8 @@ real HTTP servers on loopback, fake `/sys` trees and canned command output.
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev,hf]"
-.venv/bin/pytest                    # Python tests (152 original + setup / demo / checklist tests)
-node --test tests/web_client.test.cjs   # web-client tests, no browser needed
+.venv/bin/pytest                    # all Python tests, including merged recipe / setup / remote workflows
+node --test tests/*.test.cjs         # all web-client tests, no browser needed
 .venv/bin/ruff check .
 python -m pip wheel --no-deps . --wheel-dir dist     # installable wheel incl. cookbook + web UI
 ```
@@ -22,8 +22,10 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pytest -q -rs
 ```
 
-Four HF-cache tests need symbolic-link permissions and skip when Windows denies them; one
-executable-bit test needs a POSIX filesystem. Run the full suite on Linux before deploying.
+HF-cache symlink tests skip when Windows denies link creation. Linux PTYs, Unix sockets,
+root ownership, executable bits and atomic directory exchange have separate platform checks;
+their remaining workflow and error tests still run on Windows. Installer tests use Bash with
+fake system tools and skip if Bash is unavailable. Run the full suite on Linux before deploying.
 
 ## `tsm demo`: the whole stack on one machine
 
@@ -38,7 +40,7 @@ async with DemoCluster() as d:           # d.url, d.key, d.gateway_url, d.contro
     ...                                  # drive it with httpx or a headless browser
 ```
 
-`DemoCluster(remote={"terminal": True})` also starts the terminal services (`tsm demo --with-terminal`);
+On Linux, `DemoCluster(remote={"terminal": True})` also starts the terminal services (`tsm demo --with-terminal`);
 that terminal is a real shell as your user, so it is off by default. Power, boot and Wake-on-LAN need the
 root helper and are not available in the demo; their tests use fake `systemctl` / `efibootmgr` / `ethtool`
 through the `privops.RUN` hook.
@@ -70,9 +72,9 @@ The preview serves the built `web/dist` assets: rebuild and refresh after editin
 ## Test suites
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider   # ~40 s, no hardware, no network
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider   # no hardware; HTTP tests use loopback
 ruff check .
-node --test tests/web_client.test.cjs                                # GUI logic, no browser
+node --test tests/*.test.cjs                                         # GUI logic, no browser
 ```
 
 `tests/test_hardening_api.py`, `_controller.py` and `_agent.py` hold the regression tests for every bug

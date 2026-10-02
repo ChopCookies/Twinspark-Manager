@@ -17,6 +17,9 @@ import uvicorn
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+if sys.platform != "linux":
+    pytest.skip("needs Linux PTYs", allow_module_level=True)
+
 from twinspark.remote import policy as pol
 from twinspark.remote import terminal as term
 from twinspark.remote.termd import build_termd_app

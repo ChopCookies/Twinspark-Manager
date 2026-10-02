@@ -103,10 +103,16 @@ sudo tsm setup --root /tmp/stage --yes --no-start      # build a complete instal
 ## What you get
 
 - **Web GUI** (served by the controller): Get started, Dashboard, System status, Updates,
-  Profiles, Cookbook, Model files, Mods, Planner, Diagnostics, **Remote**, Jobs, Logs.
+  Profiles, Cookbook, **Integrations**, Model files, Mods, Planner, Diagnostics, **Remote**, Jobs, Logs.
 - **Recipes → profiles.** Built-in researched configs and community recipes (eugr/spark-vllm-docker
   format) by URL, paste or file; immutable revisions (model commit + image digest); diff, duplicate,
   known-good tracking; *Pin & prepare* stages weights without touching the model that is serving.
+  Reviewed imports can pin and prepare automatically; source updates retain local experiment settings
+  and show conflicts before creating an updated profile.
+- **Agent clients and evaluation harnesses.** Generate setup files for OpenCode, Aider,
+  LangGraph/LangChain, OpenClaw, Hermes and LM Evaluation Harness from stable model aliases.
+  Use separate coding/planning models, check protocol compatibility, and record evaluation metrics
+  against exact recipe revisions. Simulated checks and imported reports keep their evidence labels.
 - **Topologies:** `single-a`, `single-b`, `replicated`, `tp2`, `pp2`, `tp-ep`, plus **split**
   profiles (a different model on each node). Native multi-node vLLM or Ray.
 - **Safe switching:** preflight → download / rsync A→B over QSFP → drain → stop → reclaim memory →
@@ -216,6 +222,8 @@ Update both nodes (the Get started page warns when versions differ).
 ## More documentation
 
 - [Recipe and split-model workflow](docs/recipe-workflow.md)
+- [Automatic recipe imports and source updates](docs/recipe-automation.md)
+- [Agent clients and evaluation harnesses](docs/agent-integrations.md)
 - [Monitoring and coordinated maintenance](docs/maintenance.md)
 - [Remote management: terminal, logs, power, Wake-on-LAN, network boot](docs/remote-management.md)
 - [Development, testing and the demo harness](docs/development.md)

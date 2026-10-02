@@ -20,6 +20,7 @@ say()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m!  %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
+ORIGINAL_ARGS=("$@")
 NO_SETUP=0; UNINSTALL=0; PURGE=0; PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -46,13 +47,13 @@ esac
 if [ "$(id -u)" -ne 0 ] && [ -z "${TSM_NO_SUDO:-}" ]; then
   command -v sudo >/dev/null 2>&1 || die "run this as root (sudo is not installed)"
   say "Installing needs root — re-running with sudo"
-  exec sudo -E bash "$0" "$@"
+  exec sudo -E bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
 uninstall() {
   say "Stopping TwinSpark services"
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    for u in twinspark-controller twinspark-agent twinspark-privd; do
+    for u in twinspark-terminal twinspark-controller twinspark-agent twinspark-privd; do
       systemctl disable --now "$u" 2>/dev/null || true
       rm -f "/etc/systemd/system/$u.service"
     done

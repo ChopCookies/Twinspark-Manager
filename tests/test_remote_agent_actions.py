@@ -94,6 +94,28 @@ def test_status_reports_policy_services_and_never_needs_root(actions, fake_run):
     assert set(st["tools"]) == {"efibootmgr", "ethtool", "systemd-run", "journalctl"}
 
 
+def test_unavailable_host_metrics_are_reported_as_unknown(actions, fake_run, monkeypatch):
+    from twinspark.agent import remote_actions
+
+    def unavailable():
+        raise OSError("not supported")
+
+    monkeypatch.setattr(remote_actions.os, "getloadavg", unavailable, raising=False)
+    monkeypatch.setattr(remote_actions, "_uptime_s", lambda: None)
+    st = actions.registry["remote_status"]({})
+    assert st["loadavg"] is None and st["uptime_s"] is None and st["booted_at"] is None
+
+
+def test_privileged_client_without_unix_sockets_reports_unavailable(monkeypatch):
+    from twinspark.agent.privd import PrivClient, PrivdUnavailable
+
+    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
+    client = PrivClient("unused")
+    assert not client.available()
+    with pytest.raises(PrivdUnavailable, match="tsm-privd requires Unix sockets"):
+        client.call("remote_power", {"action": "reboot"})
+
+
 def test_status_with_no_policy_file_means_everything_is_off(actions, policy_path, fake_run):
     policy_path.unlink()
     st = actions.registry["remote_status"]({})

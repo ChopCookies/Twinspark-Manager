@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import os
 import stat
+import sys
 import tarfile
 import threading
 import time
@@ -92,7 +93,7 @@ async def test_agent_rejects_the_colon_trick_even_from_a_hand_made_request(clust
         await cluster.controller.agents["A"].call("container_start", spec=raw)
 
 
-async def test_symlinks_in_the_cache_cannot_lead_out_of_it(cluster, tmp_path):
+async def test_symlinks_in_the_cache_cannot_lead_out_of_it(cluster, tmp_path, require_symlinks):
     spec = single_a_spec(cluster)
     hf = tmp_path / "hf"
     hf.mkdir(exist_ok=True)
@@ -137,7 +138,9 @@ async def test_secret_values_reach_docker_through_a_private_file_not_argv(cluste
     assert rt.start(spec, {"VLLM_API_KEY": "s3cret-value"}) == "container-id"
     assert "s3cret-value" not in " ".join(seen["argv"])
     assert not any(a == "VLLM_API_KEY=${secret:backend_api_key}" for a in seen["argv"])
-    assert seen["mode"] == 0o600 and seen["body"] == "VLLM_API_KEY=s3cret-value\n"
+    assert seen["body"] == "VLLM_API_KEY=s3cret-value\n"
+    if os.name == "posix":
+        assert seen["mode"] == 0o600
     assert not Path(seen["path"]).exists(), "the secret file must be removed after docker run"
     with pytest.raises(RuntimeError_):
         rt.start(spec, {"VLLM_API_KEY": "line\nbreak"})
@@ -174,7 +177,15 @@ def test_tar_with_too_many_entries_is_refused(tmp_path):
         mods.install_mod(tmp_path / "mods", "big", b64(buf.getvalue()))
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="atomic directory exchange requires Linux renameat2")
 def test_replacing_a_mod_is_atomic_for_readers(tmp_path):
+    left, right = tmp_path / "exchange-left", tmp_path / "exchange-right"
+    left.mkdir()
+    right.mkdir()
+    if not mods._exchange(left, right):
+        pytest.skip("renameat2 directory exchange is unavailable on this filesystem")
+    left.rmdir()
+    right.rmdir()
     root = tmp_path / "mods"
     mods.install_mod(root, "patch", b64(zip_bytes({"run.sh": b"#!/bin/sh\necho v0\n"})))
     missing, stop = [], threading.Event()
@@ -219,6 +230,60 @@ def test_leftover_temp_dirs_are_swept_and_the_number_of_mods_is_capped(tmp_path,
     mods.install_mod(root, "two", archive)                    # replacing an existing one is fine
 
 
+def test_non_linux_exchange_does_not_attempt_to_load_libc(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(mods, "sys", SimpleNamespace(platform="win32"))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unsupported platforms must not load libc")
+
+    monkeypatch.setattr(mods.ctypes, "CDLL", forbidden)
+    assert mods._exchange(tmp_path / "a", tmp_path / "b") is False
+
+
+def test_failed_fallback_mod_publish_restores_the_existing_tree(tmp_path, monkeypatch):
+    root = tmp_path / "mods"
+    old = mods.install_mod(root, "patch", b64(zip_bytes({"run.sh": b"#!/bin/sh\necho old\n", "state": b"old"})))
+    monkeypatch.setattr(mods, "_exchange", lambda a, b: False)
+    original_rename = Path.rename
+
+    def fail_publish(self, target):
+        if self.name.startswith(".tmp-patch-") and Path(target) == root / "patch":
+            raise OSError("simulated publish failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_publish)
+    with pytest.raises(OSError, match="publish failure"):
+        mods.install_mod(root, "patch", b64(zip_bytes({"run.sh": b"#!/bin/sh\necho new\n"})))
+    assert mods.tree_hash(root / "patch") == old["hash"]
+    assert (root / "patch/state").read_bytes() == b"old"
+    assert [p.name for p in root.iterdir()] == ["patch"]
+
+
+def test_failed_mod_rollback_preserves_a_recovery_backup_even_after_stale_sweep(tmp_path, monkeypatch):
+    root = tmp_path / "mods"
+    mods.install_mod(root, "patch", b64(zip_bytes({"run.sh": b"#!/bin/sh\necho old\n"})))
+    monkeypatch.setattr(mods, "_exchange", lambda a, b: False)
+    original_rename = Path.rename
+
+    def fail_publish_and_restore(self, target):
+        if Path(target) == root / "patch" and self.name.startswith((".tmp-patch-", ".backup-patch-")):
+            raise OSError("simulated rename failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_publish_and_restore)
+    with pytest.raises(mods.ModError, match="previous version remains"):
+        mods.install_mod(root, "patch", b64(zip_bytes({"run.sh": b"#!/bin/sh\necho new\n"})))
+    backups = list(root.glob(".backup-patch-*"))
+    assert len(backups) == 1 and (backups[0] / "run.sh").read_text().endswith("old\n")
+    assert not list(root.glob(".tmp-patch-*"))
+    old = time.time() - 2 * mods.STALE_AFTER_S
+    os.utime(backups[0], (old, old))
+    mods._sweep_stale(root)
+    assert backups[0].is_dir(), "the previous mod must remain recoverable after a failed rollback"
+
+
 def test_names_with_a_trailing_newline_are_not_valid():
     assert mods.MOD_RE.match("ok") and not mods.MOD_RE.match("ok\n")
     assert _NAME_RE.match("tsm-x") and not _NAME_RE.match("tsm-x\n")
@@ -240,8 +305,10 @@ def test_a_failed_write_keeps_the_previous_secret(tmp_path, monkeypatch):
 def test_vault_files_are_private_and_the_master_key_is_never_overwritten(tmp_path):
     vault = SecretsVault(tmp_path / "s")
     vault.set("hf_token", "hf_x")
-    for p in (tmp_path / "s").iterdir():
-        assert stat.S_IMODE(p.stat().st_mode) == 0o600, p
+    assert vault.get("hf_token") == "hf_x"
+    if os.name == "posix":
+        for p in (tmp_path / "s").iterdir():
+            assert stat.S_IMODE(p.stat().st_mode) == 0o600, p
     key = vault.key_file.read_bytes()
     with pytest.raises(FileExistsError):
         _write_private(vault.key_file, b"another", exclusive=True)

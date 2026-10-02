@@ -36,7 +36,7 @@ def test_unreadable_policy_fails_closed_and_says_why(tmp_path, content):
     assert p.enabled == [] and p.error and p.present
 
 
-def test_symlinked_policy_is_ignored(tmp_path):
+def test_symlinked_policy_is_ignored(tmp_path, require_symlinks):
     real = tmp_path / "real.json"
     real.write_text('{"terminal": true}')
     link = tmp_path / "link.json"
@@ -45,7 +45,8 @@ def test_symlinked_policy_is_ignored(tmp_path):
     assert p.enabled == [] and "symlink" in p.error
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root-owned files would pass the ownership check")
+@pytest.mark.skipif(not hasattr(os, "geteuid") or getattr(os, "geteuid", lambda: 0)() == 0,
+                    reason="requires POSIX file ownership and a non-root test user")
 def test_policy_not_owned_by_root_is_ignored_when_root_is_required(tmp_path):
     f = tmp_path / "p.json"
     f.write_text('{"terminal": true}')
@@ -68,7 +69,8 @@ def test_write_policy_merges_atomically_and_keeps_limits(tmp_path):
     assert p.enabled == ["reboot"] and p.terminal_idle_s == 300
     data = json.loads(f.read_text())
     assert data["future_key"] == 1 and data["poweroff"] is False
-    assert (f.stat().st_mode & 0o777) == 0o644
+    if os.name == "posix":
+        assert (f.stat().st_mode & 0o777) == 0o644
     assert not [x for x in f.parent.iterdir() if x.name.startswith(".remote-policy")]
 
 

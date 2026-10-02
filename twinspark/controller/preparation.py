@@ -9,6 +9,34 @@ from .jobs import ActivationCoordinator
 from .state_machine import guidance_for
 
 
+async def prepare_steps(ctrl, job: Job, rev) -> None:
+    """Shared preparation stages; the caller owns the cluster lock and job lifetime."""
+    job.payload.update(_revision=rev, mem_total_gib=ctrl._mem_total(),
+                       node_mem_total={n: ctrl._mem_total([n]) for n in ctrl.agents})
+    coord = ActivationCoordinator(
+        config=ctrl.config, agents=ctrl.agents, gateway=ctrl.gateway,
+        planner=ctrl.planner, persist=ctrl._persist,
+        model_specs={part.identity.model_repo: ctrl.model_spec(part.identity.model_repo)
+                     for part in rev.parts()},
+        poll_interval=ctrl.poll_interval,
+        cancel_check=lambda: job.job_id in ctrl._cancel, staging_wait=ctrl._staging_wait)
+    for stage in (ActivationStage.VALIDATING, ActivationStage.RESOLVING,
+                  ActivationStage.DOWNLOADING, ActivationStage.SYNCING):
+        step = job.begin_step(stage)
+        ctrl._persist(job)
+        try:
+            if job.job_id in ctrl._cancel:
+                raise RuntimeError("cancelled by user")
+            msg = await coord.handle(job, stage, step)
+            if job.job_id in ctrl._cancel:
+                raise RuntimeError("cancelled by user")
+        except Exception as exc:
+            job.fail_step(step, str(exc), getattr(exc, "excerpt", None))
+            raise
+        job.finish_step(step, msg or step.message)
+        ctrl._persist(job)
+
+
 async def prepare(ctrl, name: str, revision: str = "latest") -> Job:
     from .controller import BusyError
 
@@ -30,31 +58,13 @@ async def prepare(ctrl, name: str, revision: str = "latest") -> Job:
     ctrl.busy_profile = name
 
     async def run():
-        step = None
         try:
-            job.payload.update(_revision=rev, mem_total_gib=ctrl._mem_total(),
-                               node_mem_total={n: ctrl._mem_total([n]) for n in ctrl.agents})
-            coord = ActivationCoordinator(
-                config=ctrl.config, agents=ctrl.agents, gateway=ctrl.gateway,
-                planner=ctrl.planner, persist=ctrl._persist,
-                model_specs={part.identity.model_repo: ctrl.model_spec(part.identity.model_repo)
-                             for part in rev.parts()},
-                poll_interval=ctrl.poll_interval,
-                cancel_check=lambda: job.job_id in ctrl._cancel, staging_wait=ctrl._staging_wait)
-            for stage in (ActivationStage.VALIDATING, ActivationStage.RESOLVING,
-                          ActivationStage.DOWNLOADING, ActivationStage.SYNCING):
-                step = job.begin_step(stage)
-                ctrl._persist(job)
-                if job.job_id in ctrl._cancel:
-                    raise RuntimeError("cancelled by user")
-                msg = await coord.handle(job, stage, step)
-                job.finish_step(step, msg)
-                ctrl._persist(job)
+            await prepare_steps(ctrl, job, rev)
             job.state = JobState.COMPLETED
             job.payload["ready"] = True
         except Exception as exc:
-            if step:
-                job.fail_step(step, str(exc))
+            job.state = JobState.FAILED
+            job.error = str(exc)
             job.guidance = guidance_for(str(exc))
         finally:
             job.payload.pop("_revision", None)

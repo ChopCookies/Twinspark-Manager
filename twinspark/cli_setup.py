@@ -451,7 +451,7 @@ def cmd_go_live(args, api=None):
     if not path.exists():
         sys.exit(f"{path} not found — run `sudo tsm setup` first")
     target = "dry-run" if args.revert else "docker"
-    if os.geteuid() != 0 and lay.root == Path("/"):
+    if not lay.sandbox and os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable, "-m", "twinspark.cli", *sys.argv[1:]])
     if target == "docker":
         d = hostprobe.docker_status(hostprobe.default_service_user())

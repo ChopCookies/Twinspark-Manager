@@ -20,10 +20,15 @@ from ..api import (
     routes_cookbook,
     routes_diagnostics,
     routes_files,
+    routes_integrations,
     routes_profiles,
     routes_remote,
     routes_system,
 )
+from ..api.body_limit import JSON_LIMIT as _JSON_LIMIT
+from ..api.body_limit import UPLOAD_LIMIT as _UPLOAD_LIMIT
+from ..api.body_limit import UPLOAD_PATHS as _UPLOAD_PATHS
+from ..api.body_limit import BodyLimitMiddleware
 from ..api.deps import check_key
 from .controller import Controller
 from .remote import RemoteError
@@ -32,9 +37,6 @@ log = logging.getLogger("twinspark.app")
 WEB_ASSETS = Path(__file__).resolve().parent.parent / "web" / "dist"
 
 _BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-_JSON_LIMIT = 4 * 1024 ** 2                       # ordinary API bodies are a few KiB
-_UPLOAD_LIMIT = 100 * 1024 ** 2                   # mod archives travel base64-encoded
-_UPLOAD_PATHS = ("/api/v1/mods",)
 
 
 def _clean(value: object, limit: int) -> str:
@@ -77,6 +79,7 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
     app.state.management_key = management_key
     app.state.rate_buckets = {}
 
+    app.add_middleware(BodyLimitMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
     @app.middleware("http")
@@ -124,7 +127,7 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
 
     for r in (routes_profiles.router, routes_activation.router, routes_system.router,
               routes_cookbook.router, routes_diagnostics.router, routes_files.router,
-              routes_remote.router, routes_remote.ws_router):
+              routes_remote.router, routes_remote.ws_router, routes_integrations.router):
         app.include_router(r)
 
     @app.get("/api/v1/health")

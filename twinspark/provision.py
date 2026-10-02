@@ -309,7 +309,7 @@ remote_mgmt:
 def _rw_paths(a: Answers, lay: Layout, controller: bool) -> str:
     paths = [lay.state, lay.secrets]
     if not controller:
-        paths += [lay.cache, Path(a.hf_cache_dir or lay.state / "hf-cache")]
+        paths += [lay.cache, a.hf_cache_dir or lay.state / "hf-cache"]
     return " ".join(str(p) for p in dict.fromkeys(paths))
 
 

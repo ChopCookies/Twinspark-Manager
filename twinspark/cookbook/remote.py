@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import time
+from copy import deepcopy
 from typing import Any, Optional
 from urllib.parse import urljoin, urlsplit
 
@@ -44,7 +45,7 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
     key = f"list:{src}"
     hit = _cache.get(key)
     if hit and not refresh and time.time() - hit[0] < _TTL:
-        return hit[1]
+        return deepcopy(hit[1])
     owner, repo, path, ref = parse_source(src)
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     c = _client(client)
@@ -62,7 +63,15 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
         raise RemoteError(f"{owner}/{repo}:{path} not found")
     if r.status_code != 200:
         raise RemoteError(f"GitHub returned HTTP {r.status_code}")
-    items = r.json() if isinstance(r.json(), list) else []
+    try:
+        items = r.json()
+    except ValueError as exc:
+        raise RemoteError("GitHub returned an invalid recipe listing") from exc
+    if not isinstance(items, list):
+        raise RemoteError("recipe source must point to a GitHub folder, not a file")
+    if any(not isinstance(it, dict) or not isinstance(it.get("name"), str)
+           or not isinstance(it.get("path"), str) for it in items):
+        raise RemoteError("GitHub returned an invalid recipe listing")
     files = [{"name": it["name"], "path": it["path"], "size": it.get("size"),
               "url": it.get("html_url"), "download_url": it.get("download_url"),
               "sha": it.get("sha")}
@@ -71,7 +80,8 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
              and not it["name"].lower().endswith(".meta.json")]
     out = {"source": src, "repo": f"{owner}/{repo}", "path": path, "ref": ref, "files": files,
            "fetched_at": time.time()}
-    _cache[key] = (time.time(), out)
+    files.sort(key=lambda item: item["name"].lower())
+    _cache[key] = (time.time(), deepcopy(out))
     return out
 
 
@@ -81,7 +91,7 @@ MAX_REDIRECTS = 3
 def check_public_url(url: str, resolve: bool = True) -> str:
     try:
         return _check_public_url(url, resolve)
-    except UnsafeURL as exc:
+    except (UnsafeURL, ValueError) as exc:
         raise RemoteError(str(exc).replace("URLs", "recipe URLs", 1)) from exc
 
 
@@ -95,9 +105,12 @@ def fetch_text(url: str, client: Optional[httpx.Client] = None) -> str:
     buf = bytearray()
     try:
         for _hop in range(MAX_REDIRECTS + 1):
-            with c.stream("GET", url) as r:
+            with c.stream("GET", url, follow_redirects=False) as r:
                 if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
-                    url = check_public_url(urljoin(url, r.headers["location"]), resolve=own)
+                    target = urljoin(url, r.headers["location"])
+                    if urlsplit(target).scheme != "https":
+                        raise RemoteError("recipe redirect must stay on https://")
+                    url = check_public_url(target, resolve=own)
                     continue
                 if r.status_code != 200:
                     raise RemoteError(f"{_host(url)} returned HTTP {r.status_code}")

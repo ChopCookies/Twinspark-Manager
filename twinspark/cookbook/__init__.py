@@ -23,6 +23,7 @@ from typing import Any, Optional
 from ..schemas.enums import VerificationStatus
 from ..schemas.profile import ProfileDraft
 from .eugr import RecipeImportError, parse_eugr_recipe, slugify
+from .tracking import record_import
 
 RECIPES_DIR = Path(__file__).resolve().parent / "recipes"
 _GITHUB_BLOB = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$")
@@ -44,26 +45,28 @@ def _files() -> dict[str, Path]:
 
 
 def _draft_from_file(path: Path, profile_name: Optional[str] = None) -> tuple[ProfileDraft, dict]:
+    text = path.read_text(encoding="utf-8")
     if path.suffix == ".json":
-        doc = json.loads(path.read_text(encoding="utf-8"))
-        if profile_name:
-            doc["name"] = profile_name
-        doc.setdefault("source", {}).setdefault("recipe", path.stem)
-        return ProfileDraft.model_validate(doc), {}
-    draft, report = parse_eugr_recipe(path.read_text(encoding="utf-8"), profile_name or path.stem,
+        draft, report = import_text(text, profile_name, source_ref=f"builtin:{path.name}")
+        draft.source["recipe"] = path.stem
+        return record_import(draft, text, f"builtin:{path.name}", "twinspark"), report
+    draft, report = parse_eugr_recipe(text, profile_name or path.stem,
                                       source_ref=f"builtin:{path.name}")
     extra = (draft.source or {})
     meta_path = path.with_suffix(".meta.json")
     update: dict[str, Any] = {}
+    metadata = None
     if meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        metadata = meta_path.read_text(encoding="utf-8")
+        meta = json.loads(metadata)
         if meta.get("verification"):
             update["verification"] = VerificationStatus(meta["verification"])
         if meta.get("kv_bytes_per_token"):
             extra = {**extra, "kv_bytes_per_token": meta["kv_bytes_per_token"]}
         extra = {**extra, **meta}
     update["source"] = {**extra, "recipe": path.stem}
-    return draft.model_copy(update=update), report
+    draft = draft.model_copy(update=update)
+    return record_import(draft, text, f"builtin:{path.name}", "eugr", metadata=metadata), report
 
 
 def list_recipes() -> list[dict[str, Any]]:
@@ -134,7 +137,9 @@ def import_eugr(text: str, profile_name: Optional[str] = None,
 def import_text(text: str, profile_name: Optional[str] = None, source_ref: Optional[str] = None,
                 overrides: Optional[dict[str, Any]] = None) -> tuple[ProfileDraft, dict]:
     """Any supported recipe text: a TwinSpark draft (JSON) or an eugr recipe (YAML)."""
-    stripped = text.lstrip()
+    if len(text.encode("utf-8")) > 512 * 1024:
+        raise RecipeImportError("recipe file larger than 512 KiB")
+    stripped = text.lstrip("\ufeff \t\r\n")
     if stripped.startswith("{"):
         try:
             doc = json.loads(stripped)
@@ -148,10 +153,11 @@ def import_text(text: str, profile_name: Optional[str] = None, source_ref: Optio
             raise RecipeImportError(f"not a valid TwinSpark recipe: {exc}") from exc
         if source_ref:
             draft.source.setdefault("ref", source_ref)
-        return draft, {"format": "twinspark", "mapped": {}, "dropped": [], "raw": [], "notes": []}
-    draft, report = parse_eugr_recipe(text, profile_name, overrides=overrides, source_ref=source_ref)
+        return record_import(draft, text, source_ref, "twinspark"), {
+            "format": "twinspark", "mapped": {}, "dropped": [], "raw": [], "notes": []}
+    draft, report = parse_eugr_recipe(stripped, profile_name, overrides=overrides, source_ref=source_ref)
     report["format"] = "eugr"
-    return draft, report
+    return record_import(draft, text, source_ref, "eugr", overrides), report
 
 
 def raw_url(url: str) -> str:

@@ -89,7 +89,11 @@ def _uptime(sec: Optional[float]) -> str:
 
 def _sudo_again(args) -> None:
     """Re-run this command with sudo when it needs root (never in a sandbox root or a dry run)."""
-    if args.root != "/" or os.geteuid() == 0 or getattr(args, "dry", False):
+    if args.root != "/" or getattr(args, "dry", False):
+        return
+    if not hasattr(os, "geteuid"):
+        sys.exit("Changing the local node policy needs Linux. Use `tsm remote` to manage a Spark from this machine.")
+    if os.geteuid() == 0:
         return
     print("This changes root-owned files, so it needs root — re-running with sudo.")
     try:
@@ -401,6 +405,8 @@ def cmd_remote_terminal(args, api) -> None:
 # ---- tsm node … (on this Spark, no controller needed) ------------------------------------------
 def _pick_priv(cfg):
     """Root does the privileged work itself; anyone else asks tsm-privd (and so meets the policy)."""
+    if not hasattr(os, "geteuid"):
+        sys.exit("Local node operations need Linux. Use `tsm remote` to manage a Spark from this machine.")
     from .agent.privd import PrivClient
     return privops.LocalPriv() if os.geteuid() == 0 else PrivClient(cfg.runtime.privd_socket)
 
@@ -660,6 +666,8 @@ def cmd_netboot(args, api=None) -> None:
             (Path(args.out) / "dnsmasq-netboot.conf").write_text(plan.config)
             print(f"\nwritten: {Path(args.out) / 'dnsmasq-netboot.conf'}")
         return
+    if not hasattr(os, "geteuid"):
+        sys.exit("netboot serve needs Linux; generate a plan here and run the helper on the Spark.")
     if os.geteuid() != 0:
         sys.exit("netboot serve needs root (DHCP and TFTP use privileged ports): sudo tsm netboot serve …")
     for w in plan.warnings:

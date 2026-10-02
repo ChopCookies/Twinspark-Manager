@@ -40,6 +40,13 @@ def _boot_id() -> str | None:
         return None
 
 
+def _loadavg() -> list[float] | None:
+    try:
+        return list(os.getloadavg())
+    except (AttributeError, OSError):
+        return None
+
+
 def _tcp_open(host: str, port: int, timeout: float = 0.6) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -61,6 +68,7 @@ def build(actions: "AgentActions") -> dict[str, Callable[[dict], Any]]:
 
     def status(params: dict) -> dict:
         pol = policy()
+        uptime = _uptime_s()
         which = privops.shutil.which
         try:
             ifaces = [i.as_dict() for i in hostprobe.list_interfaces() if not i.virtual]
@@ -86,8 +94,8 @@ def build(actions: "AgentActions") -> dict[str, Callable[[dict], Any]]:
         host = cfg.listener.bind if cfg.listener.bind not in ("0.0.0.0", "::") else "127.0.0.1"
         return {
             "node": cfg.node.node_id, "hostname": platform.node(), "version": __version__,
-            "kernel": platform.release(), "boot_id": _boot_id(), "uptime_s": _uptime_s(),
-            "booted_at": time.time() - (_uptime_s() or 0), "loadavg": list(os.getloadavg()),
+            "kernel": platform.release(), "boot_id": _boot_id(), "uptime_s": uptime,
+            "booted_at": time.time() - uptime if uptime is not None else None, "loadavg": _loadavg(),
             "policy": pol.as_dict(), "enabled": pol.enabled,
             "terminal_service": _tcp_open(host, rm.terminal_port),
             "privd": actions.privd.available(),

@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased — quick start, error testing, remote management
+## Unreleased — recipe automation, agent integrations, setup and remote management
+
+### Recipe automation and agent integrations
+
+- Reviewed recipe imports can pin and prepare both models in durable jobs with cancellation
+  and exact-revision retries. Source tracking compares upstream updates while retaining local
+  settings and displaying conflicts before creating a new experiment.
+- The Integrations page generates setup files for OpenCode, Aider, LangGraph/LangChain,
+  OpenClaw, Hermes and LM Evaluation Harness, including separate coding/planning aliases.
+- Compatibility jobs check chat, streaming, tool-result turns and structured output. Dry-run
+  results remain simulated; imported harness metrics remain reported evidence tied to an
+  immutable recipe revision.
+- Gateway streams clean up on cancellation. Read/write failures and HTTP 502/504 responses
+  are not replayed; explicit 503 responses may fail over to another replica. Probe responses
+  have byte and time limits.
+- Combined startup recovery respects operator stops and switches made while nodes reconnect.
+  Automatic recipe jobs retain profile deletion protection. Installer elevation preserves
+  command options, and uninstall removes the terminal service along with other manager units.
+- Maintenance restoration verifies the exact saved revision while retaining startup race protection.
+  Remote power scheduling and plug cycles reserve the cluster until the request finishes; explicit
+  force and recovery power-on retain their existing behavior.
+- Request body limits count streamed bytes as well as declared lengths. Windows demos support
+  native cache paths and short directory names, close their database before cleanup, and report
+  unsupported host readings as unavailable. Linux-only terminal and root operations fail clearly.
+- Mod publication on systems without Linux atomic exchange restores the previous installation
+  after a failed replacement, retaining a recovery backup if restoration also fails.
 
 ### Setup and first run (milestone 1)
 

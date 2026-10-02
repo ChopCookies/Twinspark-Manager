@@ -262,20 +262,35 @@ class RemoteService:
             raise RemoteError("the cluster is busy (an activation, preparation or maintenance run is in "
                               "progress); wait for it or repeat with force", 409)
 
+    @contextlib.asynccontextmanager
+    async def _reserve_power(self, force: bool, recovery_on: bool = False):
+        # Forced power changes and turning a failed node back on remain available during
+        # maintenance. Idle requests reserve the cluster until scheduling/cycling finishes.
+        if force or (recovery_on and self.ctrl.busy()):
+            yield
+            return
+        self._guard_busy(False)
+        # acquire() completes without yielding when this asyncio lock is unlocked.
+        await self.ctrl._lock.acquire()
+        try:
+            yield
+        finally:
+            self.ctrl._lock.release()
+
     async def power(self, node: str, action: str, confirm: str, delay_s: int = 5, force: bool = False) -> dict:
         if action not in ("reboot", "poweroff"):
             raise RemoteError("action must be 'reboot' or 'poweroff'")
         want = f"{action.upper()} {node}"
         if confirm != want:
             raise RemoteError(f"type '{want}' to confirm", 422)
-        self._guard_busy(force)
-        act = self.ctrl.active()
-        r = await self._call(node, "remote_power", timeout=30, action=action, delay_s=delay_s)
-        own = node == self.ctrl.config.node.node_id
-        self._audit(f"remote.{action}", node, {"delay_s": delay_s, "active_model": act["profile"] if act else None,
-                                              "controller_goes_down": own})
-        return {**r, "controller_goes_down": own, "active_model": act["profile"] if act else None,
-                "autostart": self.ctrl.config.autostart}
+        async with self._reserve_power(force):
+            act = self.ctrl.active()
+            r = await self._call(node, "remote_power", timeout=30, action=action, delay_s=delay_s)
+            own = node == self.ctrl.config.node.node_id
+            self._audit(f"remote.{action}", node, {"delay_s": delay_s, "active_model": act["profile"] if act else None,
+                                                  "controller_goes_down": own})
+            return {**r, "controller_goes_down": own, "active_model": act["profile"] if act else None,
+                    "autostart": self.ctrl.config.autostart}
 
     async def power_cancel(self, node: str) -> dict:
         r = await self._call(node, "remote_power_cancel")
@@ -361,27 +376,27 @@ class RemoteService:
             if confirm != want:
                 raise RemoteError(f"this switches the machine off abruptly (no shutdown). "
                                   f"Type '{want}' to confirm", 422)
-            self._guard_busy(force)
-        plug = ep.plug
-        steps: list[int] = []
-        if action == "on":
-            if not plug.on:
-                raise RemoteError("this plug has no 'on' request configured", 409)
-            steps.append(await self._plug_call(plug.on))
-        elif action == "off":
-            if not plug.off:
-                raise RemoteError("this plug has no 'off' request configured", 409)
-            steps.append(await self._plug_call(plug.off))
-        elif plug.cycle:
-            steps.append(await self._plug_call(plug.cycle))
-        elif plug.off and plug.on:
-            steps.append(await self._plug_call(plug.off))
-            await self.sleep(plug.settle_s)
-            steps.append(await self._plug_call(plug.on))
-        else:
-            raise RemoteError("cycling needs either a 'cycle' request or both 'off' and 'on'", 409)
-        self._audit(f"remote.plug_{action}", node, {"http": steps})
-        return {"ok": True, "action": action, "http": steps}
+        async with self._reserve_power(force, recovery_on=action == "on"):
+            plug = ep.plug
+            steps: list[int] = []
+            if action == "on":
+                if not plug.on:
+                    raise RemoteError("this plug has no 'on' request configured", 409)
+                steps.append(await self._plug_call(plug.on))
+            elif action == "off":
+                if not plug.off:
+                    raise RemoteError("this plug has no 'off' request configured", 409)
+                steps.append(await self._plug_call(plug.off))
+            elif plug.cycle:
+                steps.append(await self._plug_call(plug.cycle))
+            elif plug.off and plug.on:
+                steps.append(await self._plug_call(plug.off))
+                await self.sleep(plug.settle_s)
+                steps.append(await self._plug_call(plug.on))
+            else:
+                raise RemoteError("cycling needs either a 'cycle' request or both 'off' and 'on'", 409)
+            self._audit(f"remote.plug_{action}", node, {"http": steps})
+            return {"ok": True, "action": action, "http": steps}
 
 
 def _triage(node: str, agent_ok: bool, answers: bool, ssh_ok: bool, link: Optional[dict], ep, detail: str,

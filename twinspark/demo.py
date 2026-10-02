@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import socket
+import sys
 import tempfile
 from contextlib import suppress
 from pathlib import Path
@@ -51,6 +52,8 @@ class DemoCluster:
     def __init__(self, base: Optional[Path] = None, seed: bool = True, mgmt_port: Optional[int] = None,
                  gateway_port: Optional[int] = None, extra: Optional[dict] = None,
                  remote: Optional[dict] = None):
+        if (remote or {}).get("terminal") and sys.platform != "linux":
+            raise ValueError("the demo terminal requires Linux PTYs; run the demo without --with-terminal")
         self._tmp = None
         if base is None:
             self._tmp = tempfile.TemporaryDirectory(prefix="twinspark-demo-")
@@ -74,6 +77,9 @@ class DemoCluster:
     # ---- provisioning (the same code path as a real install) ------------------------------
     def provision(self) -> None:
         user = getpass.getuser()
+        if not provision._USER_RE.fullmatch(user):
+            # Sandbox service files describe Linux users, even when the demo runs on Windows.
+            user = "twinspark-demo"
         common = dict(service_user=user, mgmt_port=self.mgmt_port,
                       gateway_port=self.gateway_port, gateway_bind="127.0.0.1", agent_port=self.agent_port,
                       terminal_port=self.terminal_port, remote=dict(self.remote),
@@ -140,6 +146,9 @@ class DemoCluster:
             with suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(t, timeout=10)
         self.servers, self.tasks = [], []
+        if self.controller is not None:
+            self.controller.store.close()
+            self.controller = None
         if self._tmp:
             self._tmp.cleanup()
             self._tmp = None

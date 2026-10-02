@@ -25,11 +25,12 @@ Multi-node wiring
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from ..schemas.config import ControllerConfig
 from ..schemas.enums import DistributedBackend, Topology
@@ -61,6 +62,7 @@ def immutable_image_ref(ref: str) -> bool:
 
 
 _MOUNT_PATH_RE = re.compile(r"/[A-Za-z0-9._/+@-]{1,500}")
+_WINDOWS_MOUNT_PATH_RE = re.compile(r"[A-Za-z]:[/\\][A-Za-z0-9._+@~-][A-Za-z0-9._/\\+@~-]{0,499}")
 
 
 class Mount(BaseModel):
@@ -68,15 +70,30 @@ class Mount(BaseModel):
     container: str
     read_only: bool = False
 
-    @field_validator("host", "container")
+    @field_validator("container")
     @classmethod
-    def _plain_absolute_path(cls, v: str) -> str:
+    def _plain_container_path(cls, v: str) -> str:
         # `docker run -v` splits on ':' — a colon (or comma, space, newline...) inside a path
         # would make docker mount something other than the path that was validated.
         if not _MOUNT_PATH_RE.fullmatch(v):
             raise ValueError(f"mount path must be absolute and use only letters, digits and "
                              f"'._/+@-': {v!r}")
         return v
+
+    @field_validator("host")
+    @classmethod
+    def _plain_host_path(cls, v: str) -> str:
+        if _MOUNT_PATH_RE.fullmatch(v):
+            return v
+        # Local Windows plans/dry-run agents use native cache paths. Spark agents
+        # validate this same schema on Linux and continue to accept POSIX hosts only.
+        # The drive prefix is the only permitted colon; UNC/device paths are excluded.
+        # Windows may expose a user's temp directory through an 8.3 name such as DANNYG~1.
+        if os.name == "nt" and _WINDOWS_MOUNT_PATH_RE.fullmatch(v):
+            parts = re.split(r"[/\\]+", v[3:])
+            if ".." not in parts and any(part not in ("", ".") for part in parts):
+                return v
+        raise ValueError(f"host mount path must be a plain absolute path without Docker mount separators: {v!r}")
 
 
 class ContainerSpec(BaseModel):
@@ -411,16 +428,20 @@ class LaunchPlanner:
     # ------------------------------------------------------------------
     def _mounts(self, mods: list[str]) -> list[Mount]:
         rt = self.config.runtime
-        mounts = [Mount(host=rt.hf_cache_dir, container=CONTAINER_HF_HOME)]
-        if rt.cache_mounts:
-            base = rt.compile_cache_dir.rstrip("/")
-            mounts += [Mount(host=f"{base}/{sub}", container=path)
-                       for sub, path in CACHE_MOUNTS.items()]
-        else:
-            mounts.append(Mount(host=rt.compile_cache_dir, container=CONTAINER_COMPILE_CACHE))
-        if mods:
-            mounts.append(Mount(host=rt.mods_dir, container=CONTAINER_MODS, read_only=True))
-        return mounts
+        try:
+            mounts = [Mount(host=rt.hf_cache_dir, container=CONTAINER_HF_HOME)]
+            if rt.cache_mounts:
+                base = rt.compile_cache_dir.rstrip("/")
+                mounts += [Mount(host=f"{base}/{sub}", container=path)
+                           for sub, path in CACHE_MOUNTS.items()]
+            else:
+                mounts.append(Mount(host=rt.compile_cache_dir, container=CONTAINER_COMPILE_CACHE))
+            if mods:
+                mounts.append(Mount(host=rt.mods_dir, container=CONTAINER_MODS, read_only=True))
+            return mounts
+        except ValidationError as exc:
+            raise LaunchError("invalid runtime mount paths: cache and mods directories must be plain absolute paths") \
+                from exc
 
     def _env(self, node: str, profile_env: dict[str, str], multi: bool) -> dict[str, str]:
         """defaults < node wiring < profile env (explicit recipe values win)."""

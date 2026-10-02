@@ -84,6 +84,8 @@ def machine(tmp_path, monkeypatch):
 
     monkeypatch.setattr(hostprobe, "probe_host", probe)
     monkeypatch.setattr(hostprobe, "port_free", lambda port, host="0.0.0.0": True)
+    monkeypatch.setattr(hostprobe, "docker_status", lambda user=None, run=None: {
+        "installed": True, "reachable": True, "in_group": True, "detail": "server 27.0.1"})
     return net, ib
 
 
@@ -223,10 +225,13 @@ def test_provisioner_builds_a_complete_sandbox_and_is_idempotent(tmp_path):
     v = SecretsVault(lay.secrets)
     keys = {s: v.get(s) for s in ("agent_token", "management_api_key", "inference_api_key", "backend_api_key")}
     assert all(len(k) >= 40 for k in keys.values())
-    for p in (lay.secrets, lay.ssh_dir):
-        assert stat.S_IMODE(p.stat().st_mode) == 0o700
+    if os.name == "posix":
+        for p in (lay.secrets, lay.ssh_dir):
+            assert stat.S_IMODE(p.stat().st_mode) == 0o700
     key = lay.ssh_dir / "id_ed25519"
-    assert stat.S_IMODE(key.stat().st_mode) == 0o600 and key.with_suffix(".pub").read_text().startswith("ssh-ed25519 ")
+    if os.name == "posix":
+        assert stat.S_IMODE(key.stat().st_mode) == 0o600
+    assert key.with_suffix(".pub").read_text().startswith("ssh-ed25519 ")
     assert first.pubkey and first.pubkey.startswith("ssh-ed25519 ")
     # second run keeps everything, including the secrets and the key
     again = Provisioner(a, lay)
@@ -271,7 +276,8 @@ def test_node_b_trusts_node_a_key_only_from_node_a_and_never_touches_a_sandbox_h
     p.apply()
     line = (home / ".ssh" / "authorized_keys").read_text().strip()
     assert line.startswith('from="192.168.100.1",no-agent-forwarding,no-port-forwarding') and line.endswith(pub)
-    assert stat.S_IMODE((home / ".ssh" / "authorized_keys").stat().st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE((home / ".ssh" / "authorized_keys").stat().st_mode) == 0o600
     p2 = Provisioner(b, Layout(tmp_path / "rootb2"), home_override=str(home))
     assert {s.name: s for s in p2.apply()}["authorize key"].status == "kept"
     assert (home / ".ssh" / "authorized_keys").read_text().count("EXAMPLEKEY") == 1
@@ -456,7 +462,10 @@ def test_console_in_yes_mode_refuses_questions_without_a_default():
 
 def test_modules_do_not_leave_the_sandbox(tmp_path):
     lay = Layout(tmp_path / "x")
-    assert lay.sandbox and not Layout().sandbox
+    assert lay.sandbox
+    if os.name == "posix":
+        assert not Layout().sandbox
+    else:
+        assert Layout().sandbox  # a host-native Windows path cannot be a live Linux install
     for p in (lay.etc, lay.secrets, lay.systemd, lay.state, lay.cache, lay.home, lay.run, lay.ssh_dir):
         assert str(p).startswith(str(tmp_path / "x"))
-    assert os.geteuid() == 0 or True

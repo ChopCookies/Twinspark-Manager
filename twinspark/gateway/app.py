@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 
+import anyio
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .gateway import Gateway, RouteState
@@ -16,8 +17,18 @@ from .gateway import Gateway, RouteState
 # (audio/transcriptions is multipart, which this JSON-rewriting gateway cannot route by alias.)
 _FORWARDED = {"chat/completions", "completions", "embeddings", "responses", "rerank",
               "score", "tokenize", "detokenize", "classify", "pooling"}
-_HOP_BY_HOP = {"content-length", "transfer-encoding", "connection", "keep-alive"}
-_FAILOVER_STATUS = {502, 503, 504}      # a replica that says this is skipped for the next candidate
+_HOP_BY_HOP = {"content-length", "transfer-encoding", "connection", "keep-alive",
+               "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade"}
+# Only failures before sending a request may move a POST to another replica.
+# A read/write failure can mean the first backend already accepted an agent turn.
+_RETRYABLE_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+# An explicit unavailable reply rejects the turn. Gateway timeout/error replies
+# (502/504) may follow an accepted turn and therefore must not be replayed.
+_FAILOVER_STATUS = {503}
+
+
+class _ResponseLimitExceeded(httpx.ReadError):
+    """The in-process compatibility proxy exceeded its upstream byte budget."""
 
 
 def _error(status: int, message: str, code: str, headers: dict | None = None, **extra) -> JSONResponse:
@@ -33,7 +44,12 @@ def _model_entry(st: RouteState) -> dict:
     return entry
 
 
-def build_gateway_app(gateway: Gateway) -> Starlette:
+def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None) -> Starlette:
+    # Probes use a cap before their in-process ASGI transport can buffer a body.
+    # Ordinary inference traffic keeps its existing streaming behavior.
+    if max_response_bytes is not None and (isinstance(max_response_bytes, bool)
+                                           or not isinstance(max_response_bytes, int) or max_response_bytes < 1):
+        raise ValueError("max_response_bytes must be a positive integer or None")
     async def list_models(request: Request):
         if not gateway.check_key(request.headers.get("authorization")):
             return _error(401, "invalid api key", "invalid_api_key")
@@ -75,13 +91,13 @@ def build_gateway_app(gateway: Gateway) -> Starlette:
             return _error(400, "request body must be JSON", "invalid_request_error")
         if not isinstance(body, dict):
             return _error(400, "request body must be a JSON object", "invalid_request_error")
+        model = body.get("model")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            return _error(400, "model must be a non-empty string", "invalid_request_error", param="model")
 
-        requested = body.get("model")
-        if requested is not None and not isinstance(requested, str):
-            return _error(400, "'model' must be a string", "invalid_request_error")
-        st = gateway.resolve(requested)
+        st = gateway.resolve(model)
         if st is None:
-            return _error(404, f"unknown model/alias: {str(requested)[:120]!r}", "model_not_found")
+            return _error(404, f"unknown model/alias: {str(model)[:120]!r}", "model_not_found")
         if st.draining or not st.backends or st.down_reason:
             msg = ("model is down: " + st.down_reason) if st.down_reason else \
                 "model is switching or not loaded; retry shortly"
@@ -93,52 +109,116 @@ def build_gateway_app(gateway: Gateway) -> Starlette:
         st.acquire()
         upstream = None
         last_exc: Exception | None = None
-        candidates = st.candidates()
-        for i, backend in enumerate(candidates):
-            req = gateway._client.build_request(
-                "POST", f"{backend}/v1/{path}", content=payload, headers=gateway.backend_headers())
-            try:
-                resp = await gateway._client.send(req, stream=True)
-            except httpx.HTTPError as exc:
-                st.backend_failed(backend)
-                last_exc = exc
-                continue
-            if resp.status_code in _FAILOVER_STATUS and i + 1 < len(candidates):
-                st.backend_failed(backend)             # a replica is sick: try the next one
-                await resp.aclose()
-                continue
-            upstream = resp
-            break
+        try:
+            candidates = st.candidates()
+            for i, backend in enumerate(candidates):
+                backend_headers = gateway.backend_headers()
+                if max_response_bytes is not None:
+                    backend_headers["Accept-Encoding"] = "identity"
+                req = gateway._client.build_request(
+                    "POST", f"{backend}/v1/{path}", content=payload, headers=backend_headers)
+                try:
+                    resp = await gateway._client.send(req, stream=True)
+                except _RETRYABLE_CONNECT_ERRORS as exc:
+                    st.backend_failed(backend)
+                    last_exc = exc
+                except httpx.HTTPError as exc:
+                    # Do not replay potentially accepted inference/tool requests.
+                    last_exc = exc
+                    break
+                else:
+                    if resp.status_code in _FAILOVER_STATUS and i + 1 < len(candidates):
+                        st.backend_failed(backend)
+                        try:
+                            with anyio.CancelScope(shield=True):
+                                await resp.aclose()
+                        except httpx.HTTPError:
+                            pass
+                        continue
+                    upstream = resp
+                    break
+        except BaseException:
+            # Cancellation before upstream headers must not block future drains.
+            st.release()
+            raise
         if upstream is None:
             st.errors += 1
-            st.last_error = f"backend unreachable: {type(last_exc).__name__}"
+            st.last_error = f"backend request failed: {type(last_exc).__name__}"
             st.release()
-            return _error(502, f"backend unreachable: {type(last_exc).__name__}", "backend_error")
+            status_code = 504 if isinstance(last_exc, httpx.TimeoutException) else 502
+            return _error(status_code, st.last_error, "backend_error")
         if upstream.status_code >= 500:
             st.errors += 1
             st.last_error = f"backend returned {upstream.status_code}"
+            st.backend_failed(backend)
 
-        headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP}
+        if (max_response_bytes is not None
+                and upstream.headers.get("content-encoding", "identity").lower() != "identity"):
+            # A compressed wire-byte cap does not bound decompressed ASGI bodies.
+            try:
+                with anyio.CancelScope(shield=True):
+                    await upstream.aclose()
+            except httpx.HTTPError:
+                pass
+            finally:
+                st.release()
+            return _error(502, "compatibility checks require uncompressed upstream responses", "backend_error")
+
+        connection_headers = {h.strip().lower() for h in upstream.headers.get("connection", "").split(",")}
+        headers = {k: v for k, v in upstream.headers.items()
+                   if k.lower() not in _HOP_BY_HOP | connection_headers}
         released = False
 
         async def body_iter():
             # the in-flight counter only drops once the client got the last byte,
             # the client went away, or the backend stream broke — exactly once
             nonlocal released
+            total = 0
             try:
                 async for chunk in upstream.aiter_raw():
+                    total += len(chunk)
+                    if max_response_bytes is not None and total > max_response_bytes:
+                        raise _ResponseLimitExceeded("backend response exceeded the compatibility check size limit")
                     yield chunk
+            except httpx.CloseError as exc:
+                # httpx also closes after the last byte; a cleanup error does
+                # not invalidate a response that was already fully delivered.
+                st.errors += 1
+                st.last_error = f"stream close failed: {type(exc).__name__}"
             except httpx.HTTPError as exc:
                 st.errors += 1
                 st.last_error = f"stream interrupted: {type(exc).__name__}"
-                # Re-raise: swallowing it would end the chunked body cleanly and the client
-                # would see a complete 200 response that is silently truncated.
+                # Headers have already been sent; abort the response instead of
+                # presenting incomplete tool arguments as a successful stream.
                 raise
             finally:
-                await upstream.aclose()
-                if not released:
-                    released = True
-                    st.release()
+                try:
+                    # Starlette cancels its stream task when the caller disconnects.
+                    # Shield cleanup so the backend connection is released as well.
+                    with anyio.CancelScope(shield=True):
+                        await upstream.aclose()
+                except httpx.HTTPError as exc:
+                    st.errors += 1
+                    st.last_error = f"stream close failed: {type(exc).__name__}"
+                finally:
+                    if not released:
+                        released = True
+                        st.release()
+
+        is_sse = headers.get("content-type", "").lower().startswith("text/event-stream")
+        if max_response_bytes is not None and not is_sse:
+            # JSON/errors must be bounded before sending response headers. Reading
+            # incrementally avoids the unbounded Response.aread() path.
+            data = bytearray()
+            try:
+                async for chunk in body_iter():
+                    data.extend(chunk)
+            except _ResponseLimitExceeded:
+                return _error(502, "backend response exceeded the compatibility check size limit",
+                              "backend_response_too_large")
+            except httpx.HTTPError:
+                return _error(502, "backend response transfer failed", "backend_error")
+            return Response(bytes(data), status_code=upstream.status_code, headers=headers)
 
         return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=headers)
 

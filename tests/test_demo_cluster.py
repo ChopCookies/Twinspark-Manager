@@ -7,6 +7,8 @@ simulated by the dry-run runtime.
 
 from __future__ import annotations
 
+import sys
+
 import httpx
 import pytest
 
@@ -22,6 +24,23 @@ async def demo():
 
 def auth(d):
     return {"x-api-key": d.key}
+
+
+def test_demo_provision_accepts_non_linux_host_username(tmp_path, monkeypatch):
+    from twinspark.schemas.config import ControllerConfig, load_config
+
+    monkeypatch.setattr("twinspark.demo.getpass.getuser", lambda: "Windows User")
+    d = DemoCluster(base=tmp_path)
+    d.provision()
+    config = load_config(d.a_layout.controller_yaml, ControllerConfig)
+    assert config.nodes["B"].ssh_user == "twinspark-demo"
+    assert d.key
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="Linux supports the demo terminal")
+def test_demo_terminal_on_unsupported_host_has_clear_error():
+    with pytest.raises(ValueError, match="requires Linux PTYs"):
+        DemoCluster(remote={"terminal": True})
 
 
 async def test_stack_boots_and_both_nodes_answer_over_real_http(demo):
