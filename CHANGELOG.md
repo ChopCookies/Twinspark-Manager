@@ -1,6 +1,37 @@
 # Changelog
 
-## Unreleased — recipe automation, agent integrations, setup and remote management
+## Unreleased — recipe automation, agent integrations, setup, remote management and QSFP automation
+
+### QSFP link automation
+
+- `tsm qsfp status|plan|apply|revert|verify|scan` ([docs/qsfp-link.md](docs/qsfp-link.md)): finds the cabled
+  ConnectX port and its two twin interfaces (`enp1s0f1np1` / `enP2p1s0f1np1`), plans static addresses on
+  **separate /24s** with MTU 9000 (`192.168.100.x` and `192.168.101.x`, node A = .1, node B = .2) — the
+  layout of NVIDIA's two-Spark playbook and eugr/spark-vllm-docker — and writes
+  `/etc/netplan/60-twinspark-qsfp.yaml`. A twin that already has an address from elsewhere is kept; only the
+  missing one is added.
+- Safety on headless machines: refuses the interface with the default route or an SSH session, never edits a
+  netplan file it did not write (marker line), runs `netplan generate` first, verifies addresses and MTU
+  afterwards and restores the previous file if they are not there. `--temporary` sets addresses until the
+  next reboot; `revert` undoes the last apply. Read-only `status`, `plan`, `verify` (jumbo-frame ping of the
+  other Spark through each twin, SSH check) and `scan` (finds the other Spark on the link, like eugr's
+  `autodiscover.sh`).
+- `tsm setup` shows the plan when the cabled port lacks addresses and asks (default no) before writing;
+  `--configure-qsfp` does it unattended, `--yes` alone never touches the network. Node B takes its host number
+  and subnet from the join code. The old single-interface netplan snippet is gone.
+- `tsm node doctor` lists the QSFP findings as warnings with the fixing command.
+- `suggest_rdma` (and so `tsm rdma`, setup and the GUI) now accepts the second twin on its own subnet; before it
+  only recognised the layout where both twins share one subnet, which eugr's guide advises against, and
+  its advice said to put them on the same one.
+- Hardened after an independent review: a hand-written `60-twinspark-qsfp.yaml` (what the old setup snippet told
+  people to create) is never overwritten — TwinSpark uses `61-…` instead; backups are kept root-owned in
+  `/var/backups/twinspark-qsfp` and verified before `revert` copies them back; the apply window ignores
+  Ctrl-C/hang-up, checks that the management interface kept its route and addresses, and a rollback also removes
+  addresses and MTU that networkd would keep; `revert` has `apply`'s guards; IPv6 link-local SSH sessions and
+  unreadable routing tables are handled; the netplan file is `optional: true` so boot never waits for the link;
+  temporary addresses are recorded in `/run` and `revert --temporary` needs no `--node`.
+- Tested against a fake Spark (`tests/qsfp_fakes.py`): fake `/sys`, `ip`, `ss`, `ping` and a `netplan` that
+  turns YAML into addresses, including rollback paths. **Not yet run on real hardware.**
 
 ### Recipe automation and agent integrations
 

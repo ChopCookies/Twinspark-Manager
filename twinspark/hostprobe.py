@@ -99,6 +99,28 @@ def list_interfaces(sysfs: str = "/sys/class/net", run: Runner = run_cmd,
     return ifaces
 
 
+def default_routes(run: Runner = run_cmd) -> Optional[list[str]]:
+    """Interfaces that carry a default route (multipath routes included). ``None`` if the table cannot be read."""
+    rc, out = run(["ip", "-j", "route", "show", "default"], 5)
+    if rc != 0:
+        return None
+    if not out.strip():
+        return []
+    try:
+        devs: list[str] = []
+        for r in json.loads(out):
+            devs += [r["dev"]] if r.get("dev") else []
+            devs += [n["dev"] for n in r.get("nexthops") or [] if n.get("dev")]
+        return sorted(set(devs))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def default_route_ifaces(run: Runner = run_cmd) -> list[str]:
+    """Like :func:`default_routes`, but unreadable counts as "none"."""
+    return default_routes(run) or []
+
+
 def guess_qsfp(ifaces: list[Iface]) -> Optional[Iface]:
     """The interface most likely cabled to the other Spark.
 
@@ -236,6 +258,8 @@ class HostReport:
     mem_total_gib: float
     privd_socket: bool
     ports: dict[int, bool]
+    default_routes: list[str] = field(default_factory=list)       # interfaces that carry a default route
+    routes_known: bool = True                                     # False when `ip route` could not be read
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -250,6 +274,7 @@ def probe_host(user: Optional[str] = None, hf_path: Optional[str] = None,
     ok, pyv = python_ok()
     rdma = sysinfo.rdma_devices(sysfs_ib)
     mem = sysinfo.memory_snapshot()
+    routes = default_routes(run)
     return HostReport(
         hostname=u.node, arch=u.machine, kernel=u.release, python=pyv, python_ok=ok,
         systemd=systemd_available(),
@@ -262,6 +287,8 @@ def probe_host(user: Optional[str] = None, hf_path: Optional[str] = None,
         mem_total_gib=mem.get("mem_total_gib", 0.0),
         privd_socket=Path("/run/twinspark/privd.sock").exists(),
         ports={p: port_free(p) for p in ports},
+        default_routes=routes or [],
+        routes_known=routes is not None,
     )
 
 

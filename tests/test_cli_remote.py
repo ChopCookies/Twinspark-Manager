@@ -332,6 +332,42 @@ def test_node_doctor_explains_each_problem_with_a_fix(box, run, capsys, monkeypa
     assert "[WARN] tool efibootmgr" in out and "apt install efibootmgr" in out
 
 
+def _fake_spark_under(box, tmp_path, monkeypatch, **kw):
+    import shutil
+
+    from tests.qsfp_fakes import FakeNode
+    from twinspark import qsfp
+    n = FakeNode(tmp_path / "fake-spark", **kw)
+    shutil.copytree(n.sysfs / "sys", box.root / "sys")
+    monkeypatch.setattr(qsfp, "RUN", n.run)
+    return n
+
+
+def test_node_doctor_reports_the_qsfp_link_as_warnings_with_the_fix(box, run, tmp_path, capsys, monkeypatch):
+    run.table["timedatectl"] = (0, "yes\n", "")
+    _fake_spark_under(box, tmp_path, monkeypatch, primary_ips=["192.168.100.1/24"])      # second twin has nothing
+    assert run_cli("node", "doctor", "--root", box.root) == 0                            # a warning, never a failure
+    out = capsys.readouterr().out
+    assert "[ok  ] qsfp link" in out and "[WARN] qsfp addresses" in out
+    assert "sudo tsm qsfp apply" in out and "[WARN] qsfp mtu" in out
+
+
+def test_node_doctor_is_quiet_about_qsfp_on_a_single_spark(box, run, tmp_path, capsys, monkeypatch):
+    run.table["timedatectl"] = (0, "yes\n", "")
+    box.controller_yaml.unlink()                       # no two-node controller config, agent on loopback: a lone Spark
+    _fake_spark_under(box, tmp_path, monkeypatch, cabled=False)
+    assert run_cli("node", "doctor", "--root", box.root) == 0
+    assert "qsfp" not in capsys.readouterr().out
+
+
+def test_node_doctor_warns_about_a_missing_link_when_a_second_node_is_configured(box, run, tmp_path, capsys,
+                                                                                monkeypatch):
+    run.table["timedatectl"] = (0, "yes\n", "")
+    _fake_spark_under(box, tmp_path, monkeypatch, cabled=False)
+    assert run_cli("node", "doctor", "--root", box.root) == 0
+    assert "[WARN] qsfp link" in capsys.readouterr().out
+
+
 def test_node_logs_and_bundle_work_without_a_controller(box, run, tmp_path, capsys):
     run.table["journalctl"] = (0, "one\n\x1b[31mtwo error\x1b[0m\nthree\n", "")
     assert run_cli("node", "logs", "kernel", "--root", box.root, "--grep", "error") == 0
@@ -513,7 +549,7 @@ async def test_client_surfaces_an_error_frame_from_the_node(monkeypatch):
 
 # ---- `tsm remote …` through a live controller ------------------------------------------------
 async def test_remote_status_reach_and_logs_commands_against_a_live_controller(demo, capsys):
-    base = ["--api", demo.url, "--key", demo.key]
+    base = ["--api", demo.url, f"--key={demo.key}"]
     assert await asyncio.to_thread(run_cli, *base, "remote", "status") == 0
     out = capsys.readouterr().out
     assert "node A (controller)" in out and "node B" in out and "terminal" in out
@@ -526,7 +562,7 @@ async def test_remote_status_reach_and_logs_commands_against_a_live_controller(d
 
 
 async def test_remote_power_commands_demand_the_typed_phrase_or_yes(demo, capsys, monkeypatch):
-    base = ["--api", demo.url, "--key", demo.key]
+    base = ["--api", demo.url, f"--key={demo.key}"]
     monkeypatch.setattr(cli_remote.sys.stdin, "isatty", lambda: False)
     with pytest.raises(SystemExit, match="--yes"):
         await asyncio.to_thread(run_cli, *base, "remote", "reboot", "B")
@@ -544,7 +580,7 @@ async def test_remote_power_commands_demand_the_typed_phrase_or_yes(demo, capsys
 
 async def test_remote_bundle_command_downloads_a_file(demo, tmp_path):
     out = tmp_path / "b.tar.gz"
-    base = ["--api", demo.url, "--key", demo.key]
+    base = ["--api", demo.url, f"--key={demo.key}"]
     await asyncio.to_thread(run_cli, *base, "remote", "bundle", "B", "-o", out)
     with tarfile.open(out) as t:
         assert any(m.name.endswith("tsm/vault-slots.txt") for m in t.getmembers())

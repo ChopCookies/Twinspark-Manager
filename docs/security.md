@@ -38,6 +38,12 @@ is not in `ALLOWED_AGENT_ACTIONS`, and the agent refuses anything it does not im
   limit; power actions need a typed phrase and are refused while the cluster is busy. Wake-on-LAN and
   smart-plug calls come from the config file only (an API caller cannot choose a URL or MAC), and the plug
   token lives in the vault. Details: [remote-management.md](remote-management.md).
+- The QSFP link is changed **only by a person running `sudo tsm qsfp apply` (or `revert`) on that machine**.
+  No agent action, API route or GUI button can do it, and nothing runs as part of a service. It writes one
+  root-owned netplan file (0600) that it recognises by a marker line, refuses to edit anyone else's, refuses
+  the default-route interface and the interface your SSH session uses, validates with `netplan generate` and
+  puts the previous file back if the addresses do not come up. `tsm qsfp scan --identify` uses key-only SSH
+  (`BatchMode`), a validated user name and no password prompt. Details: [qsfp-link.md](qsfp-link.md).
 
 ## Known limits (deliberately not fixed yet)
 

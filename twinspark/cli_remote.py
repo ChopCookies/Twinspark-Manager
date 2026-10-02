@@ -534,7 +534,26 @@ def node_checks(n: LocalNode) -> list[Check]:
     for t in ("efibootmgr", "ethtool"):
         if not st["tools"].get(t):
             out.append(Check("warn", f"tool {t}", "not installed", f"sudo apt install {t}"))
+    out += qsfp_checks(n)
     return out
+
+
+def qsfp_checks(n: LocalNode) -> list[Check]:
+    """The QSFP link as findings of `tsm node doctor`. Never worse than a warning: a single Spark has no link."""
+    from . import cli_qsfp, qsfp
+
+    host = qsfp.Host(root=n.lay.root, sysfs=n.lay.root)
+    if not host.net.is_dir():
+        return []
+    d = qsfp.discover(host)
+    if not d.ports:
+        return []
+    iface, hcas, gid = cli_qsfp._controller_endpoint(n.lay, n.node)
+    two_node = bool(iface) or n.cfg.listener.bind not in ("127.0.0.1", "::1", "localhost", "0.0.0.0", "::")
+    if not any(p.cabled for p in d.ports) and not two_node:
+        return []
+    return [Check("warn" if r["status"] == "fail" else r["status"], r["check"], r["detail"], r["fix"])
+            for r in qsfp.checks(d, configured_iface=iface, configured_hcas=hcas, configured_gid=gid)]
 
 
 def cmd_node_doctor(args) -> None:
