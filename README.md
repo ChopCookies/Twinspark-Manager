@@ -198,6 +198,7 @@ Update both nodes (the Get started page warns when versions differ).
 - [Recipe and split-model workflow](docs/recipe-workflow.md)
 - [Monitoring and coordinated maintenance](docs/maintenance.md)
 - [Development, testing and the demo harness](docs/development.md)
+- [Security model and known limits](docs/security.md)
 - [Changelog](CHANGELOG.md) · [Review notes](REVIEW.md) · [Researched profiles](OPTIMAL-PROFILES.md)
 - [Two-node DeepSeek startup commands](DEEPSEEK-TWO-NODE-STARTUP.md) · [Small-model validation](SMALL-MODEL-DEVELOPMENT.md)
 

@@ -62,6 +62,20 @@ python scripts/preview_web.py --demo-nodes   # labeled sample telemetry + a simu
 The preview serves the built `web/dist` assets: rebuild and refresh after editing `web/src`.
 `dist/` is committed so a plain `pip install` serves the GUI without Node.
 
+## Test suites
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider   # ~40 s, no hardware, no network
+ruff check .
+node --test tests/web_client.test.cjs                                # GUI logic, no browser
+```
+
+`tests/test_hardening_api.py`, `_controller.py` and `_agent.py` hold the regression tests for every bug
+found while exercising the stack on loopback (auth, input handling, secrets, mods, watchdog,
+maintenance). When you fix a bug, add its test next to those. Pinning needs Hugging Face, so the
+end-to-end activation tests (`tests/test_activation.py`) stub the resolver; real pinning and real
+containers are only exercised on site.
+
 ## On-site checklist (first contact with real hardware)
 
 1. Install with the default dry-run mode; `tsm plan …` and compare with the command you run by

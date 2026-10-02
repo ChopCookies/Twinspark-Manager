@@ -31,8 +31,12 @@ from .security import SecretsVault
 
 JOIN_PREFIX = "tsm1."
 UNIT_NAMES = ("twinspark-privd.service", "twinspark-agent.service", "twinspark-controller.service")
-_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
+_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}\Z")
+# one single-line OpenSSH public key; a newline would smuggle a second, unrestricted authorized_keys entry
+_PUBKEY_RE = re.compile(r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) "
+                        r"[A-Za-z0-9+/=]{20,2000}(?: [^\r\n]{0,200})?")
+MAX_JOIN_BYTES = 64 * 1024
 
 
 class SetupError(Exception):
@@ -148,7 +152,11 @@ def decode_join(code: str) -> dict[str, Any]:
         raise SetupError("that is not a TwinSpark join code (it should start with 'tsm1.')")
     body = code[len(JOIN_PREFIX):]
     try:
-        data = json.loads(zlib.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))))
+        inflater = zlib.decompressobj()
+        raw = inflater.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)), MAX_JOIN_BYTES)
+        if inflater.unconsumed_tail:                  # bigger than any real join code: a bomb
+            raise SetupError("that join code is far larger than a real one — refusing it")
+        data = json.loads(raw)
     except (ValueError, zlib.error) as exc:
         raise SetupError("the join code is damaged or cut off — copy the whole line from node A") from exc
     if not isinstance(data, dict) or data.get("v") != 1:
@@ -156,6 +164,13 @@ def decode_join(code: str) -> dict[str, Any]:
     for k in ("agent_token", "backend_api_key", "a_ip", "b_ip"):
         if not data.get(k):
             raise SetupError(f"the join code is missing {k!r}")
+    for k in ("a_ip", "b_ip"):
+        if not (isinstance(data[k], str) and _IP_RE.match(data[k])):
+            raise SetupError(f"the join code has an invalid address in {k!r}")
+    if data.get("b_user") is not None and not (isinstance(data["b_user"], str) and _USER_RE.match(data["b_user"])):
+        raise SetupError("the join code has an invalid user name")
+    if data.get("pubkey") and not (isinstance(data["pubkey"], str) and _PUBKEY_RE.fullmatch(data["pubkey"].strip())):
+        raise SetupError("the join code carries something that is not a single OpenSSH public key")
     return data
 
 
@@ -569,13 +584,16 @@ class Provisioner:
             self._step("authorize key", "planned" if self.dry else "skipped",
                        "authorise the other node's sync key" if self.dry else "no home directory for the user")
             return
+        pubkey = pubkey.strip()
+        if not _PUBKEY_RE.fullmatch(pubkey):
+            raise SetupError("the key from node A is not a single-line OpenSSH public key")
         ak = Path(home, ".ssh", "authorized_keys")
         opts = "no-agent-forwarding,no-port-forwarding,no-X11-forwarding"
-        line = f'from="{from_ip}",{opts} {pubkey.strip()}' if from_ip else f"{opts} {pubkey.strip()}"
+        line = f'from="{from_ip}",{opts} {pubkey}' if from_ip else f"{opts} {pubkey}"
         ak.parent.mkdir(parents=True, exist_ok=True)
         existing = ak.read_text() if ak.exists() else ""
-        blob = pubkey.strip().split()[1] if len(pubkey.split()) > 1 else pubkey.strip()
-        if blob in existing:
+        blob = pubkey.split()[1]
+        if any(blob == tok for ln in existing.splitlines() for tok in ln.split()):
             self._step("authorize key", "kept", f"the other node's key is already authorised for {self.a.service_user}")
             return
         ak.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n")

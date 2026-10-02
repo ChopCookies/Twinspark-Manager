@@ -77,8 +77,8 @@ class WeightsStager:
                 if n not in nodes and await self.present(n, repo, rev, include):
                     sources.append(n)
         notes = []
-        if not sources:
-            dn = download_node if download_node in nodes else nodes[0]
+
+        async def download_on(dn: str) -> None:
             step.message = f"downloading {repo}@{rev[:8]} on node {dn}"
             self.persist(job)
             task = await self.agent(dn).call("download", repo=repo, revision=rev, include=include,
@@ -88,15 +88,22 @@ class WeightsStager:
                                            cancel_check=cancel_check)
             if not await self.present(dn, repo, rev, include):
                 raise StageError(f"download finished but the snapshot is incomplete on node {dn}")
-            sources = [dn]
             have[dn] = True
             notes.append(f"downloaded on {dn}" + (" + verified" if verify else ""))
+
+        if not sources:
+            dn = download_node if download_node in nodes else nodes[0]
+            await download_on(dn)
+            sources = [dn]
         for target in [n for n in nodes if not have[n]]:
             src = sources[0]
             ep = self.config.nodes.get(target)
             if ep is None or not (ep.sync_host and ep.ssh_user):
-                raise StageError(f"node {target} lacks {repo}@{rev[:8]} and nodes.{target}.qsfp_ip/"
-                                 f"ssh_user are not set, so it cannot receive a copy")
+                # No copy path *to* this node (setup configures A -> B only): fetch it from the
+                # Hub on the node itself instead of failing the activation.
+                notes.append(f"no sync path to {target}")
+                await download_on(target)
+                continue
             dst = await self.hf_home(target)
             step.message = f"copying {repo}@{rev[:8]} {src} → {target} over QSFP"
             self.persist(job)

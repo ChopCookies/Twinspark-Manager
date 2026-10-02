@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..schemas.enums import MemoryStrategy, Quantization, Topology, VerificationStatus
-from .planner import MemoryPlanner, ModelSpec
+from .planner import _BYTES_PER_PARAM, MemoryPlanner, ModelSpec
 
 
 @dataclass
@@ -131,13 +131,21 @@ class QuantizationAdvisor:
                 Quantization.GPTQ: 2, Quantization.AUTOROUND: 2}
 
     def __init__(self, planner: MemoryPlanner, spec: ModelSpec, topology: Topology,
-                 known_status: Optional[dict[Quantization, VerificationStatus]] = None):
+                 known_status: Optional[dict[Quantization, VerificationStatus]] = None,
+                 base_quant: Optional[Quantization] = None):
         self.planner, self.spec, self.topology = planner, spec, topology
         self.known_status = known_status or {}
+        self.base_quant = base_quant      # quantisation of the checkpoint whose size is known
 
     def variants(self, context_length: int = 32768, concurrency: int = 4) -> list[QuantVariant]:
         out = []
-        spec = ModelSpec(**{**self.spec.__dict__, "weight_bytes": None})  # compare like-for-like
+        num_params = self.spec.num_params
+        if not num_params and self.spec.weight_bytes and self.base_quant is not None:
+            # Hub-derived specs only know the checkpoint size: turn it back into a parameter
+            # count so every quantisation can be sized (otherwise all of them weigh 0 GiB).
+            num_params = int(self.spec.weight_bytes / _BYTES_PER_PARAM[self.base_quant])
+        spec = ModelSpec(**{**self.spec.__dict__, "num_params": num_params,
+                            "weight_bytes": None})  # compare like-for-like
         for q in Quantization:
             budget = self.planner.estimate(spec=spec, quant=q, context_length=context_length,
                                            concurrency=concurrency, topology=self.topology)

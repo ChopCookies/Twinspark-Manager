@@ -2,55 +2,84 @@
 
 from __future__ import annotations
 
-import secrets
 import time
 from typing import Optional
 
 from fastapi import Header, HTTPException, Request
 
 from ..controller.controller import Controller
+from ..security import tokens_equal
 
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+_FAILED_PER_MIN = 120          # wrong-key requests tolerated per client per minute
 
 
 def controller_dep(request: Request) -> Controller:
     return request.app.state.controller
 
 
-def require_auth(request: Request, x_api_key: Optional[str] = Header(default=None),
-                 authorization: Optional[str] = Header(default=None)) -> None:
-    """Management-plane auth + CSRF + rate limit, applied to every /api router."""
+def _bucket(request: Request, name: str) -> list[int]:
+    """Fixed 60 s window counter per (name, client address)."""
+    now = int(time.time() // 60)
+    host = request.client.host if request.client else "?"
+    bucket = request.app.state.rate_buckets.setdefault(f"{name}:{host}", [now, 0])
+    if bucket[0] != now:
+        bucket[:] = [now, 0]
+    return bucket
+
+
+def _too_many() -> HTTPException:
+    wait = 60 - int(time.time() % 60)
+    return HTTPException(429, "rate limit exceeded", headers={"Retry-After": str(max(1, wait))})
+
+
+def check_key(request: Request) -> None:
+    """CSRF + management-key check, from headers only (safe to run before the body is read)."""
     ctrl: Controller = request.app.state.controller
     cfg = ctrl.config
 
-    # rate limit: fixed 60 s window per client
-    now = int(time.time() // 60)
-    key = request.client.host if request.client else "?"
-    bucket = request.app.state.rate_buckets.setdefault(key, [now, 0])
-    if bucket[0] != now:
-        bucket[:] = [now, 0]
-    bucket[1] += 1
-    if bucket[1] > cfg.rate_limit_per_min:
-        raise HTTPException(429, "rate limit exceeded")
-
     if cfg.csrf_protection and request.method in _MUTATING:
         origin = request.headers.get("origin")
-        if origin:
+        if origin is not None:             # an empty or "null" Origin is a mismatch, not "absent"
             host = request.headers.get("host", "")
             if origin.split("://", 1)[-1].rstrip("/") != host:
                 raise HTTPException(403, "cross-origin request rejected")
+        elif request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+            raise HTTPException(403, "cross-site request rejected")
+
+    if cfg.management_auth != "none":
+        expected: str = request.app.state.management_key
+        if not expected:
+            raise HTTPException(503, "management key not configured — run `tsm init`")
+        provided = request.headers.get("x-api-key")
+        authorization = request.headers.get("authorization")
+        if not provided and authorization and authorization.lower().startswith("bearer "):
+            provided = authorization[7:].strip()
+        if not tokens_equal(provided, expected):
+            failed = _bucket(request, "fail")
+            failed[1] += 1
+            if failed[1] > _FAILED_PER_MIN:
+                raise _too_many()
+            raise HTTPException(401, "invalid management API key")
+
+
+def require_auth(request: Request, x_api_key: Optional[str] = Header(default=None),
+                 authorization: Optional[str] = Header(default=None)) -> None:
+    """Management-plane auth + CSRF + rate limit, applied to every /api router.
+
+    Order matters: nothing about the cluster (maintenance state, validation of the body) is
+    revealed before the key has been checked, and callers with a wrong key cannot use up the
+    request budget of the real operator (behind an SSH tunnel every client is 127.0.0.1).
+    """
+    ctrl: Controller = request.app.state.controller
+    cfg = ctrl.config
+    check_key(request)
+
+    ok = _bucket(request, "ok")
+    ok[1] += 1
+    if ok[1] > cfg.rate_limit_per_min:
+        raise _too_many()
 
     if (request.method in _MUTATING and ctrl.maintenance.blocking()
             and not request.url.path.startswith("/api/v1/system/maintenance/")):
         raise HTTPException(409, "cluster is reserved for maintenance; open Updates to review progress")
-
-    if cfg.management_auth == "none":
-        return
-    expected: str = request.app.state.management_key
-    if not expected:
-        raise HTTPException(503, "management key not configured — run `tsm init`")
-    provided = x_api_key
-    if not provided and authorization and authorization.lower().startswith("bearer "):
-        provided = authorization[7:].strip()
-    if not secrets.compare_digest(provided or "", expected):
-        raise HTTPException(401, "invalid management API key")

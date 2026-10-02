@@ -19,6 +19,48 @@
   `known_hosts`, which breaks weight sync when the agent runs under systemd).
 - README rewritten around the quick start; development notes moved to `docs/development.md`.
 
+### Error testing and hardening (milestone 2)
+
+Everything below was found by exercising the stack on loopback (`DemoCluster`, dry-run runtime),
+fuzzing the API and driving the GUI at desktop and phone widths — nothing was tried on the live
+Sparks. Each fix has a regression test (`tests/test_hardening_*.py`, 296 tests in total).
+
+**Security**
+- Management and agent tokens are compared byte-wise in constant time, so a non-ASCII header can no
+  longer cause a 500; authentication runs before the request body is read; failed logins have their own
+  rate bucket and cannot lock the operator out of the GUI.
+- `/docs`, `/redoc` and `/openapi.json` are disabled on the controller and agent; validation errors are
+  sanitised (no echoed input, no secrets in 422 bodies).
+- Secret references (`${secret:slot}`) are only honoured for the documented slot → variable pairs
+  (`backend_api_key` → `VLLM_API_KEY`, `hf_token` → `HF_TOKEN`). A profile, recipe or mod cannot read the vault.
+- Container mounts must match a strict path pattern and are mapped on the agent, not trusted from the
+  controller. Containers start with `--pull never`; secrets reach them through a 0600 `--env-file`,
+  not on the command line.
+- Outbound fetches (recipes, cookbook sources) are limited to public `https://` hosts without credentials
+  (`twinspark/netguard.py`); redirects are re-checked.
+- Mod archives are bounded (64 MiB archive, 512 MiB extracted, 20 000 files, 64 mods), reject links and path
+  escapes, and are swapped in atomically (`RENAME_EXCHANGE`) so a failed install never leaves half a mod.
+- Vault writes are atomic (temp file + fsync + replace); join codes and the sync public key are validated
+  before anything is written to `authorized_keys`.
+
+**Reliability**
+- The watchdog no longer burns its hourly recovery budget while a node is unreachable; it waits, logs
+  once and recovers with the full budget when the node returns. It also stands down when a switch or
+  prepare starts mid-probe.
+- After a reboot the controller waits (up to `startup_wait_s`, default 180 s) for the other node's agent
+  instead of failing recovery because it started a few seconds earlier. The wait runs in the background,
+  so the GUI is available immediately.
+- Maintenance retries a lost reboot request instead of waiting forever.
+- Stopping a deployment whose node was removed from the plan is logged and skipped rather than raised.
+- A profile that is being activated cannot be deleted; failed model-file deletes are reported, not
+  swallowed; per-node failures (mods, files) surface as errors in the GUI.
+
+**GUI**
+- No horizontal page scroll at phone width (profile Overview, tag chips, grids), a Copy button that no
+  longer covers the command, scrollable tab strips with a visible edge, higher-contrast secondary text.
+- Unknown profiles/jobs/routes show a "Not found" page with ways back instead of a dead end; a hand-typed
+  `%` in the URL no longer breaks routing.
+
 ## 0.4.1 — 2026-10-01
 
 - Prepare pinned recipes in a background job without stopping the active model:

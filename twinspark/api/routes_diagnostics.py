@@ -107,14 +107,6 @@ def metrics_series(ctrl: Controller = Depends(controller_dep)):
     return ctrl.sampler.series()
 
 
-@router.get("/telemetry")
-async def telemetry(refresh: bool = False, ctrl: Controller = Depends(controller_dep)):
-    """Per-node memory/GPU telemetry (refreshed by the background loop)."""
-    if refresh or not ctrl.telemetry:
-        await ctrl.metrics_tick(refresh_nodes=True)
-    return ctrl.telemetry
-
-
 class HeadlessApply(BaseModel):
     mode: Literal["desktop", "headless-safe", "headless-max"]
     now: bool = False      # also stop the display manager right away (not just at next boot)

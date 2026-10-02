@@ -139,7 +139,7 @@ def test_join_code_roundtrip_and_resistance_to_paste_damage(tmp_path):
     v = SecretsVault(tmp_path / "s")
     v.ensure("agent_token")
     v.ensure("backend_api_key")
-    code = provision.make_join(a, v, "ssh-ed25519 AAAA test")
+    code = provision.make_join(a, v, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYEXAMPLEKEYEXAMPLEKEY test")
     info = provision.decode_join(code)
     assert info["agent_token"] == v.get("agent_token") and info["b_ip"] == "192.168.100.2"
     assert provision.decode_join(code[:60] + "\n  " + code[60:]) == info      # wrapped by a terminal or chat

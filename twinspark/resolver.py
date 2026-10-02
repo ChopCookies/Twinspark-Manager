@@ -28,11 +28,12 @@ from urllib.parse import quote
 import httpx
 
 from .controller.planner import ModelSpec, make_spec_from_hf
+from .netguard import guard_request
 
-_SHA40 = re.compile(r"^[0-9a-f]{40}$")
-_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-_TAG = re.compile(r"^[\w][\w.-]{0,127}$")
+_SHA40 = re.compile(r"^[0-9a-f]{40}\Z")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+_TAG = re.compile(r"^[\w][\w.-]{0,127}\Z")
 _HF_API = "https://huggingface.co/api"
 _SHA_HEADER = "x-repo-commit"
 
@@ -44,12 +45,14 @@ _INDEX_META = ("metadata", "total_size")
 
 def _strip_ref(ref: str) -> tuple[str, str]:
     """Split 'org/name@branch' into (repo, branch)."""
+    if len(ref) > 400:
+        raise ValueError("model reference is too long")
     if "@" in ref:
         repo, _, branch = ref.partition("@")
     else:
         repo, branch = ref, "main"
-    if not _REPO.match(repo):
-        raise ValueError(f"malformed model repo: {repo!r}")
+    if not _REPO.match(repo) or any(p in ("", ".", "..") for p in repo.split("/")):
+        raise ValueError(f"malformed model repo: {repo[:120]!r}")
     if not _TAG.match(branch):
         raise ValueError(f"malformed branch/tag: {branch!r}")
     return repo, branch
@@ -80,7 +83,7 @@ def resolve_hf_revision(ref: str, token: Optional[str] = None,
             hint = " (gated/private repo? store an hf_token with `tsm init --hf-token`)" \
                 if code in (401, 403) else ""
             raise ValueError(f"Hugging Face returned {code} for {repo}@{branch}{hint}") from exc
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise ValueError(f"cannot reach Hugging Face ({type(exc).__name__})") from exc
         sha = info.get("sha", "")
         if not isinstance(sha, str) or not _SHA40.fullmatch(sha):
@@ -179,7 +182,9 @@ def resolve_image_digest(image: str, client: Optional[httpx.Client] = None) -> s
         registry = "registry-1.docker.io"
     url = f"https://{registry}/v2/{repo_path}/manifests/{tag}"
     close = client is None
-    client = client or httpx.Client(timeout=20, follow_redirects=True)
+    # image references come from the caller: never let them reach loopback / LAN addresses
+    client = client or httpx.Client(timeout=20, follow_redirects=True,
+                                    event_hooks={"request": [guard_request]})
     headers = {"Accept": _MANIFEST_ACCEPT}
     try:
         r = client.head(url, headers=headers)

@@ -22,6 +22,9 @@ from .. import __version__
 from ..controller.launch import (
     ALLOWED_CAPS,
     ALLOWED_DEVICES,
+    CACHE_MOUNTS,
+    CONTAINER_COMPILE_CACHE,
+    CONTAINER_HF_HOME,
     CONTAINER_MODS,
     OWNER_LABEL,
     ContainerSpec,
@@ -36,16 +39,21 @@ from .privd import PrivClient, PrivdUnavailable
 from .runtime import DockerRuntime, DryRunRuntime, RuntimeError_, port_in_use
 from .tasks import TaskRegistry
 
-_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
-_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_HOST_RE = re.compile(r"^[A-Za-z0-9.:-]+$")
-_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-_NAME_RE = re.compile(r"^tsm-[a-z0-9._-]+$")
-_FOREIGN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,255}$")
-_IMAGE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}$")
-_GLOB_RE = re.compile(r"^[A-Za-z0-9._*?/\[\]-]{1,128}$")
-_SECRET_REF = re.compile(r"^\$\{secret:([a-z_]+)\}$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*\Z")
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
+_NAME_RE = re.compile(r"^tsm-[a-z0-9._-]+\Z")
+_FOREIGN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,255}\Z")
+_IMAGE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}\Z")
+_GLOB_RE = re.compile(r"^[A-Za-z0-9._*?/\[\]-]{1,128}\Z")
+_SECRET_REF = re.compile(r"\$\{secret:([a-z_]+)\}")
+# vault slot -> the only container variables it may be injected into
+_SECRET_ENV: dict[str, set[str]] = {
+    "backend_api_key": {"VLLM_API_KEY"},
+    "hf_token": {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"},
+}
 
 
 class ActionError(Exception):
@@ -250,7 +258,16 @@ class AgentActions:
         rt = self.rt
         rw_roots = [Path(rt.hf_cache_dir).resolve(), Path(rt.compile_cache_dir).resolve()]
         mods_root = Path(rt.mods_dir).resolve()
+        resolved_mounts = []
+        # This node decides where its own caches live. The controller sends its own paths, which
+        # only match when both nodes happen to use identical directories.
+        compile_base = rt.compile_cache_dir.rstrip("/")
+        local_host = {CONTAINER_HF_HOME: rt.hf_cache_dir, CONTAINER_COMPILE_CACHE: rt.compile_cache_dir,
+                      CONTAINER_MODS: rt.mods_dir,
+                      **{path: f"{compile_base}/{sub}" for sub, path in CACHE_MOUNTS.items()}}
         for m in spec.mounts:
+            if m.container in local_host:
+                m = m.model_copy(update={"host": local_host[m.container]})
             host = Path(m.host).resolve()
 
             def inside(r: Path, host: Path = host) -> bool:
@@ -263,6 +280,14 @@ class AgentActions:
                 raise ActionError(f"mount outside allowed roots: {m.host}")
             elif not self.dry_run:
                 host.mkdir(parents=True, exist_ok=True)
+            # hand docker the path that was validated (symlinks resolved), not the raw string
+            resolved_mounts.append(m.model_copy(update={"host": str(host)}))
+        spec = spec.model_copy(update={"mounts": resolved_mounts})
+        if not _IMAGE_REF_RE.fullmatch(spec.image_ref):
+            raise ActionError("invalid image reference")
+        if not self.runtime.image_present(spec.image_ref):
+            raise ActionError(f"image {spec.image_ref} is not on node {node}; pull it first "
+                              f"(containers never pull implicitly)")
         # node-local policy: the controller cannot escalate beyond what this node allows
         if spec.privileged and rt.container_mode != "privileged":
             raise ActionError("privileged containers are not allowed by this node's "
@@ -283,11 +308,18 @@ class AgentActions:
         # resolve ${secret:...} placeholders locally — secrets never travel in plans
         overrides: dict[str, str] = {}
         for k, v in spec.env.items():
-            m = _SECRET_REF.match(v)
+            if "${secret" in v.lower().replace(" ", "") and not _SECRET_REF.fullmatch(v):
+                raise ActionError(f"malformed secret reference in {k}")
+            m = _SECRET_REF.fullmatch(v)
             if m:
-                val = self.vault.get(m.group(1))
+                slot = m.group(1)
+                # Only the documented slot -> variable pairs. Anything else would let a profile,
+                # recipe or mod read the node's vault (management key, agent token, ...).
+                if k not in _SECRET_ENV.get(slot, ()):
+                    raise ActionError(f"secret '{slot}' may not be injected into {k}")
+                val = self.vault.get(slot)
                 if not val:
-                    raise ActionError(f"secret slot '{m.group(1)}' is empty on node {node}")
+                    raise ActionError(f"secret slot '{slot}' is empty on node {node}")
                 overrides[k] = val
         # a crashed earlier attempt of the same revision leaves an exited container
         self.runtime.remove_exited_owned(spec.name)

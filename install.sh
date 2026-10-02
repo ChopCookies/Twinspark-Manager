@@ -32,6 +32,14 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# $TSM_HOME is deleted by --uninstall and chown'ed by the install: it must be a dedicated directory.
+case "$TSM_HOME" in
+  /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+    die "TSM_HOME=$TSM_HOME is a system directory; use a dedicated one such as /opt/twinspark" ;;
+  /*) ;;
+  *) die "TSM_HOME must be an absolute path (got '$TSM_HOME')" ;;
+esac
+
 [ "$(uname -s)" = "Linux" ] || die "TwinSpark targets Linux (the DGX Spark). On other systems use: python -m venv .venv && .venv/bin/pip install -e . && .venv/bin/tsm demo"
 
 # Everything below writes to system locations: become root once, keeping the arguments.
@@ -97,6 +105,13 @@ command -v docker >/dev/null 2>&1 || warn "docker was not found. Setup can still
 [ -f "$SRC/pyproject.toml" ] || die "run install.sh from a checkout of the TwinSpark repository (pyproject.toml not found next to it)"
 say "Installing TwinSpark into $TSM_HOME"
 mkdir -p "$TSM_HOME"
+# An existing environment is reused and then run as root: it must not belong to somebody else.
+if [ -e "$TSM_HOME" ] && [ "$(stat -c %u "$TSM_HOME")" != "0" ]; then
+  die "$TSM_HOME is not owned by root; remove it (sudo rm -rf $TSM_HOME) and run the installer again"
+fi
+if [ -d "$TSM_HOME/venv" ] && [ "$(stat -c %u "$TSM_HOME/venv")" != "0" ]; then
+  die "$TSM_HOME/venv is not owned by root; remove it (sudo rm -rf $TSM_HOME/venv) and run the installer again"
+fi
 if [ ! -x "$TSM_HOME/venv/bin/python" ]; then
   "$PY" -m venv "$TSM_HOME/venv"
 fi

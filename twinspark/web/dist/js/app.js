@@ -254,20 +254,22 @@ function boot() {
 }
 
 /* ============================== router ============================== */
+/** decodeURIComponent that never throws on a hand-typed "%" in the address bar */
+function safeDecode(v) { try { return decodeURIComponent(v); } catch { return String(v); } }
 const ROUTES = [
   [/^\/?$/, () => viewDashboard()],
   [/^\/dashboard$/, () => viewDashboard()],
   [/^\/system$/, () => viewSystem()],
   [/^\/updates$/, () => viewUpdates()],
   [/^\/profiles$/, () => viewProfiles()],
-  [/^\/profiles\/([^/]+)(?:\/(\w+))?$/, (m) => viewProfile(decodeURIComponent(m[1]), m[2] || "overview")],
+  [/^\/profiles\/([^/]+)(?:\/(\w+))?$/, (m) => viewProfile(safeDecode(m[1]), m[2] || "overview")],
   [/^\/cookbook(?:\/(\w+))?$/, (m) => viewCookbook(m[1] || "builtin")],
   [/^\/files$/, () => viewFiles()],
   [/^\/mods$/, () => viewMods()],
   [/^\/planner$/, () => viewPlanner()],
   [/^\/diagnostics(?:\/(\w+))?$/, (m) => viewDiagnostics(m[1] || "doctor")],
   [/^\/jobs$/, () => viewJobs()],
-  [/^\/jobs\/([^/]+)$/, (m) => viewJob(decodeURIComponent(m[1]))],
+  [/^\/jobs\/([^/]+)$/, (m) => viewJob(safeDecode(m[1]))],
   [/^\/audit$/, () => viewAudit()],
   [/^\/logs$/, () => viewLogs()],
 ];
@@ -293,13 +295,14 @@ async function route() {
       try { await fn(m); }
       catch (e) {
         if (!current(g)) return;
-        main.innerHTML = `<div class="view"><div class="view-head"><div><h1>Something went wrong</h1><p>${esc(e.message)}</p></div></div>
-          <div class="row"><button class="btn" onclick="route()">Retry</button></div></div>`;
+        const missing = e && e.status === 404;
+        main.innerHTML = `<div class="view"><div class="view-head"><div><h1>${missing ? "Not found" : "Something went wrong"}</h1><p>${esc(e.message)}</p></div></div>
+          <div class="row">${missing ? "" : `<button class="btn" onclick="route()">Retry</button>`}<a class="btn ${missing ? "primary" : ""}" href="#/dashboard">Dashboard</a><a class="btn" href="#/profiles">Profiles</a><a class="btn" href="#/jobs">Jobs</a></div></div>`;
       }
       return;
     }
   }
-  main.innerHTML = `<div class="view">${empty("Not found", path)}</div>`;
+  main.innerHTML = `<div class="view">${empty("Not found", path)}<div class="row"><a class="btn primary" href="#/dashboard">Back to the dashboard</a></div></div>`;
 }
 function go(hash) { if (location.hash === hash) route(); else location.hash = hash; }
 /** render into #main only if the user has not navigated away meanwhile */
@@ -1179,7 +1182,10 @@ async function viewMods() {
   onAct({
     remove: async (el) => {
       if (!await confirmBox(`Remove ${el.dataset.name}?`, "Removed from every node. Profiles that list it will fail preflight until it is reinstalled.", { label: "Remove", danger: true })) return;
-      await DEL(`/api/v1/mods/${enc(el.dataset.name)}`); toast("removed", "good"); route();
+      const r = await DEL(`/api/v1/mods/${enc(el.dataset.name)}`);
+      const errs = Object.entries((r && r.results) || {}).filter(([, x]) => x && x.error);
+      if (errs.length) toast(errs.map(([n, x]) => `node ${n}: ${x.error}`).join("; "), "bad"); else toast("removed", "good");
+      route();
     },
   });
   $("#mod-file").onchange = async (e) => {

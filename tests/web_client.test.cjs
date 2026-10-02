@@ -25,6 +25,12 @@ test("maintenance failure offers recovery and escapes node errors", () => {
   assert.match(result, /&lt;unsafe text&gt;/);
 });
 
+test("a hand-typed percent sign in the address bar cannot break routing", () => {
+  const c = client();
+  assert.equal(c.run("safeDecode('%E0%A4%A')"), "%E0%A4%A");
+  assert.equal(c.run("safeDecode('my%20profile')"), "my profile");
+});
+
 function client() {
   const elements = new Map(), events = new Map(), storage = new Map();
   const element = id => {

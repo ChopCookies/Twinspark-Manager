@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -27,6 +28,9 @@ class Store:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if str(self.db_path) != ":memory:" and not self.db_path.exists():
+            # profile environments and job logs live here: not readable by other local users
+            os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600))
         # FastAPI runs sync routes in a threadpool and jobs run on the event loop:
         # one shared connection, serialised by a lock (sqlite3 objects are not
         # thread-safe by default and raise ProgrammingError across threads).

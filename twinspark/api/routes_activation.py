@@ -14,7 +14,7 @@ from .deps import controller_dep, require_auth
 
 router = APIRouter(prefix="/api/v1", tags=["activation"], dependencies=[Depends(require_auth)])
 
-_CONTAINER = re.compile(r"^tsm-[a-z0-9._-]+$")
+_CONTAINER = re.compile(r"^tsm-[a-z0-9._-]+\Z")
 
 
 @router.get("/status")
@@ -108,4 +108,4 @@ async def active_logs(tail: int = 300, ctrl: Controller = Depends(controller_dep
 
 @router.get("/audit", response_model=list[AuditEntry])
 def audit(limit: int = 100, ctrl: Controller = Depends(controller_dep)):
-    return ctrl.store.audit_log(limit=min(limit, 1000))
+    return ctrl.store.audit_log(limit=max(1, min(limit, 1000)))

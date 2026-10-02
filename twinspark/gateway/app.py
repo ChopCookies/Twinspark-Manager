@@ -13,10 +13,11 @@ from starlette.routing import Route
 from .gateway import Gateway, RouteState
 
 # Endpoints forwarded to vLLM. /v1/models is answered by the gateway itself.
+# (audio/transcriptions is multipart, which this JSON-rewriting gateway cannot route by alias.)
 _FORWARDED = {"chat/completions", "completions", "embeddings", "responses", "rerank",
-              "score", "tokenize", "detokenize", "audio/transcriptions", "classify",
-              "pooling"}
+              "score", "tokenize", "detokenize", "classify", "pooling"}
 _HOP_BY_HOP = {"content-length", "transfer-encoding", "connection", "keep-alive"}
+_FAILOVER_STATUS = {502, 503, 504}      # a replica that says this is skipped for the next candidate
 
 
 def _error(status: int, message: str, code: str, headers: dict | None = None, **extra) -> JSONResponse:
@@ -51,6 +52,8 @@ def build_gateway_app(gateway: Gateway) -> Starlette:
         return JSONResponse(_model_entry(st))
 
     async def status(request: Request):
+        if not gateway.check_key(request.headers.get("authorization")):
+            return _error(401, "invalid api key", "invalid_api_key")
         return JSONResponse({"routes": [
             {k: v for k, v in st.to_payload().items() if k not in ("last_error",)}
             for st in gateway.routes.values()]})
@@ -73,9 +76,12 @@ def build_gateway_app(gateway: Gateway) -> Starlette:
         if not isinstance(body, dict):
             return _error(400, "request body must be a JSON object", "invalid_request_error")
 
-        st = gateway.resolve(body.get("model"))
+        requested = body.get("model")
+        if requested is not None and not isinstance(requested, str):
+            return _error(400, "'model' must be a string", "invalid_request_error")
+        st = gateway.resolve(requested)
         if st is None:
-            return _error(404, f"unknown model/alias: {body.get('model')!r}", "model_not_found")
+            return _error(404, f"unknown model/alias: {str(requested)[:120]!r}", "model_not_found")
         if st.draining or not st.backends or st.down_reason:
             msg = ("model is down: " + st.down_reason) if st.down_reason else \
                 "model is switching or not loaded; retry shortly"
@@ -87,15 +93,22 @@ def build_gateway_app(gateway: Gateway) -> Starlette:
         st.acquire()
         upstream = None
         last_exc: Exception | None = None
-        for backend in st.candidates():
+        candidates = st.candidates()
+        for i, backend in enumerate(candidates):
             req = gateway._client.build_request(
                 "POST", f"{backend}/v1/{path}", content=payload, headers=gateway.backend_headers())
             try:
-                upstream = await gateway._client.send(req, stream=True)
-                break
+                resp = await gateway._client.send(req, stream=True)
             except httpx.HTTPError as exc:
                 st.backend_failed(backend)
                 last_exc = exc
+                continue
+            if resp.status_code in _FAILOVER_STATUS and i + 1 < len(candidates):
+                st.backend_failed(backend)             # a replica is sick: try the next one
+                await resp.aclose()
+                continue
+            upstream = resp
+            break
         if upstream is None:
             st.errors += 1
             st.last_error = f"backend unreachable: {type(last_exc).__name__}"
@@ -118,6 +131,9 @@ def build_gateway_app(gateway: Gateway) -> Starlette:
             except httpx.HTTPError as exc:
                 st.errors += 1
                 st.last_error = f"stream interrupted: {type(exc).__name__}"
+                # Re-raise: swallowing it would end the chunked body cleanly and the client
+                # would see a complete 200 response that is silently truncated.
+                raise
             finally:
                 await upstream.aclose()
                 if not released:
