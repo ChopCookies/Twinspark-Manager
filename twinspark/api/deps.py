@@ -11,6 +11,7 @@ from ..controller.controller import Controller
 from ..security import tokens_equal
 
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+_MAINTENANCE_OK = ("/api/v1/system/maintenance/", "/api/v1/remote/")
 _FAILED_PER_MIN = 120          # wrong-key requests tolerated per client per minute
 
 
@@ -80,6 +81,9 @@ def require_auth(request: Request, x_api_key: Optional[str] = Header(default=Non
     if ok[1] > cfg.rate_limit_per_min:
         raise _too_many()
 
+    # Remote management stays reachable while a maintenance run is in progress or has failed: that is
+    # when a terminal or a power cycle is needed most. Reboot/poweroff/plug-off still refuse a busy
+    # cluster unless the operator repeats them with force (see controller/remote.py).
     if (request.method in _MUTATING and ctrl.maintenance.blocking()
-            and not request.url.path.startswith("/api/v1/system/maintenance/")):
+            and not request.url.path.startswith(_MAINTENANCE_OK)):
         raise HTTPException(409, "cluster is reserved for maintenance; open Updates to review progress")

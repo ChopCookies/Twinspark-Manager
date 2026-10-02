@@ -21,10 +21,12 @@ from ..api import (
     routes_diagnostics,
     routes_files,
     routes_profiles,
+    routes_remote,
     routes_system,
 )
 from ..api.deps import check_key
 from .controller import Controller
+from .remote import RemoteError
 
 log = logging.getLogger("twinspark.app")
 WEB_ASSETS = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -107,6 +109,10 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
                    "type": _clean(e.get("type", ""), 60)} for e in exc.errors()[:20]]
         return JSONResponse(status_code=422, content={"detail": errors})
 
+    @app.exception_handler(RemoteError)
+    async def remote_problem(request: Request, exc: RemoteError):
+        return JSONResponse(status_code=exc.status, content={"detail": _clean(exc, 600)})
+
     @app.exception_handler(RecursionError)
     async def too_deep(request: Request, exc: RecursionError):
         return JSONResponse(status_code=400, content={"detail": "request body is nested too deeply"})
@@ -117,7 +123,8 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
         return JSONResponse(status_code=500, content={"detail": f"internal error ({type(exc).__name__})"})
 
     for r in (routes_profiles.router, routes_activation.router, routes_system.router,
-              routes_cookbook.router, routes_diagnostics.router, routes_files.router):
+              routes_cookbook.router, routes_diagnostics.router, routes_files.router,
+              routes_remote.router, routes_remote.ws_router):
         app.include_router(r)
 
     @app.get("/api/v1/health")

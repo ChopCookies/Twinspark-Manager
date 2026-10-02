@@ -364,3 +364,10 @@ input[type="search"]::-webkit-search-cancel-button{cursor:pointer}
 .start-mark.blocked{border-color:var(--bad);color:var(--bad)}
 .start-step.done{opacity:.78}
 @media (max-width:720px){.start-step{flex-wrap:wrap}}
+
+/* ---- Remote page: terminal ---- */
+.term-box{height:min(62vh,540px);min-height:240px;background:#050a14;border:1px solid var(--stroke);border-radius:12px;padding:8px;overflow:hidden}
+.term-box .xterm{height:100%}
+.term-box .xterm-viewport{background:transparent!important}
+.term-keys{margin-top:8px;flex-wrap:wrap;gap:6px}
+@media (max-width:640px){.term-box{height:min(52vh,420px)}}

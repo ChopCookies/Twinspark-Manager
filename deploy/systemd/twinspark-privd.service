@@ -4,7 +4,7 @@ After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/opt/twinspark/venv/bin/tsm serve privd --socket /run/twinspark/privd.sock --group twinspark
+ExecStart=/opt/twinspark/venv/bin/tsm serve privd --socket /run/twinspark/privd.sock --group twinspark --remote-policy /etc/twinspark/remote-policy.json
 Restart=on-failure
 User=root
 NoNewPrivileges=true

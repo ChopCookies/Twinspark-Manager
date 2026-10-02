@@ -26,11 +26,14 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import __version__
+from .remote.policy import FEATURES as REMOTE_FEATURES
+from .remote.policy import write_policy
 from .schemas.config import AgentConfig, ControllerConfig, load_config
 from .security import SecretsVault
 
 JOIN_PREFIX = "tsm1."
-UNIT_NAMES = ("twinspark-privd.service", "twinspark-agent.service", "twinspark-controller.service")
+UNIT_NAMES = ("twinspark-privd.service", "twinspark-agent.service", "twinspark-controller.service",
+              "twinspark-terminal.service")
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}\Z")
 # one single-line OpenSSH public key; a newline would smuggle a second, unrestricted authorized_keys entry
@@ -106,6 +109,7 @@ class Answers:
     gateway_bind: str = "0.0.0.0"
     gateway_port: int = 8000
     agent_port: int = 9443
+    terminal_port: int = 9444
     vllm_port: int = 8100
     runtime_mode: str = "dry-run"
 
@@ -130,8 +134,13 @@ class Answers:
         for label, ip in (("QSFP address", self.qsfp_ip), ("peer address", self.peer_ip)):
             if self.role != "single" and not (ip and _IP_RE.match(ip) and all(int(x) < 256 for x in ip.split("."))):
                 raise SetupError(f"{label} {ip!r} is not an IPv4 address")
+        unknown = sorted(set(self.remote) - set(REMOTE_FEATURES))
+        if unknown:
+            raise SetupError(f"unknown remote-management option(s): {', '.join(unknown)} "
+                             f"(known: {', '.join(REMOTE_FEATURES)})")
         for label, port in (("management", self.mgmt_port), ("gateway", self.gateway_port),
-                            ("agent", self.agent_port), ("vLLM", self.vllm_port)):
+                            ("agent", self.agent_port), ("terminal", self.terminal_port),
+                            ("vLLM", self.vllm_port)):
             if not 1024 <= int(port) <= 65535:
                 raise SetupError(f"{label} port {port} must be between 1024 and 65535")
         if self.role == "agent" and not (self.agent_token and self.backend_api_key):
@@ -216,6 +225,7 @@ def render_controller_yaml(a: Answers, lay: Layout) -> str:
         f"    qsfp_iface: {a.qsfp_iface or 'null'}",
         f"    rdma_hcas: {_hcas(a.rdma_hcas)}       # `tsm rdma` prints the right values",
         f"    ib_gid_index: {ib}",
+        f"    terminal_port: {a.terminal_port}               # tsm-termd (only runs if the terminal is enabled)",
     ]
     if a.role != "single":
         nodes += [
@@ -226,6 +236,7 @@ def render_controller_yaml(a: Answers, lay: Layout) -> str:
             f"    ssh_user: {a.peer_ssh_user}                 # weights are copied A -> B over QSFP as this user",
             f"    rdma_hcas: {_hcas(a.rdma_hcas)}",
             f"    ib_gid_index: {ib}",
+            f"    terminal_port: {a.terminal_port}",
         ]
     return f"""# {lay.controller_yaml} — written by `tsm setup` (TwinSpark {__version__})
 # Safe to edit. Re-running `tsm setup` keeps this file unless you pass --force (a backup is made).
@@ -254,6 +265,15 @@ runtime:
 
 autostart: true                     # adopt / re-activate the last healthy model after a reboot
 auto_rollback: true
+
+# Out-of-band power for a node that is off or hung (optional; see docs/remote-management.md).
+# `tsm node info` on the node prints its MAC addresses. Uncomment, adjust, restart the controller:
+#   nodes:
+#     B:
+#       wake: {{mac: "aa:bb:cc:dd:ee:ff", iface: {a.qsfp_iface or 'enp1s0f1np1'}, broadcast: 255.255.255.255}}
+#       plug:                         # a smart plug / PDU outlet with an HTTP API (Tasmota, Shelly, Home Assistant)
+#         off: {{url: "http://192.168.1.50/cm?cmnd=Power%20Off"}}
+#         on:  {{url: "http://192.168.1.50/cm?cmnd=Power%20On"}}
 """
 
 
@@ -275,6 +295,14 @@ runtime:
   mods_dir: {lay.state}/mods
   ssh_key: {lay.ssh_dir}/id_ed25519
   ssh_known_hosts: {lay.ssh_dir}/known_hosts
+
+# What the web GUI / CLI may do to this machine is decided by {lay.etc}/remote-policy.json,
+# which only root can change:   sudo tsm remote enable terminal reboot ...
+remote_mgmt:
+  policy_path: {lay.etc}/remote-policy.json
+  require_root_owned: {"false" if lay.sandbox else "true"}
+  record_dir: {lay.state}/terminal
+  terminal_port: {a.terminal_port}
 """
 
 
@@ -288,13 +316,14 @@ def _rw_paths(a: Answers, lay: Layout, controller: bool) -> str:
 def render_units(a: Answers, lay: Layout) -> dict[str, str]:
     """systemd units for this node, pinned to the service user and the paths in the configs."""
     tsm = lay.tsm_bin
+    policy_args = f"--remote-policy {lay.etc}/remote-policy.json" + (" --unsafe-policy-owner" if lay.sandbox else "")
     privd = f"""[Unit]
 Description=TwinSpark privileged helper (drop page cache, headless mode, node power)
 After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart={tsm} serve privd --socket {lay.run}/privd.sock --group {a.group}
+ExecStart={tsm} serve privd --socket {lay.run}/privd.sock --group {a.group} {policy_args}
 Restart=on-failure
 User=root
 NoNewPrivileges=true
@@ -350,7 +379,46 @@ WantedBy=multi-user.target
     units = {"twinspark-privd.service": privd, "twinspark-agent.service": agent}
     if a.role in ("controller", "single"):
         units["twinspark-controller.service"] = controller
+    if a.remote.get("terminal"):
+        units["twinspark-terminal.service"] = render_terminal_unit(a, lay)
     return units
+
+
+def render_terminal_unit(a: Answers, lay: Layout) -> str:
+    """The terminal service. It is deliberately NOT sandboxed like the agent: a troubleshooting shell
+    needs sudo, docker and a writable filesystem, exactly as over SSH. It is a separate unit so the
+    agent keeps its restrictions, and it only does anything while the root-owned policy allows it."""
+    return f"""[Unit]
+Description=TwinSpark terminal (opt-in browser/CLI shell on this node, recorded)
+After=network-online.target twinspark-agent.service
+Wants=network-online.target
+
+[Service]
+User={a.service_user}
+ExecStart={lay.tsm_bin} serve termd --config {lay.agent_yaml}
+Restart=on-failure
+RestartSec=3
+# stopping the unit ends every shell it started
+KillMode=control-group
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def installed_terminal_unit(lay: Layout) -> str:
+    """The terminal unit for a node that is already set up (same user as its agent unit)."""
+    from types import SimpleNamespace
+    agent_unit = lay.systemd / "twinspark-agent.service"
+    try:
+        m = re.search(r"(?m)^User=(\S+)\s*$", agent_unit.read_text())
+    except OSError:
+        m = None
+    if not m:
+        raise SetupError(f"cannot tell which user runs the agent ({agent_unit} not found) — run "
+                         f"`sudo tsm setup` on this node first")
+    return render_terminal_unit(SimpleNamespace(service_user=m.group(1)), lay)       # type: ignore[arg-type]
 
 
 def netplan_snippet(iface: str, ip: str, prefix: int = 24) -> str:
@@ -642,6 +710,22 @@ class Provisioner:
             except Exception as exc:  # noqa: BLE001
                 raise SetupError(f"the written configuration does not validate: {exc}") from exc
 
+    def remote_policy(self) -> None:
+        """Write the remote-management switches the operator chose (root-owned, merged with any existing)."""
+        want = {k: bool(v) for k, v in self.a.remote.items()}
+        path = self.lay.etc / "remote-policy.json"
+        if not want:
+            self._step("remote management", "kept" if path.exists() else "skipped",
+                       "policy unchanged" if path.exists() else
+                       "everything off (enable later with: sudo tsm remote enable …)")
+            return
+        if self.dry:
+            self._step("remote management", "planned", ", ".join(k for k, v in want.items() if v) or "all off")
+            return
+        pol = write_policy(path, want, chown_root=not self.lay.sandbox)
+        self._step("remote management", "done",
+                   "enabled: " + (", ".join(pol.enabled) or "nothing") + f"  ({path})")
+
     def units(self) -> list[str]:
         written = []
         for name, text in render_units(self.a, self.lay).items():
@@ -674,6 +758,7 @@ class Provisioner:
         self.secrets()
         pub = self.ssh_key()
         self.configs()
+        self.remote_policy()
         names = self.units()
         self.start(names)
         self.pubkey = pub

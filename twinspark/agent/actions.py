@@ -122,6 +122,8 @@ class AgentActions:
             "mods_install": self.mods_install,
             "mods_remove": self.mods_remove,
         }
+        from .remote_actions import build as _remote_actions
+        self.registry.update(_remote_actions(self))
 
     @property
     def dry_run(self) -> bool:

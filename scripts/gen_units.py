@@ -17,7 +17,8 @@ from twinspark.provision import Answers, Layout, render_units  # noqa: E402
 
 
 def reference_units() -> dict[str, str]:
-    return render_units(Answers(role="controller", service_user="twinspark", group="twinspark"), Layout())
+    return render_units(Answers(role="controller", service_user="twinspark", group="twinspark",
+                                remote={"terminal": True}), Layout())
 
 
 if __name__ == "__main__":

@@ -49,7 +49,8 @@ class DemoCluster:
     """Controller + gateway + agents A and B on loopback addresses (127.0.0.1 / 127.0.0.2)."""
 
     def __init__(self, base: Optional[Path] = None, seed: bool = True, mgmt_port: Optional[int] = None,
-                 gateway_port: Optional[int] = None, extra: Optional[dict] = None):
+                 gateway_port: Optional[int] = None, extra: Optional[dict] = None,
+                 remote: Optional[dict] = None):
         self._tmp = None
         if base is None:
             self._tmp = tempfile.TemporaryDirectory(prefix="twinspark-demo-")
@@ -59,6 +60,9 @@ class DemoCluster:
         self.mgmt_port = mgmt_port or free_port()
         self.gateway_port = gateway_port or free_port()
         self.agent_port = free_port("127.0.0.2")
+        self.terminal_port = free_port("127.0.0.2")
+        # remote-management switches to turn on in both nodes' policy ({} = everything off, the default)
+        self.remote = dict(remote or {})
         self.extra = extra or {}
         self.a_layout = Layout(self.base / "node-a")
         self.b_layout = Layout(self.base / "node-b")
@@ -72,6 +76,7 @@ class DemoCluster:
         user = getpass.getuser()
         common = dict(service_user=user, mgmt_port=self.mgmt_port,
                       gateway_port=self.gateway_port, gateway_bind="127.0.0.1", agent_port=self.agent_port,
+                      terminal_port=self.terminal_port, remote=dict(self.remote),
                       vllm_port=free_port(), runtime_mode="dry-run", peer_ssh_user=user)
         a = Answers(role="controller", node_id="A", hostname="demo-a", qsfp_iface="lo", qsfp_ip="127.0.0.1",
                     peer_ip="127.0.0.2", peer_iface="lo", hf_cache_dir=str(self.base / "node-a" / "hf"),
@@ -117,8 +122,12 @@ class DemoCluster:
         self.provision()
         q = "warning"
         # agents first: like a real boot where the controller must wait for them
-        await self._boot([serve.build_agent_server(str(self.a_layout.agent_yaml), q),
-                          serve.build_agent_server(str(self.b_layout.agent_yaml), q)])
+        servers = [serve.build_agent_server(str(self.a_layout.agent_yaml), q),
+                   serve.build_agent_server(str(self.b_layout.agent_yaml), q)]
+        if self.remote.get("terminal"):
+            servers += [serve.build_termd_server(str(self.a_layout.agent_yaml), q),
+                        serve.build_termd_server(str(self.b_layout.agent_yaml), q)]
+        await self._boot(servers)
         self.controller, mgmt, gw = serve.build_servers(
             str(self.a_layout.controller_yaml), seed=seed_recipes if self.seed else None, log_level=q)
         await self._boot([mgmt, gw])
@@ -145,7 +154,8 @@ class DemoCluster:
 def cmd_demo(args, api=None) -> None:
     async def main() -> None:
         base = Path(args.dir) if args.dir else None
-        demo = DemoCluster(base, seed=not args.empty, mgmt_port=args.port)
+        demo = DemoCluster(base, seed=not args.empty, mgmt_port=args.port,
+                           remote={"terminal": True} if getattr(args, "with_terminal", False) else None)
         await demo.start()
         print("TwinSpark demo — two simulated Sparks on this machine (containers are NOT run).")
         print(f"  Web GUI      {demo.url}/")
@@ -154,6 +164,8 @@ def cmd_demo(args, api=None) -> None:
               f"{demo.a_layout.secrets})")
         print(f"  Files        {demo.base}")
         print("  Try: import a recipe in the Cookbook, Pin & prepare it, press Plan. Ctrl-C stops and cleans up.")
+        if getattr(args, "with_terminal", False):
+            print("  Remote page: the terminal is switched on — it opens a real shell as YOUR user on this machine.")
         try:
             await asyncio.gather(*demo.tasks)
         finally:
@@ -170,4 +182,6 @@ def add_parsers(sub, cmd) -> None:
     s.add_argument("--port", type=int, help="web GUI port (default: any free port)")
     s.add_argument("--dir", help="keep demo files here instead of a temp dir")
     s.add_argument("--empty", action="store_true", help="do not pre-load the built-in recipes")
+    s.add_argument("--with-terminal", action="store_true",
+                   help="switch the Remote page's terminal on (opens a real shell as your user on this machine)")
     cmd_demo.local = True

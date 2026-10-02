@@ -20,6 +20,7 @@ SECRET_SLOTS = {
     "management_api_key",     # GUI/CLI -> controller
     "backend_api_key",        # gateway -> vLLM (never leaves the cluster)
     "agent_token",            # controller -> agents (same value on both nodes)
+    "plug_token",             # optional: referenced as ${secret:plug_token} in smart-plug requests
 }
 
 

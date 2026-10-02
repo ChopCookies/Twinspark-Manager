@@ -61,6 +61,35 @@ Sparks. Each fix has a regression test (`tests/test_hardening_*.py`, 296 tests i
 - Unknown profiles/jobs/routes show a "Not found" page with ways back instead of a dead end; a hand-typed
   `%` in the URL no longer breaks routing.
 
+### Remote management for headless nodes (milestone 3)
+
+Full guide: [docs/remote-management.md](docs/remote-management.md). Everything that changes a node is
+**off until switched on, on that node**, in a root-owned `/etc/twinspark/remote-policy.json` that fails
+closed (`sudo tsm remote enable|disable|policy`, or `tsm setup --remote …`).
+
+- **Terminal**: opt-in `twinspark-terminal` service (PTY over WebSocket, separate from the sandboxed
+  agent), in the **Remote** page (xterm.js, vendored; touch keys for phones) and as `tsm remote terminal B`
+  (raw TTY, Ctrl-] . to leave). One-time 30 s tickets, Origin check, idle/total limits, at most 2 sessions
+  per node, every session recorded as asciicast and audited.
+- **Diagnostics without a shell**: `tsm remote reach` (agent / SSH / terminal probes and a verdict:
+  ok, agent_error, agent_down, link_down, host_down, each with next steps), `tsm remote logs` (agent,
+  kernel, previous boot, docker, …), `tsm remote bundle` (redacted support archive, size- and time-bounded).
+- **Power**: reboot / power-off scheduled a few seconds ahead through `twinspark-privd`, typed
+  confirmation (`REBOOT B`, `POWEROFF B`), cancel, refused while the cluster is busy unless forced.
+- **Out-of-band**: boot-once from network / USB via UEFI BootNext (`tsm remote boot`), Wake-on-LAN
+  (node setting and `nodes.<id>.wake` magic packet), HTTP smart plug (`nodes.<id>.plug`, token in the vault as
+  `${secret:plug_token}`, typed `CUT POWER B`).
+- **When the controller is down**: `sudo tsm node status|doctor|logs|bundle|reboot|poweroff|cancel|boot|wol`
+  work on the node alone; `tsm wake MAC` and `tsm netboot plan|serve` (short-lived proxyDHCP/TFTP rescue
+  helper locked to one MAC) are standalone.
+- `tsm demo --with-terminal`, `DemoCluster(remote={...})`; the setup wizard asks which features to enable.
+- Controller→node traffic uses typed actions only (allowlist; no generic exec); the remote endpoints stay
+  reachable during a maintenance run so a node can still be inspected.
+- 518 tests in total (222 new, covering the policy, root helper, terminal relay, controller, CLI and docs
+  examples); the Remote page was also checked in a real browser at desktop and phone width.
+- **Not verified on the hardware**: Wake-on-LAN, BootNext and network boot depend on DGX Spark firmware;
+  the guide says how to test each once while the machine is still reachable.
+
 ## 0.4.1 — 2026-10-01
 
 - Prepare pinned recipes in a background job without stopping the active model:

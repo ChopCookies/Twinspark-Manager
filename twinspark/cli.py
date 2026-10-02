@@ -145,8 +145,10 @@ def cmd_serve(args, api=None):
         asyncio.run(serve.run_controller(args.config))
     elif args.what == "agent":
         serve.run_agent(args.config)
+    elif args.what == "termd":
+        serve.run_termd(args.config)
     else:
-        serve.run_privd(args.socket, args.group)
+        serve.run_privd(args.socket, args.group, args.remote_policy, not args.unsafe_policy_owner)
 
 
 # ---- status ---------------------------------------------------------------------------------
@@ -923,10 +925,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--show", action="store_true", help="print secret values")
 
     s = cmd("serve", cmd_serve, "run a service (used by systemd)")
-    s.add_argument("what", choices=["controller", "agent", "privd"])
+    s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
     s.add_argument("--config", help="controller.yaml / agent.yaml")
     s.add_argument("--socket", default="/run/twinspark/privd.sock")
     s.add_argument("--group", default="twinspark")
+    s.add_argument("--remote-policy", help="privd: path of the remote-management policy "
+                                           "(default /etc/twinspark/remote-policy.json)")
+    s.add_argument("--unsafe-policy-owner", action="store_true",
+                   help="privd: accept a policy file not owned by root (sandbox installs and tests only)")
 
     cmd("status", cmd_status, "active model, routes, memory, live serving metrics")
     cmd("profiles", cmd_profiles, "list profiles", aliases=["ls"])
@@ -1032,8 +1038,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_setup
+    from . import cli_remote, cli_setup
     cli_setup.add_parsers(sub, cmd)
+    cli_remote.add_parsers(sub, cmd)
     from . import demo
     demo.add_parsers(sub, cmd)
     return p
@@ -1045,8 +1052,8 @@ def main(argv=None) -> int:
     if not getattr(args, "fn", None):
         p.print_help()
         return 0
-    if args.fn is cmd_serve and args.what in ("controller", "agent") and not args.config:
-        p.error("serve controller|agent needs --config")
+    if args.fn is cmd_serve and args.what in ("controller", "agent", "termd") and not args.config:
+        p.error("serve controller|agent|termd needs --config")
     api = None if getattr(args.fn, "local", False) or args.fn in (cmd_init, cmd_serve) \
         else Api(args.api, _key(args), args.json)
     args.fn(args, api)

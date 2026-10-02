@@ -186,10 +186,39 @@ def gather_controller(args, con: Console, rep: hostprobe.HostReport, a: Answers)
         [("dry-run", "dry-run — simulates containers; switch later with `sudo tsm go-live` (recommended)"),
          ("docker", "docker — real containers right away")], 0)
     a.runtime_mode = mode
+    gather_remote(args, con, a)
     if args.hf_token_file:
         a.hf_token = Path(args.hf_token_file).read_text().strip()
     elif not con.yes:
         a.hf_token = con.secret("Hugging Face token for gated models") or None
+
+
+def gather_remote(args, con: Console, a: Answers) -> None:
+    """Optional remote management for a headless node. Everything stays OFF unless chosen here."""
+    from .cli_remote import parse_features
+
+    con.head("Remote management (optional)")
+    con.say("  Both Sparks run headless. These switches let you fix problems without a monitor:")
+    con.say("  a shell in the GUI, reboot / power-off, boot once from the network, Wake-on-LAN.")
+    con.say("  They are OFF by default and decided by a root-owned file on this machine, so nothing")
+    con.say("  but you (with sudo) can switch them on. Change them any time: sudo tsm remote enable …")
+    if args.remote is not None:
+        try:
+            chosen = parse_features(args.remote)
+        except SetupError as exc:
+            sys.exit(f"error: {exc}")
+    elif con.yes:
+        chosen = []
+        con.say("  → off (pass --remote terminal,reboot,… or --remote all to enable some)")
+    else:
+        pick = con.choose("What should be switched on for this node?", [
+            ("none", "nothing for now (safest; enable later with `sudo tsm remote enable …`)"),
+            ("terminal", "terminal only — a recorded shell from the GUI or `tsm remote terminal`"),
+            ("terminal,reboot,poweroff,boot-next", "terminal + reboot / power-off / boot from network once"),
+            ("all", "everything, including turning Wake-on-LAN on")], 0)
+        chosen = parse_features(pick)
+    a.remote = {f: True for f in chosen}
+    con.say("  remote management: " + (", ".join(f.replace("_", "-") for f in chosen) or "off"))
 
 
 def _user_check(v: str) -> Optional[str]:
@@ -247,6 +276,7 @@ def gather_agent(args, con: Console, rep: hostprobe.HostReport, a: Answers, info
     a.hf_cache_dir = args.hf_cache_dir or con.ask("Model files (Hugging Face home)", default_hf)
     if args.runtime_mode:
         a.runtime_mode = args.runtime_mode
+    gather_remote(args, con, a)
     if args.hf_token_file:
         a.hf_token = Path(args.hf_token_file).read_text().strip()
     elif not con.yes:
@@ -315,6 +345,7 @@ def cmd_setup(args, api=None):
     if a.role != "agent":
         con.say(f"  web GUI         http://{a.mgmt_bind}:{a.mgmt_port}/   gateway :{a.gateway_port}")
     con.say(f"  mode            {a.runtime_mode}")
+    con.say("  remote          " + (", ".join(k.replace("_", "-") for k, v in a.remote.items() if v) or "off"))
     if not con.confirm("Write the configuration and start the services?", True):
         sys.exit("aborted — nothing was changed.")
 
@@ -344,6 +375,8 @@ def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None
             con.say("  ✓ agent is answering" if h else "  ! agent did not answer yet — journalctl -u twinspark-agent")
         con.head("Next")
         con.say("  Back on node A:   tsm doctor")
+        if not a.remote.get("terminal"):
+            con.say("  Headless? Shell, reboot and logs from the GUI:  sudo tsm remote enable terminal")
         pub = getattr(pv, "pubkey", None)
         if pub:
             con.say("  Only if you ever set download_node: B (B downloads, A receives), authorise this key on node A:")
@@ -375,6 +408,10 @@ def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None
     con.say("       (print it again any time with `tsm init --show`)")
     n += 1
     con.say(f"  {n}. Follow the 'Get started' page in the GUI, or:  tsm doctor")
+    if not a.remote.get("terminal"):
+        n += 1
+        con.say(f"  {n}. Headless? A shell, reboot and logs from the GUI:  sudo tsm remote enable terminal   "
+                f"(on each node; docs/remote-management.md)")
     if a.runtime_mode == "dry-run":
         con.say("\n  Running in dry-run: activations are simulated. When `tsm plan <profile>` looks right:")
         con.say("       sudo tsm go-live        (run on each node)")
@@ -474,6 +511,9 @@ def add_parsers(sub, cmd) -> None:
     s.add_argument("--gateway-port", type=int)
     s.add_argument("--vllm-port", type=int)
     s.add_argument("--runtime-mode", choices=["dry-run", "docker"])
+    s.add_argument("--remote", metavar="FEATURES",
+                   help="remote management to switch on: terminal,reboot,poweroff,boot-next,wol | all | none "
+                        "(default: ask; off when unattended)")
 
     s = cmd("join-code", cmd_join_code, "print the node-B join command again (node A)")
     s.add_argument("--root", default="/")

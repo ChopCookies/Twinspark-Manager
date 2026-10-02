@@ -67,7 +67,9 @@ class Controller:
         self.telemetry: dict[str, dict] = {}
         self.telemetry_history: dict[str, list] = {}
         from .maintenance import Maintenance
+        from .remote import RemoteService
         self.maintenance = Maintenance(self)
+        self.remote = RemoteService(self)
         self.watch_state: dict[str, Any] = {"unhealthy_streak": 0, "recoveries": [], "last": None}
         self._audit("system", "controller.init", "controller", {})
 

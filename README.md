@@ -103,7 +103,7 @@ sudo tsm setup --root /tmp/stage --yes --no-start      # build a complete instal
 ## What you get
 
 - **Web GUI** (served by the controller): Get started, Dashboard, System status, Updates,
-  Profiles, Cookbook, Model files, Mods, Planner, Diagnostics, Jobs, Logs.
+  Profiles, Cookbook, Model files, Mods, Planner, Diagnostics, **Remote**, Jobs, Logs.
 - **Recipes → profiles.** Built-in researched configs and community recipes (eugr/spark-vllm-docker
   format) by URL, paste or file; immutable revisions (model commit + image digest); diff, duplicate,
   known-good tracking; *Pin & prepare* stages weights without touching the model that is serving.
@@ -120,6 +120,10 @@ sudo tsm setup --root /tmp/stage --yes --no-start      # build a complete instal
   updates (B before A) with checkpoints, watchdog with auto-recovery, audit log.
 - **Hands-off boot:** the controller adopts running containers after a restart and resumes the last
   healthy model after a reboot.
+- **Remote management for headless nodes** (opt-in, per node): a recorded browser/CLI terminal, node
+  logs and a redacted support bundle, reboot / power-off with typed confirmation, boot-once from
+  network or USB, Wake-on-LAN, smart-plug power-cycling and a "why can't I reach it?" triage. See
+  [docs/remote-management.md](docs/remote-management.md).
 
 ## How it fits together
 
@@ -169,6 +173,21 @@ tsm stop                       # drain and stop the active model
 
 Everything in the GUI is the same API the CLI uses; `tsm --help` lists all commands.
 
+### When a node misbehaves (headless)
+
+```bash
+tsm remote reach B             # agent / SSH / terminal probes → what to do next
+tsm remote logs B --source previous-boot     # what happened before the last reboot
+tsm remote bundle B            # one redacted tar.gz for a bug report
+sudo tsm remote enable terminal      # on a node: switch on a recorded shell (off by default)
+tsm remote terminal B          # open it (or use the Remote page)
+sudo tsm node doctor           # on a node, with or without the controller
+```
+
+Power control, Wake-on-LAN, smart plugs and network boot are covered in
+[docs/remote-management.md](docs/remote-management.md). Everything that changes a node is off until you
+switch it on, on that node.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -182,6 +201,7 @@ Everything in the GUI is the same API the CLI uses; `tsm --help` lists all comma
 | Weight sync fails | `tsm doctor` shows the SSH check; node B must accept node A's sync key (setup installs it from the join code) |
 | `sudo: a terminal is required` over Tailscale SSH | start the session with `ssh -t`, or use `tmux`; setup itself only needs one `sudo` |
 | Activation fails and the old model comes back | by design — read the job (`tsm job <id>`), then `tsm logs` |
+| A node stopped answering | `tsm remote reach B` says which case it is; the checklist is in [docs/remote-management.md](docs/remote-management.md) |
 
 ## Updating and removing
 
@@ -197,6 +217,7 @@ Update both nodes (the Get started page warns when versions differ).
 
 - [Recipe and split-model workflow](docs/recipe-workflow.md)
 - [Monitoring and coordinated maintenance](docs/maintenance.md)
+- [Remote management: terminal, logs, power, Wake-on-LAN, network boot](docs/remote-management.md)
 - [Development, testing and the demo harness](docs/development.md)
 - [Security model and known limits](docs/security.md)
 - [Changelog](CHANGELOG.md) · [Review notes](REVIEW.md) · [Researched profiles](OPTIMAL-PROFILES.md)

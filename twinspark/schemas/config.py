@@ -7,16 +7,20 @@ Secrets are never stored in these files — they live in the vault under
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from pathlib import Path
 from typing import Literal, Optional, TypeVar
+from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .enums import HeadlessMode
 
 _IFACE_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
 class Listener(BaseModel):
@@ -24,6 +28,92 @@ class Listener(BaseModel):
     port: int
     tls_cert: Optional[str] = None
     tls_key: Optional[str] = None
+
+
+class WakeSettings(BaseModel):
+    """Wake-on-LAN: the controller broadcasts a magic packet for the node's MAC address."""
+
+    model_config = ConfigDict(extra="forbid")          # a typo such as `mac_address` must not be ignored silently
+
+    mac: str
+    # send from this interface / to this broadcast address (the QSFP subnet's broadcast to wake the
+    # other Spark over the direct link; 255.255.255.255 on the local LAN)
+    iface: Optional[str] = None
+    broadcast: str = "255.255.255.255"
+    port: int = Field(default=9, ge=1, le=65535)
+
+    @field_validator("mac")
+    @classmethod
+    def _mac(cls, v: str) -> str:
+        v = v.strip().lower().replace("-", ":")
+        if not _MAC_RE.match(v):
+            raise ValueError(f"not a MAC address: {v!r} (expected aa:bb:cc:dd:ee:ff)")
+        return v
+
+    @field_validator("iface")
+    @classmethod
+    def _iface(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _IFACE_RE.match(v):
+            raise ValueError(f"invalid interface name: {v!r}")
+        return v
+
+    @field_validator("broadcast")
+    @classmethod
+    def _bcast(cls, v: str) -> str:
+        try:
+            ipaddress.IPv4Address(v)
+        except ValueError as exc:
+            raise ValueError(f"broadcast must be an IPv4 address: {v!r}") from exc
+        return v
+
+
+class PlugRequest(BaseModel):
+    """One HTTP call that switches a smart plug / PDU outlet. Taken from the config file only —
+    never from an API caller — so it may point at a private address."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["GET", "POST", "PUT"] = "GET"
+    url: str
+    body: Optional[str] = Field(default=None, max_length=4096)
+    headers: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        parts = urlsplit(v)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("plug URL must be http:// or https:// with a host name")
+        return v
+
+    @field_validator("headers")
+    @classmethod
+    def _headers(cls, v: dict[str, str]) -> dict[str, str]:
+        for k, val in v.items():
+            if not _HEADER_RE.match(k) or "\n" in val or "\r" in val:
+                raise ValueError(f"invalid header {k!r}")
+        return v
+
+
+class PlugSettings(BaseModel):
+    """Out-of-band power for a node whose OS is hung or off. ``${secret:plug_token}`` in the URL,
+    body or a header is replaced from the vault (``sudo tsm remote plug-token``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    on: Optional[PlugRequest] = None
+    off: Optional[PlugRequest] = None
+    cycle: Optional[PlugRequest] = None     # a single call that cuts and restores power, if the plug can
+    settle_s: float = Field(default=8.0, ge=1, le=120)   # off -> on pause when there is no `cycle`
+
+    @model_validator(mode="before")
+    @classmethod
+    def _yaml_booleans(cls, data):
+        """YAML 1.1 reads an unquoted ``on:`` / ``off:`` key as the booleans True / False. That is exactly
+        what a person writes here, so accept it instead of silently dropping the plug's actions."""
+        if isinstance(data, dict) and (True in data or False in data):
+            data = {("on" if k is True else "off" if k is False else k): v for k, v in data.items()}
+        return data
 
 
 class NodeEndpoint(BaseModel):
@@ -39,6 +129,11 @@ class NodeEndpoint(BaseModel):
     ib_gid_index: Optional[int] = Field(default=None, ge=0, le=255)   # RoCE v2 IPv4 GID
     ssh_user: Optional[str] = None          # rsync target user for weight sync
     ssh_host: Optional[str] = None          # defaults to qsfp_ip
+    ssh_port: int = Field(default=22, ge=1, le=65535)    # only probed, to tell "agent down" from "host down"
+    # remote management (all optional; see docs/remote-management.md)
+    terminal_port: int = Field(default=9444, ge=1024, le=65535)   # tsm-termd on that node
+    wake: Optional[WakeSettings] = None
+    plug: Optional[PlugSettings] = None
 
     @field_validator("rdma_hcas")
     @classmethod
@@ -165,6 +260,18 @@ class NodeIdentity(BaseModel):
     hostname: str = ""
 
 
+class RemoteMgmtSettings(BaseModel):
+    """Where this node keeps remote-management state. What is *allowed* is decided by the
+    root-owned policy file, never by this (user-writable-by-root-only, but still) config."""
+
+    policy_path: str = "/etc/twinspark/remote-policy.json"
+    # False only for sandbox installs and tests, where nothing is owned by root
+    require_root_owned: bool = True
+    record_dir: str = "/var/lib/twinspark/terminal"      # terminal session recordings (0600)
+    terminal_port: int = Field(default=9444, ge=1024, le=65535)
+    shell: Optional[str] = None             # default: the service user's login shell
+
+
 class AgentConfig(BaseModel):
     node: NodeIdentity
     listener: Listener = Field(default_factory=lambda: Listener(bind="127.0.0.1", port=9443))
@@ -175,6 +282,7 @@ class AgentConfig(BaseModel):
     runtime_mode: Literal["docker", "dry-run"] = "dry-run"
     docker_bin: str = "docker"
     headless_mode: HeadlessMode = HeadlessMode.HEADLESS_SAFE
+    remote_mgmt: RemoteMgmtSettings = Field(default_factory=RemoteMgmtSettings)
 
 
 ControllerConfig.model_rebuild()

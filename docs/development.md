@@ -38,6 +38,11 @@ async with DemoCluster() as d:           # d.url, d.key, d.gateway_url, d.contro
     ...                                  # drive it with httpx or a headless browser
 ```
 
+`DemoCluster(remote={"terminal": True})` also starts the terminal services (`tsm demo --with-terminal`);
+that terminal is a real shell as your user, so it is off by default. Power, boot and Wake-on-LAN need the
+root helper and are not available in the demo; their tests use fake `systemctl` / `efibootmgr` / `ethtool`
+through the `privops.RUN` hook.
+
 `tests/test_demo_cluster.py` uses it for process-level checks (auth, agent token, GUI served,
 onboarding checklist, launch plans for every built-in recipe).
 
