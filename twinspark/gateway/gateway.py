@@ -171,6 +171,8 @@ class Gateway:
         )
 
     def resolve(self, model: Optional[str]) -> Optional[RouteState]:
+        if model is not None and not isinstance(model, str):
+            return None
         name = model or "default"
         if name in self.routes:
             return self.routes[name]
