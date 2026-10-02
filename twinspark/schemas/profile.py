@@ -242,6 +242,9 @@ class AdvancedSettings(BaseModel):
     chunked_prefill: Optional[bool] = None
     prefix_cache: bool = True
     max_num_seqs: Optional[int] = Field(default=None, ge=1)
+    # imported recipe that does not pass --max-num-seqs: keep vLLM's own default instead of
+    # inventing "--max-num-seqs 1" from the concurrency used for memory sizing
+    max_num_seqs_vllm_default: bool = False
     max_num_batched_tokens: Optional[int] = Field(default=None, ge=1)
     gpu_memory_utilization: Optional[float] = Field(default=None, gt=0, le=0.95)
     trust_remote_code: bool = False
@@ -314,9 +317,13 @@ class AdvancedSettings(BaseModel):
     @field_validator("env")
     @classmethod
     def _env_names(cls, v: dict[str, str]) -> dict[str, str]:
-        for k in v:
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+        for k, val in v.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
                 raise ValueError(f"invalid environment variable name: {k}")
+            if "${secret" in str(val).lower().replace(" ", ""):
+                # placeholders are resolved by the agent from its vault; a profile (or an imported
+                # recipe) must never be able to ask for one, or it could read any node secret
+                raise ValueError(f"{k}: secret references are not allowed in profile environment")
         return {k: str(val) for k, val in v.items()}
 
 

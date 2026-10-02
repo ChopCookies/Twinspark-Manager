@@ -17,7 +17,10 @@ router = APIRouter(prefix="/api/v1/system", tags=["system"], dependencies=[Depen
 
 
 @router.get("/telemetry")
-def telemetry(ctrl: Controller = Depends(controller_dep)):
+async def telemetry(refresh: bool = False, ctrl: Controller = Depends(controller_dep)):
+    """Per-node memory/GPU telemetry; ``refresh=true`` samples the nodes now."""
+    if refresh or not ctrl.telemetry:
+        await ctrl.metrics_tick(refresh_nodes=True)
     return {"nodes": ctrl.telemetry, "history": ctrl.telemetry_history,
             "interval_s": ctrl.config.metrics_interval_s}
 
@@ -133,7 +136,7 @@ def context_advisory(req: PlanRequest, ctrl: Controller = Depends(controller_dep
 
 @router.post("/quantization/variants")
 def quantization_variants(req: PlanRequest, ctrl: Controller = Depends(controller_dep)):
-    qa = QuantizationAdvisor(ctrl.planner, _spec(ctrl, req), req.topology)
+    qa = QuantizationAdvisor(ctrl.planner, _spec(ctrl, req), req.topology, base_quant=req.quantization)
     return [{**v.__dict__, "quant": v.quant.value, "status": v.status.value}
             for v in qa.variants(req.context_length, req.concurrency)]
 

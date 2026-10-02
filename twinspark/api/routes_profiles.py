@@ -149,7 +149,10 @@ async def pin(name: str, req: PinRequest, ctrl: Controller = Depends(controller_
 
 @router.get("/{name}/compare")
 def compare(name: str, a: str, b: str, ctrl: Controller = Depends(controller_dep)):
-    return _profile(ctrl, name).diff(a, b)
+    result = _profile(ctrl, name).diff(a, b)
+    if isinstance(result, dict) and result.get("error"):
+        raise HTTPException(404, str(result["error"]))
+    return result
 
 
 @router.post("/{name}/duplicate", response_model=Profile, status_code=201)

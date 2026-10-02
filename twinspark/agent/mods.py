@@ -14,6 +14,7 @@ every node, so both Sparks always run byte-identical patches (checked via
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import io
 import os
@@ -22,14 +23,20 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-MOD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MOD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 MAX_ARCHIVE = 64 * 1024 ** 2
 MAX_EXTRACTED = 512 * 1024 ** 2
 MAX_FILES = 20000
+MAX_MODS = 64
+MAX_ZIP_DIRECTORY = 8 * 1024 ** 2           # bytes of zip central directory (20k entries need ~1-2 MiB)
+STALE_AFTER_S = 3600
+_swap_lock = threading.Lock()
 
 
 class ModError(ValueError):
@@ -44,7 +51,8 @@ def tree_hash(root: Path) -> str:
         if p.is_symlink():
             h.update(f"L {rel} -> {os.readlink(p)}\n".encode())
         elif p.is_file():
-            fh = hashlib.sha256(p.read_bytes()).hexdigest()
+            with p.open("rb") as f:                     # streamed: a huge file must not be read into memory
+                fh = hashlib.file_digest(f, "sha256").hexdigest()
             x = "x" if os.access(p, os.X_OK) else "-"
             h.update(f"F {rel} {x} {fh}\n".encode())
     return "sha256:" + h.hexdigest()
@@ -92,6 +100,10 @@ def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, 
         raise ModError(f"mod archive larger than {MAX_ARCHIVE // 1024**2} MiB")
     root = Path(mods_dir)
     root.mkdir(parents=True, exist_ok=True)
+    _sweep_stale(root)
+    if not (root / name).is_dir() and sum(1 for d in root.iterdir() if d.is_dir()
+                                           and not d.name.startswith(".")) >= MAX_MODS:
+        raise ModError(f"at most {MAX_MODS} mods can be installed; remove one first")
     tmp = Path(tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=root))
     try:
         _extract(raw, tmp)
@@ -102,23 +114,62 @@ def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, 
                 mode = 0o755 if (p.suffix == ".sh" or os.access(p, os.X_OK)) else 0o644
                 p.chmod(mode)
         final = root / name
-        trash = None
-        if final.exists():
-            trash = root / f".trash-{name}-{os.getpid()}"
-            final.rename(trash)
-        tmp.rename(final)
-        if trash:
-            shutil.rmtree(trash, ignore_errors=True)
+        with _swap_lock:
+            if final.exists():
+                # Atomic exchange: readers (preflight, container start) never see the mod missing.
+                if _exchange(tmp, final):
+                    pass                                  # tmp now holds the old version; cleaned below
+                else:
+                    trash = root / f".trash-{name}-{os.getpid()}"
+                    final.rename(trash)
+                    tmp.rename(final)
+                    tmp = trash
+            else:
+                tmp.rename(final)
+                tmp = None
         return {"name": name, "hash": tree_hash(final),
                 "files": sum(1 for p in final.rglob("*") if p.is_file())}
     finally:
-        if tmp.exists():
+        if tmp is not None and tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _exchange(a: Path, b: Path) -> bool:
+    """renameat2(RENAME_EXCHANGE): swap two directories atomically (Linux). False if unsupported."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.renameat2(-100, os.fsencode(a), -100, os.fsencode(b), 2) == 0   # AT_FDCWD, EXCHANGE
+    except (OSError, AttributeError):
+        return False
+
+
+def _sweep_stale(root: Path) -> None:
+    """Remove temp/trash directories left behind by an install that was interrupted."""
+    now = time.time()
+    for d in root.glob(".*"):
+        if d.is_dir() and d.name.startswith((".tmp-", ".trash-")):
+            try:
+                if now - d.stat().st_mtime > STALE_AFTER_S:
+                    shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
+
+
+def _zip_limits(raw: bytes) -> None:
+    """Refuse oversized zip directories *before* zipfile builds one object per entry."""
+    i = raw.rfind(b"PK\x05\x06", max(0, len(raw) - 65557))
+    if i < 0 or len(raw) < i + 22:
+        raise ModError("mod archive is not a valid zip")
+    entries = int.from_bytes(raw[i + 10:i + 12], "little")
+    directory = int.from_bytes(raw[i + 12:i + 16], "little")
+    if entries > MAX_FILES or directory > MAX_ZIP_DIRECTORY:
+        raise ModError("too many files in mod archive")
 
 
 def _extract(raw: bytes, dest: Path) -> None:
     total = 0
     if raw[:4] == b"PK\x03\x04":
+        _zip_limits(raw)
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             infos = [i for i in zf.infolist()]
             if len(infos) > MAX_FILES:
@@ -149,9 +200,11 @@ def _extract(raw: bytes, dest: Path) -> None:
     except tarfile.TarError as exc:
         raise ModError("mod archive must be a zip or a tar(.gz)") from exc
     with tf:
-        members = tf.getmembers()
-        if len(members) > MAX_FILES:
-            raise ModError("too many files in mod archive")
+        members = []
+        for m in tf:                          # stop at the limit instead of listing a million entries
+            members.append(m)
+            if len(members) > MAX_FILES:
+                raise ModError("too many files in mod archive")
         strip = _strip_prefix([m.name for m in members])
         for m in members:
             rel = _rel(m.name, strip)

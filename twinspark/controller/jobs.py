@@ -183,8 +183,10 @@ class ActivationCoordinator:
         for n in nodes:
             facts[n] = await self.agent(n).call("hardware_facts", timeout=30)
             hcas = self.config.nodes[n].rdma_hcas if multi else []
+            need_disk = (0 if facts[n].get("runtime_mode") == "dry-run"
+                         else await self._disk_needed_gib(n, rev))
             pre = await self.agent(n).call("preflight", allow_owned_port=True,
-                                           need_disk_gib=job.payload.get("need_disk_gib", 0),
+                                           need_disk_gib=need_disk,
                                            mods=sorted({m for c in self.plan.containers
                                                         if c.node == n for m in c.mods}),
                                            need_rdma=multi, hcas=hcas)
@@ -224,6 +226,23 @@ class ActivationCoordinator:
         if warnings:
             msg += " — " + " | ".join(warnings)
         return msg + (" [DRY-RUN]" if self.dry_run else "")
+
+    async def _disk_needed_gib(self, node: str, rev: ProfileRevision) -> int:
+        """Free space the weights still to be fetched onto ``node`` will need (0 if all present or
+        the size is unknown), so a nearly full disk is reported before anything is stopped."""
+        need = 0.0
+        for repo, sha, include, nodes in self._models(rev):
+            if node not in nodes:
+                continue
+            spec = self.model_specs.get(repo) or (None if rev.draft.secondary else self.model_spec)
+            weight_bytes = getattr(spec, "weight_bytes", None) if spec else None
+            if not weight_bytes:
+                continue
+            present = (await self.agent(node).call("weights_present", repo=repo, revision=sha,
+                                                   include=include or []))["present"]
+            if not present:
+                need += weight_bytes / 1024 ** 3
+        return int(need * 1.05) + 2 if need else 0
 
     async def _download(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         """Make sure every node of the plan has the weights (download + QSFP copy)."""
@@ -271,12 +290,23 @@ class ActivationCoordinator:
 
     async def _stop(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         stopped = []
+        skipped = []
         for n in sorted(self.agents):
-            res = await self.agent(n).call("containers_stop_owned", timeout=180)
+            try:
+                res = await self.agent(n).call("containers_stop_owned", timeout=180)
+            except AgentActionError:
+                if n in self.plan.nodes:
+                    raise                      # the target needs this node: a real failure
+                # An unrelated node being down (rebooting, unplugged) must not take down a model
+                # that runs only on the other one.
+                log.warning("node %s is unreachable and not part of the plan; skipping its stop", n)
+                skipped.append(n)
+                continue
             stopped += res["stopped"]
         for a in self.drained:
             self.gateway.clear_route(a)
-        return f"stopped {len(stopped)} TwinSpark container(s)" + (f": {stopped}" if stopped else "")
+        return (f"stopped {len(stopped)} TwinSpark container(s)" + (f": {stopped}" if stopped else "")
+                + (f" (node {', '.join(skipped)} unreachable, not part of this deployment)" if skipped else ""))
 
     async def _reclaim(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         """Unified memory is released asynchronously after a container exits: drop the
@@ -410,9 +440,17 @@ class ActivationCoordinator:
                 r = await client.post(f"{url}/v1/completions", headers=headers, json={
                     "model": model, "prompt": "Hello", "max_tokens": 8,
                     "temperature": 0})
-                if r.status_code != 200:
+                if r.status_code in (400, 404, 405, 422) and "ompletions" in r.text:
+                    # Pooling / embedding / rerank models answer "does not support Completions
+                    # API": the server is up and has the model, which is what this stage proves.
+                    listed = await client.get(f"{url}/v1/models", headers=headers)
+                    if listed.status_code != 200 or model not in listed.text:
+                        raise RuntimeError(f"smoke test on {url}: model {model!r} is not listed by /v1/models")
+                    out.append("model listed (no text completions)")
+                elif r.status_code != 200:
                     raise RuntimeError(f"smoke test on {url} returned {r.status_code}: {r.text[:300]}")
-                out.append(f"{(time.perf_counter() - t0) * 1000:.0f} ms")
+                else:
+                    out.append(f"{(time.perf_counter() - t0) * 1000:.0f} ms")
                 try:
                     m = (await client.get(f"{url}/v1/models", headers=headers)).json()
                     entry = next((item for item in m["data"] if item.get("id") == model), {})
@@ -431,7 +469,15 @@ class ActivationCoordinator:
             self.gateway.set_route(alias, backends, model, rev.revision_id,
                                    max_model_len=(job.payload.get("models") or {}).get(model, {}).get(
                                        "max_model_len", job.payload.get("max_model_len")))
-        self.drained = [a for a in self.drained if a not in self.plan.routes]
+        # Aliases the previous deployment had but this one does not use: reopen them (so they do
+        # not stay "switching" forever) and forget idle ones, so clients get a clean 404.
+        stale = [a for a in self.drained if a not in self.plan.routes]
+        for a in stale:
+            self.gateway.cancel_drain(a)
+            st = self.gateway.routes.get(a)
+            if st is not None and not st.backends and st.inflight == 0:
+                self.gateway.routes.pop(a, None)
+        self.drained = []
         return "routing " + ", ".join(self.plan.routes)
 
     async def _healthy(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:

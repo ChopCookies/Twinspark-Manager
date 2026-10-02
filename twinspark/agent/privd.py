@@ -11,6 +11,8 @@ Operations
 * ``boot_target``     — ``systemctl set-default multi-user.target|graphical.target``
 * ``display_manager`` — ``systemctl stop|start display-manager`` (headless *now*)
 * ``swappiness``      — ``vm.swappiness`` 0..100 (GB10 recipes use 0)
+* ``remote_*``        — journal/kernel log reads, UEFI BootNext, scheduled reboot/poweroff, Wake-on-LAN
+  setting (see :mod:`twinspark.remote.privops`; changing ops need the root-owned remote policy)
 
 Run with ``tsm serve privd`` from a root systemd unit
 (``deploy/systemd/twinspark-privd.service``). The socket is ``0660
@@ -29,6 +31,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
+from ..remote.privops import REMOTE_PRIV_OPS
 from . import maintenance
 
 log = logging.getLogger("twinspark.privd")
@@ -112,6 +115,7 @@ PRIV_OPS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "boot_target": op_boot_target,
     "display_manager": op_display_manager,
     "swappiness": op_swappiness,
+    **REMOTE_PRIV_OPS,
 }
 
 
@@ -178,9 +182,15 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
             writer.close()
 
 
-async def privd_serve(socket_path: str = PRIV_SOCKET, group: str = "twinspark") -> None:
+async def privd_serve(socket_path: str = PRIV_SOCKET, group: str = "twinspark",
+                      remote_policy: str | None = None, require_root_policy: bool = True) -> None:
     """Serve the Unix socket loop. Root only."""
     import grp
+
+    from ..remote import policy as remote_policy_mod
+    if remote_policy:
+        remote_policy_mod.PRIVD_POLICY.path = Path(remote_policy)
+    remote_policy_mod.PRIVD_POLICY.require_root = require_root_policy
 
     if os.geteuid() != 0:
         raise SystemExit("tsm-privd must run as root")

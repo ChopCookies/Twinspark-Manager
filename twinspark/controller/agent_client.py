@@ -18,6 +18,8 @@ ALLOWED_AGENT_ACTIONS = {
     "ssh_check", "task_status", "task_cancel", "tasks_list",
     "link_test", "rdma_facts", "reclaim_memory", "headless_status", "headless_apply",
     "mods_list", "mods_status", "mods_install", "mods_remove",
+    "remote_status", "remote_logs", "remote_bundle", "remote_power", "remote_power_cancel",
+    "remote_boot_status", "remote_boot_next", "remote_boot_next_clear", "remote_wol_status", "remote_wol_set",
 }
 
 
@@ -39,7 +41,7 @@ class AgentClient:
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url, verify=verify, timeout=httpx.Timeout(60, connect=5))
 
-    async def call(self, action: str, timeout: float = 60, **params: Any) -> Any:
+    async def call(self, action: str, /, timeout: float = 60, **params: Any) -> Any:
         if action not in ALLOWED_AGENT_ACTIONS:
             raise AgentActionError(action, self.node, "action not allowlisted")
         try:

@@ -1,10 +1,10 @@
 [Unit]
-Description=TwinSpark privileged helper (drop page cache, headless switch)
+Description=TwinSpark privileged helper (drop page cache, headless mode, node power)
 After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/opt/twinspark/venv/bin/tsm serve privd --socket /run/twinspark/privd.sock --group twinspark
+ExecStart=/opt/twinspark/venv/bin/tsm serve privd --socket /run/twinspark/privd.sock --group twinspark --remote-policy /etc/twinspark/remote-policy.json
 Restart=on-failure
 User=root
 NoNewPrivileges=true

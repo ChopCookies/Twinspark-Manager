@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import asdict, dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from ..schemas.enums import DistributedBackend, Quantization, Topology
 
@@ -126,6 +126,9 @@ class MemoryPlanner:
     def __init__(self, calibration_db: Optional[dict] = None):
         # {(repo, quant, topology): [observed totals GiB, ...]}
         self.calibration_db = calibration_db or {}
+        # Returns the real MemTotal the nodes report (~121.7 GiB on GB10, not a nominal 128), so
+        # the advisory endpoints agree with the check an activation applies. Set by the controller.
+        self.mem_total_provider: Optional[Callable[[], Optional[float]]] = None
 
     def estimate(
         self,
@@ -173,6 +176,8 @@ class MemoryPlanner:
         else:
             backend_gib, nccl_gib = 0.3, 0.5
 
+        if mem_total_gib is None and self.mem_total_provider is not None:
+            mem_total_gib = self.mem_total_provider()
         b = self.reserve_budget(node_id, headless, mem_total_gib, headless_system_usage_gib)
         return NodeBudget(
             node_id=node_id,
@@ -240,26 +245,48 @@ class MemoryPlanner:
 _MOE_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
 
+def _cfg_int(cfg: dict, key: str, default: int = 0, hi: int = 10 ** 9) -> int:
+    """One integer field of a (user supplied or downloaded) config.json, validated."""
+    v = cfg.get(key)
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+        raise ValueError(f"hf_config.{key} must be a number")
+    if v < 0 or v > hi:
+        raise ValueError(f"hf_config.{key} is out of range")
+    return int(v)
+
+
 def make_spec_from_hf(config: dict, weight_bytes: Optional[int] = None) -> ModelSpec:
     """Build a ModelSpec from a HF ``config.json`` (+ safetensors index total_size).
 
     ``num_params`` is not part of config.json; pass ``weight_bytes`` from
     ``model.safetensors.index.json -> metadata.total_size`` whenever possible.
+    Malformed input raises ``ValueError`` (never ``TypeError``/``OverflowError``).
     """
+    if not isinstance(config, dict):
+        raise ValueError("hf_config must be an object")
     cfg = config.get("text_config", config)   # multimodal wrappers nest the LM config
-    hidden = int(cfg.get("hidden_size", 0))
-    heads = int(cfg.get("num_attention_heads", 1)) or 1
-    layers = int(cfg.get("num_hidden_layers", 0))
-    head_dim = int(cfg.get("head_dim") or (hidden // heads if hidden else 0))
-    kv_heads = int(cfg.get("num_key_value_heads") or heads)
-    experts = next((int(cfg[k]) for k in _MOE_KEYS if cfg.get(k)), 0)
-    num_params = int(config.get("num_params") or config.get("_num_params") or 0)
+    if not isinstance(cfg, dict):
+        raise ValueError("hf_config.text_config must be an object")
+    if weight_bytes is not None:
+        if (isinstance(weight_bytes, bool) or not isinstance(weight_bytes, (int, float))
+                or weight_bytes != weight_bytes or not 0 <= weight_bytes <= 10 ** 15):
+            raise ValueError("weight_bytes must be a number between 0 and 1e15")
+        weight_bytes = int(weight_bytes)
+    hidden = _cfg_int(cfg, "hidden_size")
+    heads = _cfg_int(cfg, "num_attention_heads", 1) or 1
+    layers = _cfg_int(cfg, "num_hidden_layers")
+    head_dim = _cfg_int(cfg, "head_dim") or (hidden // heads if hidden else 0)
+    kv_heads = _cfg_int(cfg, "num_key_value_heads") or heads
+    experts = next((_cfg_int(cfg, k) for k in _MOE_KEYS if cfg.get(k)), 0)
+    num_params = _cfg_int(config, "num_params", hi=10 ** 13) or _cfg_int(config, "_num_params", hi=10 ** 13)
     if not num_params and not weight_bytes:
         raise ValueError("need num_params or weight_bytes (safetensors index) to size weights")
     return ModelSpec(
         num_params=num_params, layers=layers, num_kv_heads=kv_heads, head_dim=head_dim,
         weight_bytes=weight_bytes, is_moe=experts > 0, num_experts=experts,
-        num_attention_heads=int(cfg.get("num_attention_heads") or 0),
-        kv_lora_rank=int(cfg.get("kv_lora_rank") or 0),
-        qk_rope_head_dim=int(cfg.get("qk_rope_head_dim") or 0),
+        num_attention_heads=_cfg_int(cfg, "num_attention_heads"),
+        kv_lora_rank=_cfg_int(cfg, "kv_lora_rank"),
+        qk_rope_head_dim=_cfg_int(cfg, "qk_rope_head_dim"),
     )

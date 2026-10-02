@@ -9,9 +9,12 @@ from __future__ import annotations
 import re
 import time
 from typing import Any, Optional
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from ..netguard import UnsafeURL
+from ..netguard import check_public_url as _check_public_url
 from . import raw_url
 
 _SOURCE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+):([A-Za-z0-9_./-]*?)(?:@([A-Za-z0-9_./-]+))?$")
@@ -72,26 +75,49 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
     return out
 
 
+MAX_REDIRECTS = 3
+
+
+def check_public_url(url: str, resolve: bool = True) -> str:
+    try:
+        return _check_public_url(url, resolve)
+    except UnsafeURL as exc:
+        raise RemoteError(str(exc).replace("URLs", "recipe URLs", 1)) from exc
+
+
 def fetch_text(url: str, client: Optional[httpx.Client] = None) -> str:
     url = raw_url(url)
-    if not url.startswith("https://"):
-        raise RemoteError("only https:// recipe URLs are accepted")
-    c = _client(client)
+    own = client is None
+    # a caller-supplied client is a test seam: skip DNS there, keep every other rule
+    check_public_url(url, resolve=own)
+    c = client or httpx.Client(timeout=httpx.Timeout(15, connect=5), follow_redirects=False,
+                               headers={"user-agent": "twinspark-manager"})
+    buf = bytearray()
     try:
-        with c.stream("GET", url) as r:
-            if r.status_code != 200:
-                raise RemoteError(f"{url} returned HTTP {r.status_code}")
-            buf = bytearray()
-            for chunk in r.iter_bytes():
-                buf += chunk
-                if len(buf) > MAX_RECIPE_BYTES:
-                    raise RemoteError("recipe file larger than 512 KiB")
+        for _hop in range(MAX_REDIRECTS + 1):
+            with c.stream("GET", url) as r:
+                if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+                    url = check_public_url(urljoin(url, r.headers["location"]), resolve=own)
+                    continue
+                if r.status_code != 200:
+                    raise RemoteError(f"{_host(url)} returned HTTP {r.status_code}")
+                for chunk in r.iter_bytes():
+                    buf += chunk
+                    if len(buf) > MAX_RECIPE_BYTES:
+                        raise RemoteError("recipe file larger than 512 KiB")
+                break
+        else:
+            raise RemoteError("too many redirects")
     except httpx.HTTPError as exc:
-        raise RemoteError(f"cannot fetch {url} ({type(exc).__name__})") from exc
+        raise RemoteError(f"cannot fetch from {_host(url)} ({type(exc).__name__})") from exc
     finally:
-        if client is None:
+        if own:
             c.close()
     try:
         return bytes(buf).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RemoteError("recipe file is not UTF-8 text") from exc
+
+
+def _host(url: str) -> str:
+    return urlsplit(url).hostname or "host"

@@ -24,9 +24,10 @@ async def prepare(ctrl, name: str, revision: str = "latest") -> Job:
     job = Job(job_id=f"prepare-{secrets.token_hex(5)}", kind="prepare",
               profile_revision=rev.revision_id,
               payload={"profile": name, "revision": rev.label})
+    ctrl.store.save_job(job)              # before the lock: a failing save must not leave it held
     await ctrl._lock.acquire()
     ctrl.current_job = job.job_id
-    ctrl.store.save_job(job)
+    ctrl.busy_profile = name
 
     async def run():
         step = None
@@ -60,6 +61,7 @@ async def prepare(ctrl, name: str, revision: str = "latest") -> Job:
             ctrl._persist(job)
             ctrl._cancel.discard(job.job_id)
             ctrl.current_job = None
+            ctrl.busy_profile = None
             ctrl._lock.release()
             ctrl._audit("user", "profile.prepare", f"profile/{name}",
                         {"revision": rev.revision_id, "state": job.state.value})

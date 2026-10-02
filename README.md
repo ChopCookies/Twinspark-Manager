@@ -1,183 +1,227 @@
-# TwinSpark Manager — Alpha 0.4
+# TwinSpark Manager
 
-> **0.4.1** — see [CHANGELOG.md](CHANGELOG.md). Quick start on the GX10 pair:
-> `tsm doctor` → `tsm rdma` (paste the suggested `rdma_hcas`/`ib_gid_index` into controller.yaml)
-> → `tsm foreign ls` (stop hand-started vLLM) → `tsm mods import-eugr ~/spark-vllm-docker`
-> → `tsm cookbook import deepseek-v4-flash-0731-b12x` → `tsm pin …` → `tsm plan …` → `tsm activate …`.
-> Install `deploy/systemd/twinspark-privd.service` on both nodes for page-cache drop and headless mode.
+One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA DGX Spark
+(GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
+and keep the machines headless.
 
+> **Status: alpha (0.4.1).** The control path is covered by automated tests, and real Docker
+> activation, chat, streaming and shutdown passed on DGX Spark with a 135M model (single node
+> and two-node PP2) on 2026-09-28 — see [small-model development](SMALL-MODEL-DEVELOPMENT.md).
+> Large-model activation and other topologies still need on-site validation, which is why a
+> new install starts in **dry-run** (nothing is run on your machines) until you say otherwise.
 
-Headless-first vLLM manager for one or two NVIDIA DGX Spark systems.
+---
 
-**Status: alpha.** The control path is covered by automated tests. Real Docker
-activation, chat, streaming, and shutdown passed on DGX Spark with a 135M model
-in single-node and two-node PP2 configurations on 2026-09-28. See
-[small-model development](SMALL-MODEL-DEVELOPMENT.md) for results and reproduction.
-Large-model activation and other topologies still need hardware validation.
-
-The original working DeepSeek V4 Flash 0731 setup is backed up separately;
-its [two-node startup commands](DEEPSEEK-TWO-NODE-STARTUP.md) restore the original launcher.
-
-## What works
-
-- **Glassmorphic web GUI** (`twinspark/web`, served at the management API `/`):
-  frosted-glass SPA with Dashboard, Models, Planner, Cookbook, Resolve,
-  Diagnostics and Jobs views. Build it from `src/` with `scripts/build_web.py`.
-- Profiles with immutable revisions (model commit sha + image digest pinned), diff, duplicate, pin, known-good tracking
-- Launch planner: exact per-node `docker run … vllm serve …` for `single-a`, `single-b`, `replicated`, `tp2`, `pp2`, `tp-ep`; native multi-node (`--nnodes/--node-rank/--headless`) or Ray
-- `gpu_memory_utilization` derived from the unified-memory reserve (vLLM's 0.9 default is never used blindly)
-- Activation pipeline with live progress, preflight (foreign process on the vLLM port, disk, writable caches), weight download + rsync A→B over QSFP, drain → stop → reclaim → start → health → smoke test → route
-- Failure handling: before the stop stage the old model keeps serving; after it, partial containers are removed and the previous known-good deployment is restored automatically
-- Stable OpenAI gateway: aliases, real SSE streaming, 503 + `Retry-After` while switching, in-flight draining, round-robin for `replicated`
-- Controller restart adopts running containers instead of restarting them; autostart after reboot
-- Agents only ever touch containers labelled `org.twinspark.owned=true` — a hand-started vLLM is never stopped by the manager
-- **Cookbook import** — the four `OPTIMAL-PROFILES.md` researched configs shipped as
-  recipes (`tsm cookbook list` / import via CLI or GUI); creates a real profile.
-- **Identity resolution** (`tsm resolve` / GUI) — `org/model@branch` → pinned commit
-  sha + `config.json` + safetensors total_size, and `image:tag` → `@sha256:` digest
-  via the Docker Registry API. Pure outbound HTTP; never touches the local vLLM.
-- **NCCL / QSFP link test** (`tsm link` / Diagnostics) — echo responder + burst
-  initiator across the 200G link. Dry-run returns simulated figures; real numbers
-  need docker mode.
-- **vLLM `/metrics` scraping** (`tsm metrics` / Diagnostics) — read-only Prometheus
-  scrape of the routed backend for KV-cache %, tokens, TTFT and latency.
-- **Headless-mode apply** (`tsm headless desktop|headless-safe|headless-max`) —
-  GDM/thermal/power profile transition per node (dry-run now, privd-mediated in docker mode).
-- `tsm` CLI: `init`, `serve`, `plan`, `activate` (live progress), `status`, `stop`,
-  `jobs`, `logs`, `cookbook`, `resolve`, `link`, `metrics`, `headless`
-
-## Not in this alpha
-
-mTLS between nodes (bearer token
-over the direct QSFP link for now), and web GUI OAuth / multi-user (single
-management API key). One-click pinning is available in the Profiles view.
-
-## Install (both nodes)
+## Try it first — no Spark needed (1 minute)
 
 ```bash
-sudo useradd -r -m -G docker twinspark
-sudo python3 -m venv /opt/twinspark/venv
-sudo /opt/twinspark/venv/bin/pip install ".[hf]"
-sudo mkdir -p /etc/twinspark /var/lib/twinspark /var/cache/twinspark
-sudo chown -R twinspark: /var/lib/twinspark /var/cache/twinspark
+git clone https://github.com/ChopCookies/Twinspark-Manager && cd Twinspark-Manager
+python3.12 -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/tsm demo
 ```
 
-Node A:
-```bash
-sudo -u twinspark tsm init --secrets-dir /etc/twinspark/secrets --show   # prints keys once
-sudo cp deploy/controller.example.yaml /etc/twinspark/controller.yaml    # edit IPs/ifaces
-sudo cp deploy/agent-a.example.yaml   /etc/twinspark/agent.yaml
-```
-Node B:
-```bash
-sudo -u twinspark tsm init --role agent --secrets-dir /etc/twinspark/secrets \
-     --agent-token <from A> --backend-api-key <from A>
-sudo cp deploy/agent-b.example.yaml /etc/twinspark/agent.yaml
-```
-Both: `sudo cp deploy/systemd/*.service /etc/systemd/system/` and enable
-`twinspark-agent` (both) and `twinspark-controller` (A only).
+`tsm demo` starts two simulated Sparks, the controller, the gateway and the web GUI on this
+machine (real HTTP between them, containers simulated) and prints the URL and key. Click
+through the Cookbook, pin a recipe, press *Plan*. Ctrl-C removes everything.
 
-Weight sync needs SSH keys from `twinspark@A` to `nodes.B.ssh_user@B` over the QSFP IP.
+## Install on your two Sparks (about 10 minutes)
 
-## Using it
+You need: both Sparks cabled QSFP-to-QSFP, Docker (ships with DGX OS), Python 3.12+ (Ubuntu 24.04
+has it), and a user with `sudo`. Setup never changes your network configuration.
+
+**1. Node A** (the machine that will host the controller and the OpenAI endpoint):
 
 ```bash
-ssh -L 8443:localhost:8443 spark-a          # or use the Tailscale IP
-export TSM_API=http://127.0.0.1:8443 TSM_KEY=<management_api_key>
-curl -X POST -H "x-api-key: $TSM_KEY" -H 'content-type: application/json' \
-     $TSM_API/api/v1/profiles -d @examples/qwen-tp2.json
-tsm plan qwen-flash-tp2            # exact commands, nothing is started
-tsm activate qwen-flash-tp2        # live stage-by-stage progress
-tsm status
+git clone https://github.com/ChopCookies/Twinspark-Manager && cd Twinspark-Manager
+sudo ./install.sh
 ```
-Clients: `http://spark-a:8000/v1`, model `default`, key = `inference_api_key`.
 
-**Web GUI:** open `http://127.0.0.1:8443/` (same-origin with the management API)
-and enter the management API key. Import a researched model from the **Cookbook**
-tab, pin its model commit and image digest in **Profiles**, sanity-check memory
-in **Planner**, then activate the pinned profile.
+The installer puts the program in `/opt/twinspark`, then starts the guided `tsm setup`. It
+detects almost everything and only asks what it cannot know:
 
-Community recipes can be previewed before import. Invalid parallel sizes,
-unsupported distributed backends, and memory utilization outside `(0, 0.95]`
-are rejected with a validation message. Correct the recipe or its template
-overrides and preview again; these settings are never silently replaced.
+| Step | What it does for you |
+|---|---|
+| QSFP link | finds the cabled interface, its address and RoCE devices; prints a netplan snippet if the link has no address yet |
+| Who / where | reuses your existing Hugging Face cache (`~/.cache/huggingface`) and runs as your user, so your docker group and SSH setup just work |
+| Reach the GUI | `localhost` + SSH tunnel by default; offers your Tailscale address if it sees one |
+| Ports | moves to a free port if `8000` / `8100` are taken by a hand-started vLLM |
+| Safety | starts in **dry-run**: containers are simulated until `tsm go-live` |
 
-## Phase 0 — first contact with real hardware
+It then writes the configs, creates the secrets and a dedicated SSH key for weight sync,
+installs the systemd units and prints the exact line to run on node B.
 
-1. Install with `runtime_mode: dry-run` on both agents, `vllm_port: 8100`, and put the
-   gateway on a free port if your current vLLM already uses 8000.
-2. `tsm plan …` and compare with the command line you run by hand today. Check every
-   flag against the image you pin (`--nnodes/--node-rank/--headless`,
-   `--default-chat-template-kwargs`, `--attention-backend`, `VLLM_API_KEY`).
-3. `tsm activate …` in dry-run — the preflight must pass on both nodes.
-4. Maintenance window: stop the hand-started vLLM, set `runtime_mode: docker`, restart
-   the agents, activate a small `single-a` profile first, then `tp2`.
-5. Register real model specs (`PUT /api/v1/system/model-specs` with `config.json` and the
-   safetensors `total_size`) so the memory fit check runs before every switch.
-
-## Tests
+**2. Node B** — paste the line node A printed (it carries the shared secrets, treat it like a password):
 
 ```bash
-pip install -e ".[dev]" && pytest
+git clone https://github.com/ChopCookies/Twinspark-Manager && cd Twinspark-Manager
+sudo ./install.sh --join tsm1.…
 ```
 
-For local development on Windows (PowerShell):
+Lost the line? `sudo tsm join-code` on node A prints it again.
 
-```powershell
-python -m venv .venv
-.venv/Scripts/python.exe -m pip install -e ".[dev]"
-.venv/Scripts/python.exe -m pytest -q -rs
-```
+**3. Open the GUI.** From your laptop: `ssh -L 8443:localhost:8443 you@node-a`, browse to
+<http://localhost:8443/> and paste the management key (`tsm init --show` prints it again).
+The **Get started** page checks both nodes and shows the next step with the exact command.
 
-The dry-run agents support local Windows testing. Four HF-cache tests require
-symbolic-link permissions and skip when Windows denies them; one executable-bit
-test requires a POSIX filesystem. Run the full suite on Linux before deployment.
-Real Docker/RDMA/headless operation still targets Linux on the Sparks.
-
-To build an installable wheel including the cookbook and web UI:
+**4. Run a model.**
 
 ```bash
-python -m pip wheel --no-deps . --wheel-dir dist
+tsm cookbook list                      # built-in dual-Spark recipes
+tsm cookbook import deepseek-v4-flash-0731-b12x
+tsm pin deepseek-v4-flash-0731-b12x    # freezes the model commit + image digest
+tsm plan  deepseek-v4-flash-0731-b12x  # the exact docker/vllm commands for A and B, nothing started
+tsm activate deepseek-v4-flash-0731-b12x
 ```
 
-## Web client development
+Clients use `http://node-a:8000/v1`, model `default`, with the `inference_api_key`
+(`tsm init --show`).
 
-**System status** compares both nodes' CPU, GPU, shared memory, GPU sensor power,
-and network traffic. **Updates** offers an opt-in coordinated install/reboot run:
-B before A, with health checks, restart recovery, and restoration of the active
-pinned revision. Root-owned node policies default to disabled, and firmware has
-its own opt-in. See [monitoring and maintenance setup](docs/maintenance.md) for
-configuration, measurement limits, and recovery instructions.
-
-Profiles and built-in recipes support search and filters that persist while
-navigating. Recipe imports review the settings before saving; name conflicts
-remain in the dialog so you can correct them without starting over.
-
-Import recipes by URL, pasted text, or a local YAML/JSON file. **Pin & prepare**
-resolves an immutable revision, checks images and patches, and stages weights
-without switching the current deployment. The completed job can switch to that
-exact prepared revision.
-
-**Combine two recipes** creates a split profile: A and B each run an independent
-model, image and settings, with separate API model names. TP2, PP2 and TP + expert
-parallel still distribute one model across both nodes. See the
-[recipe and split-model guide](docs/recipe-workflow.md) for CLI commands, limits
-and the on-site test checklist. The 0.4.1 changes have been tested locally with
-simulated agents; validation on the Sparks remains pending.
+**5. Go live.** While in dry-run, `activate` walks the whole pipeline with simulated
+containers, so you can compare `tsm plan` with the command you run by hand today. When it
+matches, stop any hand-started vLLM (`tsm foreign ls`) and on **each** node run:
 
 ```bash
-python scripts/build_web.py
-python scripts/preview_web.py
+sudo tsm go-live        # runtime_mode: docker + restarts the agent;  `--revert` goes back
 ```
 
-Open `http://127.0.0.1:18744/` for a local preview seeded with the six built-in
-recipes. Its database is in memory and no Spark agents are connected; changes
-disappear when the process stops. The preview serves the built `web/dist` assets,
-so rebuild and refresh after editing `web/src`. Run client regression checks with:
+Start with a small `single-a` profile, then your large model. `tsm doctor` checks everything
+a fast, stable dual-Spark setup needs (driver parity, RDMA, headless, privd, SSH, disk).
+
+### Unattended / scripted
 
 ```bash
-node --test tests/web_client.test.cjs
+sudo ./install.sh --yes --qsfp-iface enp1s0f1np1 --qsfp-ip 192.168.100.1 --runtime-mode dry-run
+sudo tsm setup --dry          # show what would be written, change nothing
+sudo tsm setup --root /tmp/stage --yes --no-start      # build a complete install in a scratch directory
 ```
 
-Add `--demo-nodes` to the preview command for labeled sample telemetry and a fully
-simulated two-node maintenance workflow.
+`tsm setup --help` lists every flag. Re-running setup is safe: existing config files are kept
+(`--force` regenerates them and keeps a `.bak-…` copy), secrets and keys are never rotated.
+
+---
+
+## What you get
+
+- **Web GUI** (served by the controller): Get started, Dashboard, System status, Updates,
+  Profiles, Cookbook, Model files, Mods, Planner, Diagnostics, **Remote**, Jobs, Logs.
+- **Recipes → profiles.** Built-in researched configs and community recipes (eugr/spark-vllm-docker
+  format) by URL, paste or file; immutable revisions (model commit + image digest); diff, duplicate,
+  known-good tracking; *Pin & prepare* stages weights without touching the model that is serving.
+- **Topologies:** `single-a`, `single-b`, `replicated`, `tp2`, `pp2`, `tp-ep`, plus **split**
+  profiles (a different model on each node). Native multi-node vLLM or Ray.
+- **Safe switching:** preflight → download / rsync A→B over QSFP → drain → stop → reclaim memory →
+  start → health → smoke test → route. Before the stop stage the old model keeps serving; after it,
+  a failure restores the previous known-good deployment.
+- **Stable gateway:** aliases, real SSE streaming, `503 + Retry-After` while switching, in-flight draining,
+  round-robin across replicas.
+- **Memory aware:** `gpu_memory_utilization` is derived from the unified-memory reserve; page cache is
+  dropped before launch (via the root helper); headless modes free the desktop's memory.
+- **Operations:** system status (CPU / GPU / shm / network per node), opt-in coordinated OS/driver
+  updates (B before A) with checkpoints, watchdog with auto-recovery, audit log.
+- **Hands-off boot:** the controller adopts running containers after a restart and resumes the last
+  healthy model after a reboot.
+- **Remote management for headless nodes** (opt-in, per node): a recorded browser/CLI terminal, node
+  logs and a redacted support bundle, reboot / power-off with typed confirmation, boot-once from
+  network or USB, Wake-on-LAN, smart-plug power-cycling and a "why can't I reach it?" triage. See
+  [docs/remote-management.md](docs/remote-management.md).
+
+## How it fits together
+
+```
+ your laptop ──ssh -L 8443──┐                       clients ──► :8000 (OpenAI API, needs inference key)
+                            ▼                                       │
+   ┌──────────────────── node A ───────────────────────┐   QSFP    ┌──────── node B ────────┐
+   │ controller + gateway ─► agent A ─► docker (vLLM)  │◄═════════►│ agent B ─► docker (vLLM)│
+   │ web GUI / API (:8443)    │                        │ 200 Gb/s  │   │                     │
+   │ SQLite state, vault      └─► tsm-privd (root)     │ NCCL/RoCE │   └─► tsm-privd (root)  │
+   └───────────────────────────────────────────────────┘ + rsync   └─────────────────────────┘
+```
+
+- The **agent** only ever performs a fixed list of typed actions (start/stop *its own* labelled
+  containers, download, verify, sync, telemetry…). There is no generic "run this command" action,
+  and a hand-started vLLM is never touched.
+- **`tsm-privd`** is a tiny root helper over a Unix socket with an allowlist (drop page cache,
+  headless switch, maintenance).
+- Secrets live in an encrypted vault; configs contain none.
+
+| Port | Where | Purpose |
+|---|---|---|
+| 8443 | A, `127.0.0.1` | web GUI + management API (needs the management key) |
+| 8000 | A, all interfaces | OpenAI-compatible gateway (needs the inference key) |
+| 9443 | A `127.0.0.1`, B QSFP address only | agent (bearer token) |
+| 8100 | each node | internal vLLM port (must not collide with a hand-started vLLM) |
+
+| File | Purpose |
+|---|---|
+| `/etc/twinspark/controller.yaml`, `agent.yaml` | configuration (safe to edit; comments explain) |
+| `/etc/twinspark/secrets/` | encrypted vault (keys, tokens) |
+| `/var/lib/twinspark/` | state database, mods, sync key |
+| `/etc/systemd/system/twinspark-{privd,agent,controller}.service` | services |
+
+## Everyday commands
+
+```bash
+tsm status                     # active model, routes, memory, live serving metrics
+tsm doctor                     # full health check with a fix for every finding
+tsm models ls                  # model files on both nodes;  tsm models rm org/repo
+tsm logs                       # container logs of the active deployment on both nodes
+tsm headless headless-max --now    # stop the desktop session, free its memory
+tsm link --mode rdma           # QSFP / NCCL link test
+tsm rdma --apply               # write discovered RoCE devices into controller.yaml
+tsm stop                       # drain and stop the active model
+```
+
+Everything in the GUI is the same API the CLI uses; `tsm --help` lists all commands.
+
+### When a node misbehaves (headless)
+
+```bash
+tsm remote reach B             # agent / SSH / terminal probes → what to do next
+tsm remote logs B --source previous-boot     # what happened before the last reboot
+tsm remote bundle B            # one redacted tar.gz for a bug report
+sudo tsm remote enable terminal      # on a node: switch on a recorded shell (off by default)
+tsm remote terminal B          # open it (or use the Remote page)
+sudo tsm node doctor           # on a node, with or without the controller
+```
+
+Power control, Wake-on-LAN, smart plugs and network boot are covered in
+[docs/remote-management.md](docs/remote-management.md). Everything that changes a node is off until you
+switch it on, on that node.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `cannot reach the controller` | `systemctl status twinspark-controller`; from a laptop you need the SSH tunnel (`ssh -L 8443:localhost:8443 …`) |
+| GUI says *invalid management key* | `tsm init --show` on node A prints it |
+| Node B "unreachable" on Get started | `journalctl -u twinspark-agent` on B. `401` = token mismatch: re-run `sudo tsm join-code` on A and `sudo tsm setup --join …` on B. Otherwise check B's QSFP address (`ip -br addr`) |
+| `rdma_hcas is empty` / NCCL falls back to TCP | `sudo tsm rdma --apply && sudo systemctl restart twinspark-controller` |
+| `permission denied … docker.sock` | the service user needs the docker group: `sudo usermod -aG docker <user>` and restart the agent |
+| `port 8000 / 8100 already in use` | a hand-started vLLM is running: `tsm foreign ls` / `tsm foreign stop`, or let setup pick other ports |
+| Weight sync fails | `tsm doctor` shows the SSH check; node B must accept node A's sync key (setup installs it from the join code) |
+| `sudo: a terminal is required` over Tailscale SSH | start the session with `ssh -t`, or use `tmux`; setup itself only needs one `sudo` |
+| Activation fails and the old model comes back | by design — read the job (`tsm job <id>`), then `tsm logs` |
+| A node stopped answering | `tsm remote reach B` says which case it is; the checklist is in [docs/remote-management.md](docs/remote-management.md) |
+
+## Updating and removing
+
+```bash
+cd Twinspark-Manager && git pull && sudo ./install.sh --no-setup && sudo systemctl restart twinspark-agent twinspark-controller
+sudo ./install.sh --uninstall            # stop services, remove the program; config, models and state stay
+sudo ./install.sh --uninstall --purge    # …and delete /etc/twinspark and /var/lib/twinspark
+```
+
+Update both nodes (the Get started page warns when versions differ).
+
+## More documentation
+
+- [Recipe and split-model workflow](docs/recipe-workflow.md)
+- [Monitoring and coordinated maintenance](docs/maintenance.md)
+- [Remote management: terminal, logs, power, Wake-on-LAN, network boot](docs/remote-management.md)
+- [Development, testing and the demo harness](docs/development.md)
+- [Security model and known limits](docs/security.md)
+- [Changelog](CHANGELOG.md) · [Review notes](REVIEW.md) · [Researched profiles](OPTIMAL-PROFILES.md)
+- [Two-node DeepSeek startup commands](DEEPSEEK-TWO-NODE-STARTUP.md) · [Small-model validation](SMALL-MODEL-DEVELOPMENT.md)
+
+**Not in this alpha:** mTLS between nodes (bearer token over the direct QSFP link for now),
+web OAuth / multi-user (single management key).

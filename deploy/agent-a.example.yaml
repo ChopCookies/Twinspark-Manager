@@ -1,3 +1,4 @@
+# Reference only — `sudo tsm setup` writes this file for you (and keeps it up to date).
 # /etc/twinspark/agent.yaml — Node A
 node: {node_id: A, role: agent}
 listener: {bind: 127.0.0.1, port: 9443}      # controller runs on the same box
@@ -7,3 +8,8 @@ runtime:
   vllm_port: 8100
   hf_cache_dir: /var/lib/twinspark/hf-cache
   compile_cache_dir: /var/cache/twinspark/compile
+# Remote management (optional). What is ALLOWED is decided by /etc/twinspark/remote-policy.json,
+# not by this file: `sudo tsm remote enable terminal reboot` / `sudo tsm remote policy`.
+# remote_mgmt:
+#   terminal_port: 9444
+#   record_dir: /var/lib/twinspark/terminal      # terminal session recordings (asciicast, 0600)

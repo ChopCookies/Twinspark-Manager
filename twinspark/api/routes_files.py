@@ -19,6 +19,15 @@ router = APIRouter(prefix="/api/v1", tags=["files"], dependencies=[Depends(requi
 _MAX_MOD_B64 = 90 * 1024 * 1024          # ~64 MiB archive after base64
 
 
+def _raise_if_all_failed(result: dict) -> dict:
+    """A request that failed on every node is an error, not a 200 with errors inside."""
+    per_node = result.get("results") if isinstance(result, dict) else None
+    if per_node and all(isinstance(r, dict) and r.get("error") for r in per_node.values()):
+        first = next(iter(per_node.values()))["error"]
+        raise HTTPException(422, f"failed on every node: {first}")
+    return result
+
+
 def _nodes(ctrl: Controller, nodes: Optional[list[str]]) -> list[str]:
     out = nodes or sorted(ctrl.agents)
     bad = [n for n in out if n not in ctrl.agents]
@@ -66,8 +75,8 @@ class DeleteRequest(BaseModel):
 async def delete_files(req: DeleteRequest, ctrl: Controller = Depends(controller_dep)):
     nodes = _nodes(ctrl, req.nodes)
     try:
-        return await ctrl.delete_model_files(req.repo, req.revision, nodes,
-                                             force=req.force, preview=req.preview)
+        return _raise_if_all_failed(await ctrl.delete_model_files(
+            req.repo, req.revision, nodes, force=req.force, preview=req.preview))
     except DependencyError as e:
         raise HTTPException(409, {"message": str(e), "dependents": e.dependents})
     except FilesError as e:
@@ -101,7 +110,8 @@ class ModInstall(BaseModel):
 async def install_mod(req: ModInstall, ctrl: Controller = Depends(controller_dep)):
     """Install (or replace) a mod on every node — identical content everywhere."""
     try:
-        return await ctrl.install_mod(req.name, req.archive_b64, _nodes(ctrl, req.nodes))
+        return _raise_if_all_failed(
+            await ctrl.install_mod(req.name, req.archive_b64, _nodes(ctrl, req.nodes)))
     except FilesError as e:
         raise HTTPException(409, str(e))
 
@@ -109,6 +119,6 @@ async def install_mod(req: ModInstall, ctrl: Controller = Depends(controller_dep
 @router.delete("/mods/{name}")
 async def remove_mod(name: str, ctrl: Controller = Depends(controller_dep)):
     try:
-        return await ctrl.remove_mod(name)
+        return _raise_if_all_failed(await ctrl.remove_mod(name))
     except FilesError as e:
         raise HTTPException(409, str(e))

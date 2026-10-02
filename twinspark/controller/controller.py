@@ -52,6 +52,7 @@ class Controller:
         self.gateway = gateway
         self.store = store or Store(config.db_path)
         self.planner = MemoryPlanner()
+        self.planner.mem_total_provider = self._mem_total
         self.agents: dict[str, AgentClient] = dict(agents or {})
         self.poll_interval = poll_interval
         self.hf_token = hf_token
@@ -61,11 +62,14 @@ class Controller:
         self._cancel: set[str] = set()
         self._staging: dict[tuple[str, str], asyncio.Future] = {}
         self.current_job: Optional[str] = None
+        self.busy_profile: Optional[str] = None      # profile named by the running activation/prepare
         self.sampler = MetricsSampler()
         self.telemetry: dict[str, dict] = {}
         self.telemetry_history: dict[str, list] = {}
         from .maintenance import Maintenance
+        from .remote import RemoteService
         self.maintenance = Maintenance(self)
+        self.remote = RemoteService(self)
         self.watch_state: dict[str, Any] = {"unhealthy_streak": 0, "recoveries": [], "last": None}
         self._audit("system", "controller.init", "controller", {})
 
@@ -100,6 +104,9 @@ class Controller:
         active = self.active()
         if active and active.get("profile") == name:
             raise BusyError("profile is currently active — stop it first")
+        if self._lock.locked() and self.busy_profile == name:
+            # the activation would finish and mark a profile that no longer exists as active
+            raise BusyError("profile is being activated or prepared right now — wait for the job")
         ok = self.store.delete_profile(name)
         if ok:
             self._audit("user", "profile.delete", f"profile/{name}", {})
@@ -232,6 +239,8 @@ class Controller:
         if p is None:
             raise ValueError(f"unknown profile: {name}")
         rev = p.get_revision(ref) if ref else None
+        if ref and rev is None:
+            raise ValueError(f"revision not found: {name}@{ref}")
         d = rev.draft if rev else p.working_draft()
         if d is None:
             raise ValueError("profile has no draft")
@@ -383,6 +392,7 @@ class Controller:
         self.store.save_job(job)
         await self._lock.acquire()           # taken now so a second request gets 409
         self.current_job = job.job_id
+        self.busy_profile = profile_name
         self._spawn(self._run_activation(job, rev))
         self._audit("controller" if (_rollback_of or _recovery) else "user", "profile.activate",
                     f"profile/{profile_name}", {"revision": rev.revision_id, "job": job.job_id,
@@ -478,6 +488,7 @@ class Controller:
             self.store.save_job(job)
             self._cancel.discard(job.job_id)
             self.current_job = None
+            self.busy_profile = None
             self._lock.release()
         if rollback_target:
             try:
@@ -485,13 +496,16 @@ class Controller:
             except Exception:  # noqa: BLE001
                 log.exception("automatic rollback could not start")
 
-    async def _stop_everything(self, aliases: list[str]) -> list[str]:
+    async def _stop_everything(self, aliases: list[str],
+                               failed_nodes: Optional[list[str]] = None) -> list[str]:
         stopped: list[str] = []
         for n, client in self.agents.items():
             try:
                 stopped += (await client.call("containers_stop_owned", timeout=180))["stopped"]
             except Exception:  # noqa: BLE001
                 log.exception("stop on node %s failed", n)
+                if failed_nodes is not None:
+                    failed_nodes.append(n)
         for a in set(aliases) | set(self.gateway.routes):
             self.gateway.clear_route(a)
             self.gateway.cancel_drain(a)
@@ -512,12 +526,24 @@ class Controller:
                 for alias in aliases:
                     self.gateway.cancel_drain(alias)
                 raise RuntimeError("requests did not drain within the timeout; maintenance has not stopped the model")
-            stopped = await self._stop_everything(aliases)
+            failed_nodes: list[str] = []
+            stopped = await self._stop_everything(aliases, failed_nodes)
             self.store.kv_set("active", None)
-            job.finish_step(step, f"stopped {stopped}")
-            job.state = JobState.COMPLETED
+            if failed_nodes:
+                # Be honest: containers on an unreachable node may still be running (and holding
+                # its GPU memory). The reachable nodes are stopped and the route is closed.
+                msg = (f"stopped {stopped}, but node(s) {', '.join(sorted(failed_nodes))} could not be "
+                       f"reached — containers there may still be running; check with `tsm doctor` "
+                       f"once the node is back")
+                job.fail_step(step, msg)
+                job.state = JobState.FAILED
+                job.error = msg
+            else:
+                job.finish_step(step, f"stopped {stopped}")
+                job.state = JobState.COMPLETED
             self.store.save_job(job)
-            self._audit("user", "deployment.stop", "cluster", {"stopped": stopped})
+            self._audit("user", "deployment.stop", "cluster",
+                        {"stopped": stopped, "unreachable": sorted(failed_nodes)})
             return job
 
     # ---- boot / power-cut recovery (spec §36) --------------------------------------
@@ -533,6 +559,7 @@ class Controller:
         active = self.active()
         if not active:
             return None
+        await self._wait_for_agents(self.config.startup_wait_s)
         if await self._adopt_running(active):
             return None
         if not self.config.autostart:
@@ -542,6 +569,25 @@ class Controller:
         except Exception:  # noqa: BLE001
             log.exception("autostart of %s failed", active)
             return None
+
+    async def _wait_for_agents(self, timeout_s: float) -> list[str]:
+        """After a power cut both Sparks boot at once; the other node's agent may come up a minute
+        after this controller. Wait (bounded) so autostart sees the real state of both nodes.
+        Returns the nodes that are still unreachable when the wait ends."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            down = []
+            for n, a in self.agents.items():
+                try:
+                    await a.call("hardware_facts", timeout=8)
+                except Exception:  # noqa: BLE001 - not up yet is the expected case here
+                    down.append(n)
+            if not down or time.monotonic() >= deadline:
+                if down:
+                    log.warning("starting without node(s) %s: they did not answer within %ss",
+                                ", ".join(sorted(down)), timeout_s)
+                return down
+            await asyncio.sleep(min(3.0, max(0.05, self.poll_interval)))
 
     async def _adopt_running(self, active: dict) -> bool:
         """Controller restarted but the containers kept running: re-attach routes
@@ -594,19 +640,30 @@ class Controller:
         plan = self.launch_plan(rev)
         problem = None
         unhealthy = False
+        unreachable = False
+        bad: list = []                         # containers behind the problem (decides which routes go down)
         for c in plan.containers:
             try:
                 r = await self.agents[c.node].call("health_probe", name=c.name, url=c.health_url)
             except AgentActionError as exc:
                 problem = f"node {c.node} unreachable: {exc.detail}"
+                unreachable = True
+                bad = [x for x in plan.containers if x.node == c.node]
                 break
             if r.get("exited"):
                 oom = " (OOM-killed)" if r.get("oom_killed") else ""
                 problem = f"container {c.name} on node {c.node} exited with code {r.get('exit_code')}{oom}"
                 self.store.kv_set("last_incident_log", (r.get("log_tail") or "")[-4000:])
+                bad = [c]
                 break
             if not r.get("healthy"):
                 unhealthy = True
+                bad.append(c)
+        # A probe can take seconds; an operator may have stopped or switched the model meanwhile.
+        # Never "recover" something that was deliberately stopped.
+        current = self.active_revision()
+        if self.busy() or current is None or current.revision_id != rev.revision_id:
+            return None
         if problem is None and unhealthy:
             self.watch_state["unhealthy_streak"] += 1
             if self.watch_state["unhealthy_streak"] >= 3:
@@ -617,18 +674,37 @@ class Controller:
                 for alias in plan.routes:
                     self.gateway.mark_up(alias)
             self.watch_state["unhealthy_streak"] = 0
+            self.watch_state.pop("waiting_on", None)
             return None
         if problem is None:
             return None
-        for alias in plan.routes:
-            self.gateway.mark_down(alias, problem)
+        # In a split deployment only the routes served by the failing container go down; a worker
+        # container (no API of its own) or an unknown cause takes every route of the revision.
+        urls = {c.health_url for c in bad}
+        scoped = bool(bad) and None not in urls
+        for alias, backends in plan.routes.items():
+            if not scoped or urls & set(backends):
+                self.gateway.mark_down(alias, problem)
         incident = {"at": time.time(), "profile": rev.profile_name, "revision": rev.revision_id,
                     "problem": problem, "action": "none"}
         wd = self.config.watchdog
         now = time.time()
         recent = [t for t in self.watch_state["recoveries"] if now - t < 3600]
         self.watch_state["recoveries"] = recent
-        if wd.auto_recover and len(recent) < wd.max_recoveries_per_hour:
+        if not unreachable:
+            self.watch_state.pop("waiting_on", None)
+        if unreachable and wd.auto_recover:
+            # Restarting cannot succeed while a node of the deployment is away, and every failed
+            # attempt would burn the hourly budget. The route stays marked down; the first tick
+            # after the node is back sees the real state and recovers with the full budget.
+            incident["action"] = "waiting for the node to come back (no restart attempted)"
+            waiting_on = tuple(sorted({c.node for c in bad}))
+            if self.watch_state.get("waiting_on") == waiting_on:
+                # same outage as the previous tick: refresh the incident, keep the audit log quiet
+                self.store.kv_set("last_incident", incident)
+                return problem
+            self.watch_state["waiting_on"] = waiting_on
+        elif wd.auto_recover and len(recent) < wd.max_recoveries_per_hour:
             self.watch_state["recoveries"].append(now)
             try:
                 job = await self.activate(rev.profile_name, rev.revision_id, _recovery=True)

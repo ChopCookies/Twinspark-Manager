@@ -29,7 +29,7 @@ import re
 import shlex
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..schemas.config import ControllerConfig
 from ..schemas.enums import DistributedBackend, Topology
@@ -60,10 +60,23 @@ def immutable_image_ref(ref: str) -> bool:
     return bool(_DIGEST_REF_RE.fullmatch(ref) or _LOCAL_IMAGE_RE.fullmatch(ref))
 
 
+_MOUNT_PATH_RE = re.compile(r"/[A-Za-z0-9._/+@-]{1,500}")
+
+
 class Mount(BaseModel):
     host: str
     container: str
     read_only: bool = False
+
+    @field_validator("host", "container")
+    @classmethod
+    def _plain_absolute_path(cls, v: str) -> str:
+        # `docker run -v` splits on ':' — a colon (or comma, space, newline...) inside a path
+        # would make docker mount something other than the path that was validated.
+        if not _MOUNT_PATH_RE.fullmatch(v):
+            raise ValueError(f"mount path must be absolute and use only letters, digits and "
+                             f"'._/+@-': {v!r}")
+        return v
 
 
 class ContainerSpec(BaseModel):
@@ -121,12 +134,19 @@ class LaunchError(ValueError):
 
 
 # ----------------------------------------------------------------------------
-def docker_run_argv(spec: ContainerSpec, docker_bin: str = "docker", redact: bool = False) -> list[str]:
-    """Build the ``docker run`` argv. Shared by the planner (display) and the agent (exec)."""
+def docker_run_argv(spec: ContainerSpec, docker_bin: str = "docker", redact: bool = False,
+                    env_file: Optional[str] = None) -> list[str]:
+    """Build the ``docker run`` argv. Shared by the planner (display) and the agent (exec).
+
+    ``env_file``: variables that carry secrets are passed through a private file instead of
+    ``-e`` so they never appear in a process listing (``/proc/<pid>/cmdline``).
+    ``--pull never``: the image must already be on the node (pulling is a separate, policy
+    controlled step), so a start can never fetch and run an unreviewed image.
+    """
     if not immutable_image_ref(spec.image_ref):
         raise LaunchError(f"image must be pinned by digest: {spec.image_ref}")
     argv = [
-        docker_bin, "run", "-d", "--name", spec.name,
+        docker_bin, "run", "-d", "--pull", "never", "--name", spec.name,
         "--gpus", "all", "--network", "host", "--ipc", "host",
         "--ulimit", "memlock=-1", "--ulimit", "stack=67108864",
         "--ulimit", f"nofile={spec.nofile_limit}:{spec.nofile_limit}",
@@ -142,6 +162,8 @@ def docker_run_argv(spec: ContainerSpec, docker_bin: str = "docker", redact: boo
         argv.append(f"--entrypoint={spec.entrypoint}")
     for k, v in sorted(spec.labels.items()):
         argv += ["--label", f"{k}={v}"]
+    if env_file:
+        argv += ["--env-file", env_file]
     for k, v in sorted(spec.env.items()):
         shown = "***" if redact and _is_secret_env(k) else v
         argv += ["-e", f"{k}={shown}"]
@@ -459,7 +481,8 @@ class LaunchPlanner:
 
         put("max-model-len", s.context_length)
         _flag(argv, "gpu-memory-utilization", str(util))
-        put("max-num-seqs", a.max_num_seqs or s.concurrency)
+        if a.max_num_seqs or not a.max_num_seqs_vllm_default:
+            put("max-num-seqs", a.max_num_seqs or s.concurrency)
         put("max-num-batched-tokens", a.max_num_batched_tokens)
         put("dtype", a.dtype)
         put("kv-cache-dtype", a.kv_dtype)

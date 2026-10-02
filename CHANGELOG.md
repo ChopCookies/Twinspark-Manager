@@ -1,5 +1,95 @@
 # Changelog
 
+## Unreleased — quick start, error testing, remote management
+
+### Setup and first run (milestone 1)
+
+- `install.sh` + `tsm setup`: one command per node. Detects the QSFP interface, RoCE devices and GID
+  index, an existing Hugging Face cache, docker access, the Tailscale address and taken ports; writes
+  validated `controller.yaml` / `agent.yaml`, the secret vault, a dedicated SSH sync key and systemd units.
+  Starts in dry-run. `--yes` for unattended installs, `--dry` to preview, `--root DIR` for a sandbox.
+- Node B joins with a single pasted **join code** (`tsm setup --join …`, `tsm join-code` prints it again):
+  shared secrets, addresses and node A's sync key (authorised only from node A's QSFP address).
+- `tsm go-live [--revert]`, `tsm rdma --apply`, `tsm --version`.
+- **Get started** page + `GET /api/v1/system/onboarding`: live checklist with the exact next command.
+- `tsm demo` / `twinspark.demo.DemoCluster`: the whole stack (two agents, controller, gateway, GUI) on
+  loopback for trying the product and for process-level tests.
+- New `runtime.ssh_key` / `runtime.ssh_known_hosts` settings; generated systemd units keep the model
+  cache and sync key writable under `ProtectSystem=strict` (the previous example unit could not write
+  `known_hosts`, which breaks weight sync when the agent runs under systemd).
+- README rewritten around the quick start; development notes moved to `docs/development.md`.
+
+### Error testing and hardening (milestone 2)
+
+Everything below was found by exercising the stack on loopback (`DemoCluster`, dry-run runtime),
+fuzzing the API and driving the GUI at desktop and phone widths — nothing was tried on the live
+Sparks. Each fix has a regression test (`tests/test_hardening_*.py`, 296 tests in total).
+
+**Security**
+- Management and agent tokens are compared byte-wise in constant time, so a non-ASCII header can no
+  longer cause a 500; authentication runs before the request body is read; failed logins have their own
+  rate bucket and cannot lock the operator out of the GUI.
+- `/docs`, `/redoc` and `/openapi.json` are disabled on the controller and agent; validation errors are
+  sanitised (no echoed input, no secrets in 422 bodies).
+- Secret references (`${secret:slot}`) are only honoured for the documented slot → variable pairs
+  (`backend_api_key` → `VLLM_API_KEY`, `hf_token` → `HF_TOKEN`). A profile, recipe or mod cannot read the vault.
+- Container mounts must match a strict path pattern and are mapped on the agent, not trusted from the
+  controller. Containers start with `--pull never`; secrets reach them through a 0600 `--env-file`,
+  not on the command line.
+- Outbound fetches (recipes, cookbook sources) are limited to public `https://` hosts without credentials
+  (`twinspark/netguard.py`); redirects are re-checked.
+- Mod archives are bounded (64 MiB archive, 512 MiB extracted, 20 000 files, 64 mods), reject links and path
+  escapes, and are swapped in atomically (`RENAME_EXCHANGE`) so a failed install never leaves half a mod.
+- Vault writes are atomic (temp file + fsync + replace); join codes and the sync public key are validated
+  before anything is written to `authorized_keys`.
+
+**Reliability**
+- The watchdog no longer burns its hourly recovery budget while a node is unreachable; it waits, logs
+  once and recovers with the full budget when the node returns. It also stands down when a switch or
+  prepare starts mid-probe.
+- After a reboot the controller waits (up to `startup_wait_s`, default 180 s) for the other node's agent
+  instead of failing recovery because it started a few seconds earlier. The wait runs in the background,
+  so the GUI is available immediately.
+- Maintenance retries a lost reboot request instead of waiting forever.
+- Stopping a deployment whose node was removed from the plan is logged and skipped rather than raised.
+- A profile that is being activated cannot be deleted; failed model-file deletes are reported, not
+  swallowed; per-node failures (mods, files) surface as errors in the GUI.
+
+**GUI**
+- No horizontal page scroll at phone width (profile Overview, tag chips, grids), a Copy button that no
+  longer covers the command, scrollable tab strips with a visible edge, higher-contrast secondary text.
+- Unknown profiles/jobs/routes show a "Not found" page with ways back instead of a dead end; a hand-typed
+  `%` in the URL no longer breaks routing.
+
+### Remote management for headless nodes (milestone 3)
+
+Full guide: [docs/remote-management.md](docs/remote-management.md). Everything that changes a node is
+**off until switched on, on that node**, in a root-owned `/etc/twinspark/remote-policy.json` that fails
+closed (`sudo tsm remote enable|disable|policy`, or `tsm setup --remote …`).
+
+- **Terminal**: opt-in `twinspark-terminal` service (PTY over WebSocket, separate from the sandboxed
+  agent), in the **Remote** page (xterm.js, vendored; touch keys for phones) and as `tsm remote terminal B`
+  (raw TTY, Ctrl-] . to leave). One-time 30 s tickets, Origin check, idle/total limits, at most 2 sessions
+  per node, every session recorded as asciicast and audited.
+- **Diagnostics without a shell**: `tsm remote reach` (agent / SSH / terminal probes and a verdict:
+  ok, agent_error, agent_down, link_down, host_down, each with next steps), `tsm remote logs` (agent,
+  kernel, previous boot, docker, …), `tsm remote bundle` (redacted support archive, size- and time-bounded).
+- **Power**: reboot / power-off scheduled a few seconds ahead through `twinspark-privd`, typed
+  confirmation (`REBOOT B`, `POWEROFF B`), cancel, refused while the cluster is busy unless forced.
+- **Out-of-band**: boot-once from network / USB via UEFI BootNext (`tsm remote boot`), Wake-on-LAN
+  (node setting and `nodes.<id>.wake` magic packet), HTTP smart plug (`nodes.<id>.plug`, token in the vault as
+  `${secret:plug_token}`, typed `CUT POWER B`).
+- **When the controller is down**: `sudo tsm node status|doctor|logs|bundle|reboot|poweroff|cancel|boot|wol`
+  work on the node alone; `tsm wake MAC` and `tsm netboot plan|serve` (short-lived proxyDHCP/TFTP rescue
+  helper locked to one MAC) are standalone.
+- `tsm demo --with-terminal`, `DemoCluster(remote={...})`; the setup wizard asks which features to enable.
+- Controller→node traffic uses typed actions only (allowlist; no generic exec); the remote endpoints stay
+  reachable during a maintenance run so a node can still be inspected.
+- 518 tests in total (222 new, covering the policy, root helper, terminal relay, controller, CLI and docs
+  examples); the Remote page was also checked in a real browser at desktop and phone width.
+- **Not verified on the hardware**: Wake-on-LAN, BootNext and network boot depend on DGX Spark firmware;
+  the guide says how to test each once while the machine is still reachable.
+
 ## 0.4.1 — 2026-10-01
 
 - Prepare pinned recipes in a background job without stopping the active model:

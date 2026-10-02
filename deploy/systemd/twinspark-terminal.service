@@ -1,0 +1,16 @@
+[Unit]
+Description=TwinSpark terminal (opt-in browser/CLI shell on this node, recorded)
+After=network-online.target twinspark-agent.service
+Wants=network-online.target
+
+[Service]
+User=twinspark
+ExecStart=/opt/twinspark/venv/bin/tsm serve termd --config /etc/twinspark/agent.yaml
+Restart=on-failure
+RestartSec=3
+# stopping the unit ends every shell it started
+KillMode=control-group
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

@@ -13,8 +13,10 @@ user confirmed the exact container name (migration from a manual launcher).
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -98,8 +100,25 @@ class DockerRuntime:
         self._run([self.docker, "pull", image_ref], timeout=3600)
 
     def start(self, spec: ContainerSpec, env_overrides: dict[str, str]) -> str:
-        real = spec.model_copy(update={"env": {**spec.env, **env_overrides}})
-        return self._run(docker_run_argv(real, self.docker)).strip()
+        if not env_overrides:
+            return self._run(docker_run_argv(spec, self.docker)).strip()
+        # Secret values go through a 0600 file on tmpfs, not `-e K=V` (visible in /proc/*/cmdline).
+        plain = spec.model_copy(update={"env": {k: v for k, v in spec.env.items()
+                                                if k not in env_overrides}})
+        for k, v in env_overrides.items():
+            if "\n" in v or "\r" in v or "\0" in v:
+                raise RuntimeError_(f"value for {k} cannot be passed through an env file")
+        tmpdir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        fd, path = tempfile.mkstemp(prefix="tsm-env-", dir=tmpdir)       # mode 0600
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write("".join(f"{k}={v}\n" for k, v in env_overrides.items()))
+            return self._run(docker_run_argv(plain, self.docker, env_file=path)).strip()
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def list_owned(self) -> list[ContainerStatus]:
         out = self._run([self.docker, "ps", "-a", "--filter", f"label={OWNER_LABEL}=true",

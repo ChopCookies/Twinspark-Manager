@@ -25,6 +25,12 @@ test("maintenance failure offers recovery and escapes node errors", () => {
   assert.match(result, /&lt;unsafe text&gt;/);
 });
 
+test("a hand-typed percent sign in the address bar cannot break routing", () => {
+  const c = client();
+  assert.equal(c.run("safeDecode('%E0%A4%A')"), "%E0%A4%A");
+  assert.equal(c.run("safeDecode('my%20profile')"), "my profile");
+});
+
 function client() {
   const elements = new Map(), events = new Map(), storage = new Map();
   const element = id => {
@@ -37,7 +43,9 @@ function client() {
     window: { addEventListener: (name, fn) => events.set(name, fn) },
     document: { addEventListener() {}, querySelector: element },
   });
-  vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js/app.js"), "utf8"), context);
+  for (const file of ["app.js", "start.js", "remote.js"]) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js", file), "utf8"), context, { filename: file });
+  }
   return { context, element, events, storage, run: code => vm.runInContext(code, context) };
 }
 
@@ -180,4 +188,108 @@ test("pasting text alongside a URL requires choosing the intended source", () =>
   c.element("#paste-text").value = "command: vllm serve org/model";
   c.element("#paste-url").value = "https://example.com/recipe.yaml";
   assert.throws(() => c.run("pasteBody()"), /either a recipe URL or pasted text/);
+});
+
+test("get-started checklist highlights the next step, escapes node errors and shows commands", () => {
+  const c = client();
+  const html = c.run(`startHtml(${JSON.stringify({
+    done: 1, total: 3, complete: false, next: "link", dry_run: true,
+    steps: [
+      { id: "nodes", title: "Both Sparks are connected", status: "done", detail: "A and B reachable", required: true, fix: null },
+      { id: "link", title: "QSFP link", status: "todo", detail: "<img src=x onerror=alert(1)>", required: true,
+        fix: { command: "sudo tsm rdma --apply", href: "#/diagnostics/link", label: "Run a link test" } },
+      { id: "live", title: "Real containers", status: "todo", detail: "dry-run on A", required: false, fix: null },
+      { id: "recipe", title: "Import a recipe", status: "todo", detail: "later", required: true, fix: null },
+    ],
+  })})`);
+  assert.match(html, /1 of 3 required steps done/);
+  assert.match(html, /Dry-run mode/);
+  assert.match(html, /sudo tsm rdma --apply/);
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(html, /&lt;img src=x/);
+  assert.equal((html.match(/class="card start-step [a-z]+ accent"/g) || []).length, 1);   // exactly one highlighted step
+  assert.match(html, />suggested</);                                                        // optional todo is not "next"
+  assert.match(html, />later</);
+});
+
+test("navigation lists Get started first and routes to it", () => {
+  const c = client();
+  assert.equal(c.run("NAV[0][0]"), "start");
+  assert.ok(c.run("ROUTES[0][0].test('/start')"));
+});
+
+// ---- Remote page -------------------------------------------------------------------------------
+const NODE_B = {
+  node: "B", reachable: true, hostname: "gx10-cba3-node2", uptime_s: 93784, kernel: "6.11.0-nvidia", version: "0.4.1",
+  privd: true, terminal_service: true, wake_configured: true, plug_configured: true, mac: "aa:bb:cc:dd:ee:ff",
+  plug_actions: ["off", "on"], power_pending: [],
+  policy: { terminal: true, reboot: false, poweroff: false, boot_next: false, wol: false, error: null },
+  interfaces: [{ name: "enP7s7", mac: "aa:bb:cc:00:00:01", wol: "d", wol_supported: "pumbg" }],
+};
+const OV = { controller_node: "A", active: "qwen3", nodes: { A: { ...NODE_B, node: "A" }, B: NODE_B } };
+
+test("remote page lists the switches and tells the operator the exact command to turn one on", () => {
+  const c = client();
+  const html = c.run(`remoteStatusHtml(${JSON.stringify(NODE_B)}, ${JSON.stringify(OV)})`);
+  assert.match(html, /Node B/);
+  assert.match(html, /online/);
+  assert.match(html, /sudo tsm remote enable reboot/);
+  assert.match(html, /sudo tsm remote enable boot-next/);
+  assert.doesNotMatch(html, /sudo tsm remote enable terminal/, "the terminal is already on");
+  assert.match(c.run(`remoteStatusHtml(${JSON.stringify({ ...NODE_B, node: "A" })}, ${JSON.stringify(OV)})`), /runs the controller/);
+});
+
+test("remote page escapes everything that comes from a node", () => {
+  const c = client();
+  const evil = { ...NODE_B, hostname: "<img src=x onerror=alert(1)>", kernel: "<b>k</b>", policy: { ...NODE_B.policy, error: "<script>x</script>" } };
+  const html = c.run(`remoteStatusHtml(${JSON.stringify(evil)}, ${JSON.stringify(OV)})`);
+  assert.doesNotMatch(html, /<img src=x|<script>|<b>k<\/b>/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  const down = c.run(`remoteStatusHtml(${JSON.stringify({ node: "B", reachable: false, error: "<svg onload=1>", policy: {} })}, ${JSON.stringify(OV)})`);
+  assert.match(down, /not reachable/);
+  assert.doesNotMatch(down, /<svg onload/);
+  const reach = c.run(`remoteReachHtml(${JSON.stringify({ verdict: "host_down", summary: "<i>x</i>", steps: ["<u>y</u>"], agent_port_open: false, ssh_port_open: false, terminal_port_open: false })})`);
+  assert.doesNotMatch(reach, /<i>x|<u>y/);
+});
+
+test("remote power buttons stay disabled until the node allows them, and say why", () => {
+  const c = client();
+  const off = c.run(`remotePowerHtml(${JSON.stringify(NODE_B)}, ${JSON.stringify(OV)})`);
+  assert.match(off, /data-act="reboot" disabled/);
+  assert.match(off, /data-act="poweroff" disabled/);
+  assert.match(off, /sudo tsm remote enable poweroff/);
+  const on = { ...NODE_B, policy: { ...NODE_B.policy, reboot: true, poweroff: true, boot_next: true, wol: true } };
+  const html = c.run(`remotePowerHtml(${JSON.stringify(on)}, ${JSON.stringify(OV)})`);
+  assert.doesNotMatch(html, /data-act="reboot" disabled/);
+  assert.match(html, /data-act="plug-cycle"/);
+  const noHelper = c.run(`remotePowerHtml(${JSON.stringify({ ...on, privd: false })}, ${JSON.stringify(OV)})`);
+  assert.match(noHelper, /data-act="reboot" disabled/, "no privileged helper, no power buttons");
+});
+
+test("a node that runs the controller cannot be woken by itself, and a missing plug is explained", () => {
+  const c = client();
+  const a = c.run(`remotePowerHtml(${JSON.stringify({ ...NODE_B, node: "A", plug_configured: false })}, ${JSON.stringify(OV)})`);
+  assert.match(a, /this node runs the controller/);
+  assert.doesNotMatch(a, /data-act="wake"/);
+  assert.match(a, /nodes\.A\.plug/);
+});
+
+test("terminal card explains why it is unavailable and offers touch keys", () => {
+  const c = client();
+  const off = c.run(`remoteTerminalHtml(${JSON.stringify({ ...NODE_B, policy: { ...NODE_B.policy, terminal: false } })})`);
+  assert.match(off, /sudo tsm remote enable terminal/);
+  assert.match(off, /data-act="term-open" disabled/);
+  const nosvc = c.run(`remoteTerminalHtml(${JSON.stringify({ ...NODE_B, terminal_service: false })})`);
+  assert.match(nosvc, /systemctl enable --now twinspark-terminal/);
+  const on = c.run(`remoteTerminalHtml(${JSON.stringify(NODE_B)})`);
+  assert.doesNotMatch(on, /data-act="term-open" disabled/);
+  for (const k of ["Esc", "Tab", "Ctrl-C", "Ctrl-D"]) assert.match(on, new RegExp(`data-key="${k}"`));
+  assert.equal(c.run("TERM_KEYS['Ctrl-C']"), "\x03");
+});
+
+test("remote tab and route are registered, and look-alike paths do not match", () => {
+  const c = client();
+  assert.equal(c.run("NAV.some(n => n[0] === 'remote')"), true);
+  assert.equal(c.run("ROUTES.some(([re]) => re.test('/remote/B') && re.test('/remote'))"), true);
+  assert.equal(c.run("ROUTES.some(([re]) => re.test('/remote/B/../x'))"), false);
 });

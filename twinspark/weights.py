@@ -428,14 +428,31 @@ def execute_delete(plan: dict[str, Any], hf_home: str | Path) -> dict[str, Any]:
     repo_dir = Path(plan["repo_dir"]).resolve()
     if not repo_dir.is_relative_to(hub):
         raise ValueError("refusing to delete outside the cache")
-    for s in plan["snapshot_dirs"]:
-        p = Path(s)
-        if p.resolve().is_relative_to(repo_dir):
-            shutil.rmtree(p, ignore_errors=True)
+    errors: list[str] = []
+    # Blobs first: if one cannot be removed (root-owned files in a reused cache, a read-only
+    # mount) stop BEFORE touching the snapshots, so the model still shows up in the inventory
+    # and the user sees what is left instead of invisible orphaned blobs.
     for b in plan["blobs"]:
         p = Path(b)
         if p.resolve().is_relative_to(hub) and p.is_file():
-            p.unlink(missing_ok=True)
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as exc:
+                errors.append(f"{p.name}: {exc.strerror or exc}")
+    if errors:
+        raise ValueError(f"could not remove {len(errors)} file(s) ({'; '.join(errors[:3])}); the model "
+                         f"was left in place — fix the permissions in the cache and retry")
+
+    def note(_func, path, exc) -> None:
+        errors.append(f"{Path(path).name}: {getattr(exc, 'strerror', None) or exc}")
+
+    for s in plan["snapshot_dirs"]:
+        p = Path(s)
+        if p.resolve().is_relative_to(repo_dir):
+            shutil.rmtree(p, onexc=note)
+    if errors:
+        raise ValueError(f"could not remove the snapshot ({'; '.join(errors[:3])}); retry after "
+                         f"fixing the permissions")
     refs = repo_dir / "refs"
     if refs.is_dir():
         for rf in refs.rglob("*"):

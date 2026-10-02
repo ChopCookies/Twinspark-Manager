@@ -120,16 +120,28 @@ async def delete_model(ctrl: "Controller", repo: str, revision: Optional[str], n
                               f"{'@' + revision[:8] if revision else ''}: {', '.join(dependents)} "
                               f"(pass force to delete anyway; they will re-download on activation)",
                               dependents)
-    results = {}
-    for n in nodes:
-        if n not in ctrl.agents:
-            results[n] = {"error": "node not configured"}
-            continue
-        try:
-            results[n] = await ctrl.agents[n].call("weights_delete", repo=repo, revision=revision,
+    async def run_deletes() -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for n in nodes:
+            if n not in ctrl.agents:
+                out[n] = {"error": "node not configured"}
+                continue
+            try:
+                out[n] = await ctrl.agents[n].call("weights_delete", repo=repo, revision=revision,
                                                    preview=preview, timeout=600)
-        except AgentActionError as exc:
-            results[n] = {"error": exc.detail}
+            except AgentActionError as exc:
+                out[n] = {"error": exc.detail}
+        return out
+
+    if preview:
+        results = await run_deletes()
+    else:
+        # hold the operation lock: an activation or a prepare must not start (and read these
+        # files) while they are being removed
+        if ctrl._lock.locked():
+            raise FilesError("cluster is busy preparing, switching or maintaining a deployment")
+        async with ctrl._lock:
+            results = await run_deletes()
     if not preview:
         ctrl._audit("user", "model.delete", f"model/{repo}",
                     {"revision": revision, "nodes": nodes, "force": force,

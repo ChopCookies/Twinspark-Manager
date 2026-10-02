@@ -15,6 +15,7 @@ import json
 import math
 import re
 import shlex
+import string
 from pathlib import PurePosixPath
 from typing import Any, Optional
 
@@ -120,6 +121,13 @@ def _validate_document(doc: dict[str, Any]) -> None:
         if value is not None and (not isinstance(value, dict) or
                                   any(not isinstance(k, str) for k in value)):
             raise RecipeImportError(f"recipe {key} must be a mapping with string keys")
+        # scalars only: nested values are never meaningful here, and YAML aliases can expand a
+        # few bytes into gigabytes when they are stringified
+        if value and any(not isinstance(v, (str, int, float, bool)) and v is not None
+                         for v in value.values()):
+            raise RecipeImportError(f"recipe {key} values must be plain strings or numbers")
+        if value and any(len(str(v)) > 8192 for v in value.values()):
+            raise RecipeImportError(f"recipe {key} contains a value that is too long")
     for key in ("mods", "build_args"):
         value = doc.get(key)
         if value is not None and (not isinstance(value, list) or
@@ -129,13 +137,46 @@ def _validate_document(doc: dict[str, Any]) -> None:
         raise RecipeImportError("recipe quantization must be a string")
 
 
+def _render_command(template: str, params: dict[str, Any]) -> str:
+    """Expand ``{name}`` placeholders like ``str.format`` but with no format-spec machinery.
+
+    ``str.format`` accepts specs such as ``{port:>170000000}`` that allocate that many bytes, and
+    attribute/index access. Recipes only need plain substitution (``{{``/``}}`` still escape).
+    """
+    out: list[str] = []
+    try:
+        pieces = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise RecipeImportError(f"cannot render recipe command template: {exc}") from exc
+    for literal, field, spec, conv in pieces:
+        out.append(literal)
+        if field is None:
+            continue
+        if spec or conv or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field):
+            raise RecipeImportError(f"unsupported placeholder in recipe command: {{{field}}}")
+        if field not in params:
+            raise RecipeImportError(f"recipe command uses '{field}' but defaults do not define it")
+        value = params[field]
+        if not isinstance(value, (str, int, float, bool)):
+            raise RecipeImportError(f"template value '{field}' must be a string or number")
+        out.append(str(value))
+    rendered = "".join(out)
+    if len(rendered) > 65536:
+        raise RecipeImportError("recipe command is too long")
+    return rendered
+
+
 def parse_eugr_recipe(text: str, profile_name: Optional[str] = None,
                       overrides: Optional[dict[str, Any]] = None,
                       source_ref: Optional[str] = None) -> tuple[ProfileDraft, dict[str, Any]]:
     try:
         doc = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise RecipeImportError(f"not valid YAML: {exc}") from exc
+        mark = getattr(exc, "problem_mark", None)
+        where = f" (line {mark.line + 1}, column {mark.column + 1})" if mark is not None else ""
+        # no snippet of the input: it may be content fetched from somewhere that should stay private
+        reason = getattr(exc, "problem", None) or "syntax error"
+        raise RecipeImportError(f"not valid YAML{where}: {reason}") from exc
     if not isinstance(doc, dict) or "command" not in doc:
         raise RecipeImportError("an eugr recipe needs at least 'name' and 'command'")
     _validate_document(doc)
@@ -143,12 +184,7 @@ def parse_eugr_recipe(text: str, profile_name: Optional[str] = None,
     params = {**(doc.get("defaults") or {}), **(overrides or {})}
     params.setdefault("host", "0.0.0.0")
     params.setdefault("port", 8000)
-    try:
-        rendered = str(doc["command"]).format(**params)
-    except KeyError as exc:
-        raise RecipeImportError(f"recipe command uses {exc} but defaults do not define it") from exc
-    except (AttributeError, IndexError, TypeError, ValueError) as exc:
-        raise RecipeImportError(f"cannot render recipe command template: {exc}") from exc
+    rendered = _render_command(str(doc["command"]), params)
     tokens = _split_command(rendered)
     env = {str(k): str(v) for k, v in (doc.get("env") or {}).items()}
     while tokens and _ENV_ASSIGN.match(tokens[0]):
@@ -317,7 +353,9 @@ def parse_eugr_recipe(text: str, profile_name: Optional[str] = None,
                                "pinning reads the real checkpoint size)")
     simple.update(model=model, quantization=quant.value, topology=topo.value)
     simple.setdefault("context_length", 32768)
-    simple.setdefault("concurrency", 1)
+    if "concurrency" not in simple:
+        simple["concurrency"] = 1
+        adv["max_num_seqs_vllm_default"] = True       # the recipe left it to vLLM; so do we
     if simple["tool_calling"] and not behaviour.get("tool_call_parser"):
         simple["tool_calling"] = False
         report["notes"].append("--enable-auto-tool-choice without a parser — tool calling disabled")

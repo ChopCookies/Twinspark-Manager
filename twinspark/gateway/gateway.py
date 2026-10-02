@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
+
+from ..security import tokens_equal
 
 BACKEND_BACKOFF_S = 10.0
 
@@ -166,11 +167,11 @@ class Gateway:
         if self.inference_api_key is None:
             return True
         scheme, _, token = (authorization or "").partition(" ")
-        return scheme.lower() == "bearer" and secrets.compare_digest(
-            token.strip(), self.inference_api_key
-        )
+        return scheme.lower() == "bearer" and tokens_equal(token.strip(), self.inference_api_key)
 
     def resolve(self, model: Optional[str]) -> Optional[RouteState]:
+        if model is not None and not isinstance(model, str):
+            return None                      # a list/dict "model" from a client is simply unknown
         name = model or "default"
         if name in self.routes:
             return self.routes[name]

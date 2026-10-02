@@ -105,8 +105,9 @@ async def import_any(req: ImportRequest, ctrl: Controller = Depends(controller_d
             raise HTTPException(422, str(e))
         ref = req.url
     try:
-        draft, report = import_text(text or "", req.profile_name, source_ref=ref,
-                                    overrides=req.overrides or None)
+        # parsing is CPU work on untrusted text: keep it off the event loop
+        draft, report = await asyncio.to_thread(
+            import_text, text or "", req.profile_name, source_ref=ref, overrides=req.overrides or None)
     except (RecipeImportError, ValueError) as e:
         raise HTTPException(422, str(e))
     out: dict[str, Any] = {"draft": draft.model_dump(mode="json"), "report": report,

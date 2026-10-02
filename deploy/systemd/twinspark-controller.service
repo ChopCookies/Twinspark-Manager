@@ -5,7 +5,7 @@ Wants=network-online.target twinspark-agent.service
 
 [Service]
 User=twinspark
-Group=twinspark
+SupplementaryGroups=twinspark
 ExecStart=/opt/twinspark/venv/bin/tsm serve controller --config /etc/twinspark/controller.yaml
 Restart=on-failure
 RestartSec=3

@@ -18,6 +18,8 @@ from pathlib import Path
 POLICY = Path("/etc/twinspark/maintenance-policy.json")
 ROOT = Path("/var/lib/twinspark-maintenance")
 LOCK = threading.Lock()
+REBOOT_RETRY_S = 600          # a requested reboot that never happened is retried after this long
+MAX_REBOOT_RETRIES = 3
 
 
 def boot_id():
@@ -180,6 +182,19 @@ def status(params):
                     state="failed", error="node restarted before the update completed; inspect package/firmware state"
                 )
                 save(state)
+        elif state["state"] == "rebooting":
+            asked = state.get("reboot_requested_at") or state.get("updated_at") or 0
+            if time.time() - asked > REBOOT_RETRY_S:
+                # Same boot long after the request: the reboot was lost or blocked. Without this the
+                # run would stay "rebooting" forever and refuse every new run until repaired by hand.
+                retries = state.get("reboot_retries", 0) + 1
+                if retries > MAX_REBOOT_RETRIES:
+                    state.update(state="failed", error=f"the node did not reboot after "
+                                 f"{MAX_REBOOT_RETRIES} attempts; check it (journalctl -b, inhibitors)")
+                else:
+                    state.update(state="awaiting_reboot", phase="reboot did not happen — retrying",
+                                 reboot_retries=retries)
+                save(state)
         elif state["state"] in ("queued", "installing", "failed"):
             unit = "twinspark-maintenance-" + rid + ".service"
             active = command(["/usr/bin/systemctl", "is-active", unit], accepted=(0, 3, 4)).strip()
@@ -208,7 +223,7 @@ def reboot(params):
             raise RuntimeError("updates have not completed successfully")
         if not policy()["enabled"]:
             raise RuntimeError("maintenance policy has been disabled")
-        state.update(state="rebooting", phase="rebooting")
+        state.update(state="rebooting", phase="rebooting", reboot_requested_at=time.time())
         save(state)
         try:
             command(["/usr/bin/systemctl", "reboot", "--no-block"])

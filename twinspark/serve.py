@@ -1,4 +1,4 @@
-"""Process entry points: ``tsm serve controller|agent|privd``.
+"""Process entry points: ``tsm serve controller|agent|privd|termd``.
 
 The controller process runs two HTTP servers on one event loop: the management
 API (default 127.0.0.1:8443 — reach it via SSH tunnel or Tailscale) and the
@@ -26,11 +26,11 @@ log = logging.getLogger("twinspark")
 _LOCAL = ("127.0.0.1", "::1", "localhost")
 
 
-def _server(app, listener: Listener) -> uvicorn.Server:
+def _server(app, listener: Listener, log_level: str = "info") -> uvicorn.Server:
     return uvicorn.Server(uvicorn.Config(
-        app, host=listener.bind, port=listener.port, log_level="info",
+        app, host=listener.bind, port=listener.port, log_level=log_level,
         ssl_certfile=listener.tls_cert, ssl_keyfile=listener.tls_key,
-        proxy_headers=False, access_log=False))
+        proxy_headers=False, access_log=False, ws_max_size=2 * 1024 ** 2))
 
 
 def build_controller(cfg: ControllerConfig, vault: SecretsVault) -> tuple[Controller, str]:
@@ -47,26 +47,53 @@ def build_controller(cfg: ControllerConfig, vault: SecretsVault) -> tuple[Contro
     return controller, vault.get("management_api_key")
 
 
-async def run_controller(config_path: str) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+def build_servers(config_path: str, seed=None,
+                  log_level: str = "info") -> tuple[Controller, uvicorn.Server, uvicorn.Server]:
+    """Controller + the two uvicorn servers (management API, gateway), not yet running."""
     cfg = load_config(config_path, ControllerConfig)
     vault = SecretsVault(cfg.secrets_dir)
     controller, mgmt_key = build_controller(cfg, vault)
-    mgmt = _server(create_app(controller, mgmt_key), cfg.listener)
-    gw = _server(build_gateway_app(controller.gateway), cfg.gateway_listener)
+    if seed:
+        seed(controller)
+    mgmt = _server(create_app(controller, mgmt_key), cfg.listener, log_level)
+    gw = _server(build_gateway_app(controller.gateway), cfg.gateway_listener, log_level)
+    return controller, mgmt, gw
+
+
+async def run_controller(config_path: str) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    _, mgmt, gw = build_servers(config_path)
     await asyncio.gather(mgmt.serve(), gw.serve())
 
 
-def run_privd(socket_path: str, group: str) -> None:
-    from .agent.privd import privd_serve
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    asyncio.run(privd_serve(socket_path, group))
-
-
-def run_agent(config_path: str) -> None:
+def build_agent_server(config_path: str, log_level: str = "info") -> uvicorn.Server:
     cfg = load_config(config_path, AgentConfig)
     if cfg.runtime_mode == "dry-run":
         log.warning("tsm-agent runs in DRY-RUN mode: no containers will be started")
-    app = build_agent_app(cfg)
-    _server(app, cfg.listener).run()
+    return _server(build_agent_app(cfg), cfg.listener, log_level)
+
+
+def build_termd_server(config_path: str, log_level: str = "info") -> uvicorn.Server:
+    """The terminal service: same address as the agent, its own port (``remote_mgmt.terminal_port``)."""
+    from .remote.termd import build_termd_app
+
+    cfg = load_config(config_path, AgentConfig)
+    listener = cfg.listener.model_copy(update={"port": cfg.remote_mgmt.terminal_port})
+    return _server(build_termd_app(cfg), listener, log_level)
+
+
+def run_termd(config_path: str) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    build_termd_server(config_path).run()
+
+
+def run_privd(socket_path: str, group: str, remote_policy: str | None = None,
+              require_root_policy: bool = True) -> None:
+    from .agent.privd import privd_serve
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    asyncio.run(privd_serve(socket_path, group, remote_policy, require_root_policy))
+
+
+def run_agent(config_path: str) -> None:
+    build_agent_server(config_path).run()

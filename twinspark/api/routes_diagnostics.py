@@ -12,6 +12,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from ..controller import onboarding
 from ..controller.agent_client import AgentActionError
 from ..controller.controller import Controller
 from ..metrics import combine_snapshots, scrape_metrics
@@ -52,6 +53,12 @@ async def resolve(req: ResolveRequest, ctrl: Controller = Depends(controller_dep
 async def doctor(ctrl: Controller = Depends(controller_dep)):
     """Every precondition for a fast, stable dual-Spark deployment, with the fix."""
     return await ctrl.doctor()
+
+
+@router.get("/onboarding")
+async def get_started(ctrl: Controller = Depends(controller_dep)):
+    """The first-run checklist: what is done, what is next, how to do it."""
+    return await onboarding.build(ctrl)
 
 
 @router.get("/rdma")
@@ -98,14 +105,6 @@ async def metrics(live: bool = False, ctrl: Controller = Depends(controller_dep)
 @router.get("/metrics/series")
 def metrics_series(ctrl: Controller = Depends(controller_dep)):
     return ctrl.sampler.series()
-
-
-@router.get("/telemetry")
-async def telemetry(refresh: bool = False, ctrl: Controller = Depends(controller_dep)):
-    """Per-node memory/GPU telemetry (refreshed by the background loop)."""
-    if refresh or not ctrl.telemetry:
-        await ctrl.metrics_tick(refresh_nodes=True)
-    return ctrl.telemetry
 
 
 class HeadlessApply(BaseModel):
