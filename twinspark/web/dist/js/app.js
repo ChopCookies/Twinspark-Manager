@@ -15,6 +15,7 @@ const ICON = {
   dashboard: '<path d="M3 13h8V3H3zm10 8h8V11h-8zM3 21h8v-6H3zm10-18v6h8V3z"/>',
   profiles: '<path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>',
   cookbook: '<path d="M6 3h11a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6zm0 0v18M9 7h7M9 11h7" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/>',
+  integrations: '<path d="M8 8H4v8h4M16 8h4v8h-4M8 12h8M10 5l-2 7 2 7M14 5l2 7-2 7" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
   files: '<path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zm0 0v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" stroke="currentColor" stroke-width="1.8" fill="none"/>',
   mods: '<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.1-.4-.4-2.1z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/>',
   planner: '<path d="M12 3v9l6.4 6.4A9 9 0 1 1 12 3z" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M15 3.5A9 9 0 0 1 20.5 9H15z" fill="currentColor"/>',
@@ -29,7 +30,7 @@ const ICON = {
 const icon = (n) => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[n] || ""}</svg>`;
 const NAV = [
   ["dashboard", "Dashboard"], ["system", "System status"], ["updates", "Updates"], ["profiles", "Profiles"], ["cookbook", "Cookbook"],
-  ["files", "Model files"], ["mods", "Mods"], ["planner", "Planner"],
+  ["integrations", "Integrations"], ["files", "Model files"], ["mods", "Mods"], ["planner", "Planner"],
   ["diagnostics", "Diagnostics"], ["jobs", "Jobs"], ["logs", "Logs"],
 ];
 
@@ -262,6 +263,7 @@ const ROUTES = [
   [/^\/profiles$/, () => viewProfiles()],
   [/^\/profiles\/([^/]+)(?:\/(\w+))?$/, (m) => viewProfile(decodeURIComponent(m[1]), m[2] || "overview")],
   [/^\/cookbook(?:\/(\w+))?$/, (m) => viewCookbook(m[1] || "builtin")],
+  [/^\/integrations$/, () => viewIntegrations()],
   [/^\/files$/, () => viewFiles()],
   [/^\/mods$/, () => viewMods()],
   [/^\/planner$/, () => viewPlanner()],
@@ -891,6 +893,168 @@ function bindPlanSrc(name, p) {
   };
 }
 
+/* ============================== integrations ============================== */
+function compatibilityChecksHtml(checks, dryRun = false) {
+  if (!checks?.length) return `<p class="muted small">No checks recorded yet.</p>`;
+  const labels = { models: "Model discovery", chat: "Conversation", streaming: "Streaming replies", tools: "Tool calling", structured: "Structured replies", json_schema: "Structured replies", responses: "Responses API" };
+  return `<div class="list">${checks.map(check => {
+    const raw = String(check.status || "pending").toLowerCase();
+    const status = dryRun && ["ok", "pass", "passed"].includes(raw) ? "simulated" : raw;
+    const label = { ok: "Passed", pass: "Passed", passed: "Passed", fail: "Failed", failed: "Failed", unsupported: "Unsupported", simulated: "Simulated", skipped: "Skipped", pending: "Pending", running: "Checking" }[status] || status;
+    const cls = ["ok", "pass", "passed"].includes(status) ? "good" : ["fail", "failed"].includes(status) ? "bad" : ["unsupported", "skipped"].includes(status) ? "warn" : status === "simulated" ? "info" : "muted";
+    return `<div class="item"><div class="l"><div class="t">${esc(labels[check.name] || String(check.name || "Check").replace(/[_-]/g, " "))} ${tag(label, cls)}</div><div class="d">${esc(check.message || "")}</div></div></div>`;
+  }).join("")}</div>`;
+}
+function integrationAliasHtml(alias) {
+  if (!alias) return empty("No model selected", "Activate a recipe to make a model available to clients.");
+  const toolsEnabled = Array.isArray(alias.configured_tools) ? alias.configured_tools.length > 0 : !!alias.configured_tools;
+  const configured = Array.isArray(alias.configured_tools) ? alias.configured_tools.join(", ") || "Off" : alias.configured_tools ? "Enabled" : "Off";
+  const context = typeof alias.context_length === "number" && Number.isFinite(alias.context_length) && alias.context_length > 0 ? num(alias.context_length) + " tokens" + (alias.context_source === "observed" ? " · observed" : alias.context_source === "recipe" ? " · recipe setting" : "") : "Auto — not measured";
+  const latest = alias.latest_check;
+  return `<div class="card"><div class="card-head"><h2>Your recipe connection</h2>${tag(alias.status || "unknown", alias.status === "serving" ? "good" : "muted")}</div>
+    <div class="kv"><b>Model name for clients</b><span class="mono">${esc(alias.alias)}</span><b>Profile</b><span><a href="#/profiles/${enc(alias.profile)}">${esc(alias.profile)}</a></span><b>Revision</b><span class="mono">${esc(alias.revision_id || "Not pinned")}</span><b>Runs on</b><span>${esc(alias.node ? `Node ${alias.node}` : alias.topology || "—")}</span><b>Context length</b><span>${esc(context)}</span><b>Tool calling</b><span>${esc(configured)}</span><b>Tool parser</b><span>${esc(alias.tool_parser || "Not configured")}</span></div>
+    ${alias.ambiguous ? '<p class="small muted">Several profiles use this model name. Activate the intended profile or give the profiles distinct aliases before exporting its connection.</p>' : ""}
+    ${!toolsEnabled || !alias.tool_parser ? '<p class="small muted">Agent workflows usually need tool calling. Enable it and choose a parser that matches the model in the recipe before testing.</p>' : ""}
+    <div class="section-title">Latest compatibility check</div>${latest ? `<p class="small">${tag(latest.dry_run ? "Simulation" : "Live check", latest.dry_run ? "info" : "muted")} ${tag(latest.state || "unknown", latest.state === "failed" ? "bad" : "muted")}${latest.revision_id && latest.revision_id !== alias.revision_id ? ` <span class="muted">Recorded for revision ${esc(latest.revision_id)}. Check this revision again.</span>` : ""}</p>${compatibilityChecksHtml(latest.checks, latest.dry_run)}` : '<p class="small muted">Run a compatibility check to see what this recipe can support.</p>'}</div>`;
+}
+function integrationClientHtml(client) {
+  if (!client) return empty("No clients available");
+  let docs = "";
+  try { if (new URL(client.docs_url).protocol === "https:") docs = `<a href="${esc(client.docs_url)}" target="_blank" rel="noopener noreferrer">Setup guide ↗</a>`; } catch (_) { }
+  return `<h2>${esc(client.title)}</h2><p>${esc(client.description || "")}</p>${client.requirements?.length ? `<ul class="plain">${client.requirements.map(r => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}${docs ? `<p class="small">${docs}</p>` : ""}`;
+}
+function integrationBaseUrl(value) {
+  let url;
+  try { url = new URL(value.trim()); } catch (_) { throw new Error("Enter a full gateway address, such as http://192.168.1.10:8000/v1."); }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("Use an http or https gateway address without a key, password, query or fragment.");
+  return url.toString().replace(/\/+$/, "");
+}
+function integrationFilesHtml(result) {
+  return `<div class="card"><h2>Connection files</h2><p class="small muted">Save the files where the client runs and follow its setup guide. Replace environment placeholders there with your own values.</p>${(result.notes || []).map(n => `<p class="small">${esc(n)}</p>`).join("")}
+    ${(result.files || []).map((file, i) => `<div class="integration-file"><div class="row between"><b class="mono">${esc(file.name)}</b><button class="btn sm" data-act="integration-download" data-index="${i}">Download file</button></div>${codeBlock(file.content)}</div>`).join("")}</div>`;
+}
+function downloadIntegrationFile(file) {
+  const href = URL.createObjectURL(new Blob([file.content], { type: "text/plain;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = href; link.download = String(file.name || "connection.txt").split(/[\\/]/).pop();
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
+}
+async function readEvaluationReport(file) {
+  if (!file) throw new Error("Choose an LM Evaluation Harness results JSON file.");
+  if (file.size > 1024 * 1024) throw new Error("Report too large (1 MiB maximum). Use the results JSON without sample logs.");
+  let document;
+  try { document = JSON.parse(await file.text()); }
+  catch (_) { throw new Error("The file is not valid JSON. Choose the harness results file."); }
+  if (!document || typeof document !== "object" || Array.isArray(document) || !document.results || typeof document.results !== "object" || Array.isArray(document.results)) throw new Error("Expected an LM Evaluation Harness results object.");
+  const results = Object.create(null);
+  for (const [task, values] of Object.entries(document.results)) {
+    if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error("Each evaluation task must contain metric values.");
+    const metrics = Object.create(null);
+    for (const [name, value] of Object.entries(values)) if (typeof value === "number") {
+      if (!Number.isFinite(value)) throw new Error("Evaluation metric values must be finite numbers.");
+      metrics[name] = value;
+    }
+    if (Object.keys(metrics).length) results[task] = metrics;
+  }
+  if (!Object.keys(results).length) throw new Error("The report contains no numeric evaluation metrics.");
+  // Retain only attribution and sample count from the client configuration.
+  const config = {};
+  const sourceConfig = document.config || {};
+  let args = sourceConfig.model_args;
+  if (typeof args === "string") args = Object.fromEntries(args.split(",").filter(x => x.includes("=")).map(x => { const i = x.indexOf("="); return [x.slice(0, i).trim(), x.slice(i + 1).trim()]; }));
+  if (args && typeof args === "object" && Object.hasOwn(args, "model")) {
+    if (typeof args.model !== "string") throw new Error("The reported model alias must be plain text.");
+    config.model_args = { model: args.model };
+  }
+  if (typeof sourceConfig.limit === "number" && Number.isFinite(sourceConfig.limit)) config.limit = sourceConfig.limit;
+  return { results, config };
+}
+function evaluationMetricsHtml(payload) {
+  const rows = Object.entries(payload.metrics || {}).flatMap(([task, metrics]) => Object.entries(metrics || {}).filter(([, value]) => typeof value === "number" && Number.isFinite(value)).map(([metric, value]) => `<tr><td>${esc(task)}</td><td class="mono">${esc(metric)}</td><td class="mono num">${esc(String(value))}</td></tr>`));
+  return `<div class="callout warn"><div><b>Reported, not independently verified.</b> ${esc(payload.note || "Imported client results. Recipe attribution and hardware execution have not been verified.")}</div></div><div class="card"><h2>Evaluation results</h2><div class="kv"><b>Model connection</b><span class="mono">${esc(payload.alias)}</span><b>Recipe revision</b><span class="mono">${esc(payload.revision_id)}</span><b>Source</b><span>${esc(payload.source || "lm-evaluation-harness")}</span><b>Sample limit</b><span>${payload.sample_limit == null ? "Not reported" : esc(String(payload.sample_limit))}</span></div>${rows.length ? `<div class="table-wrap integration-actions"><table><thead><tr><th>Task</th><th>Metric</th><th class="num">Value</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : '<p class="small muted">No numeric metrics recorded.</p>'}</div>`;
+}
+async function viewIntegrations() {
+  const g = S.gen;
+  const catalog = await GET("/api/v1/integrations");
+  if (!current(g)) return;
+  const aliases = catalog.aliases || [], clients = catalog.clients || [];
+  const state = S.integrations || (S.integrations = {});
+  if (!aliases.some(a => a.alias === state.alias)) state.alias = (aliases.find(a => a.status === "serving") || aliases[0])?.alias || "";
+  if (!aliases.some(a => a.alias === state.secondaryAlias) || state.secondaryAlias === state.alias) state.secondaryAlias = "";
+  if (!clients.some(c => c.id === state.client)) state.client = clients[0]?.id || "";
+  if (!state.baseUrl) state.baseUrl = catalog.gateway?.suggested_base_url || "";
+  if (!render(g, `<div class="view"><div class="view-head"><div><p class="eyebrow">Connect · check · experiment</p><h1>Integrations</h1><p>Connect your recipes to coding agents, harnesses and other model clients.</p></div><button class="btn" data-act="integration-refresh">Refresh connections</button></div>
+    <div class="card"><div class="form"><label class="field"><span>Model connection</span><select id="integration-alias">${aliases.map(a => `<option value="${esc(a.alias)}" ${a.alias === state.alias ? "selected" : ""}>${esc(a.alias)} · ${esc(a.profile)}</option>`).join("")}</select></label><label class="field"><span>Second model (optional)</span><select id="integration-secondary"><option value="">None</option>${aliases.map(a => `<option value="${esc(a.alias)}" ${a.alias === state.secondaryAlias ? "selected" : ""}>${esc(a.alias)} · ${esc(a.profile)}</option>`).join("")}</select><span class="help">For clients that separate planning and coding, or use a smaller helper model.</span></label><label class="field"><span>Client or harness</span><select id="integration-client">${clients.map(c => `<option value="${esc(c.id)}" ${c.id === state.client ? "selected" : ""}>${esc(c.title)}</option>`).join("")}</select></label><label class="field"><span>Gateway address</span><input id="integration-url" type="url" autocomplete="off" spellcheck="false" value="${esc(state.baseUrl)}" placeholder="http://192.168.1.10:8000/v1"/><span class="help">Use the manager's address as seen from the client machine.</span></label></div>
+    ${catalog.gateway?.auth_required ? '<p class="small muted">The connection files use an API key placeholder. Set your gateway key on the client machine.</p>' : ""}<p class="err hidden" id="integration-error" role="alert"></p><div class="row end integration-actions"><button class="btn" id="integration-check-button" data-act="integration-check" ${aliases.find(a => a.alias === state.alias)?.status !== "serving" ? "disabled" : ""}>Run compatibility check</button><button class="btn primary" id="integration-export-button" data-act="integration-export" ${!state.alias || !state.client ? "disabled" : ""}>Create connection files</button></div></div>
+    ${!aliases.length ? `<div class="callout info"><div><b>No model connections yet.</b> Prepare and activate a profile to connect a client. <a href="#/profiles">Open profiles →</a></div></div>` : ""}
+    <div class="grid integration-details"><div id="integration-recipe" class="integration-recipes"></div><div class="card" id="integration-client-info"></div></div><div id="integration-files" aria-live="polite"></div>
+    <div class="card"><h2>Record evaluation results</h2><p class="small muted">Attach an LM Evaluation Harness report to the exact recipe revision you tested. Results are recorded as reported evidence; only numeric metrics and the sample limit are saved.</p><div class="form"><label class="field"><span>Exact recipe revision</span><input id="evaluation-revision" autocomplete="off" maxlength="128" spellcheck="false"/><span class="help">Prefilled from the selected model. Enter an older revision ID when that is what you tested.</span></label><label class="field"><span>Results JSON (up to 1 MiB)</span><input id="evaluation-file" type="file" accept=".json,application/json"/></label></div><p class="err hidden" id="evaluation-error" role="alert"></p><div class="row end integration-actions"><button class="btn" id="evaluation-record-button" data-act="evaluation-record" disabled>Record results</button></div></div></div>`)) return;
+  $("#integration-alias").value = state.alias; $("#integration-secondary").value = state.secondaryAlias; $("#integration-client").value = state.client; $("#integration-url").value = state.baseUrl;
+  $("#evaluation-revision").value = aliases.find(a => a.alias === state.alias)?.revision_id || "";
+  let epoch = 0, exported = null, pendingRequests = 0, evaluationEpoch = 0, evaluationPending = false;
+  const selected = () => ({ alias: $("#integration-alias").value, secondary_alias: $("#integration-secondary").value, client: $("#integration-client").value, base_url: $("#integration-url").value });
+  const display = () => {
+    const values = selected(); Object.assign(state, { alias: values.alias, secondaryAlias: values.secondary_alias, client: values.client, baseUrl: values.base_url });
+    const primary = aliases.find(a => a.alias === values.alias), secondary = aliases.find(a => a.alias === values.secondary_alias);
+    $("#integration-recipe").innerHTML = integrationAliasHtml(primary) + (secondary && secondary !== primary ? integrationAliasHtml(secondary) : "") + (primary?.status !== "serving" ? '<p class="small muted">Connection files can be prepared now. Activate this recipe to run model compatibility checks.</p>' : "");
+    $("#integration-check-button").disabled = pendingRequests > 0 || primary?.status !== "serving";
+    $("#integration-export-button").disabled = pendingRequests > 0 || !values.alias || !values.client;
+    $("#evaluation-record-button").disabled = evaluationPending || !values.alias || !$("#evaluation-revision").value.trim() || !$("#evaluation-file").files?.length;
+    $("#integration-client-info").innerHTML = integrationClientHtml(clients.find(c => c.id === values.client));
+  };
+  const invalidate = () => { epoch++; exported = null; $("#integration-files").innerHTML = ""; $("#integration-error").classList.add("hidden"); display(); };
+  const evaluationChanged = () => { evaluationEpoch++; $("#evaluation-error").classList.add("hidden"); display(); };
+  $("#integration-alias").onchange = () => { $("#evaluation-revision").value = aliases.find(a => a.alias === selected().alias)?.revision_id || ""; $("#evaluation-file").value = ""; evaluationChanged(); invalidate(); };
+  $("#integration-secondary").onchange = invalidate; $("#integration-client").onchange = invalidate; $("#integration-url").oninput = invalidate;
+  $("#evaluation-revision").oninput = evaluationChanged; $("#evaluation-file").onchange = evaluationChanged;
+  const request = async (btn, fn) => {
+    const token = ++epoch;
+    pendingRequests++; display();
+    $("#integration-error").classList.add("hidden");
+    try { await busy(btn, () => fn(token)); }
+    catch (error) { if (current(g) && token === epoch) { $("#integration-error").textContent = error.message || String(error); $("#integration-error").classList.remove("hidden"); } }
+    finally { pendingRequests--; if (current(g)) display(); }
+  };
+  onAct({
+    "integration-refresh": () => route(),
+    "integration-export": btn => request(btn, async token => {
+      const values = selected();
+      if (!values.alias || !values.client) throw new Error("Choose a model connection and a client first.");
+      if (values.secondary_alias && values.alias === values.secondary_alias) throw new Error("Choose different connections for the main and second model.");
+      values.base_url = integrationBaseUrl(values.base_url);
+      const result = await GET("/api/v1/integrations/export" + qs(values));
+      if (!current(g) || token !== epoch) return;
+      exported = result; $("#integration-files").innerHTML = integrationFilesHtml(result);
+    }),
+    "integration-check": btn => request(btn, async token => {
+      const values = selected();
+      if (aliases.find(a => a.alias === values.alias)?.status !== "serving") throw new Error("Activate this recipe before running compatibility checks.");
+      const job = await POST("/api/v1/integrations/check", { alias: values.alias });
+      if (current(g) && token === epoch) go("#/jobs/" + enc(job.job_id));
+    }),
+    "integration-download": btn => { const file = exported?.files?.[Number(btn.dataset.index)]; if (file) downloadIntegrationFile(file); },
+    "evaluation-record": async btn => {
+      const token = ++evaluationEpoch, alias = selected().alias, revision = $("#evaluation-revision").value.trim(), file = $("#evaluation-file").files?.[0];
+      evaluationPending = true; display(); $("#evaluation-error").classList.add("hidden");
+      try {
+        await busy(btn, async () => {
+          if (!alias || !revision) throw new Error("Choose a model and its exact pinned recipe revision.");
+          const results = await readEvaluationReport(file);
+          if (!current(g) || token !== evaluationEpoch) return;
+          if (results.config.model_args && results.config.model_args.model !== alias) throw new Error("The report's model alias differs from the selected connection. Choose the model and revision used for this evaluation.");
+          const body = { alias, revision_id: revision, results };
+          if (new TextEncoder().encode(JSON.stringify(body)).byteLength > 1024 * 1024) throw new Error("Report too large (1 MiB maximum). Use fewer tasks or the results JSON without sample logs.");
+          const job = await POST("/api/v1/integrations/evaluations", body);
+          if (current(g) && token === evaluationEpoch) go("#/jobs/" + enc(job.job_id));
+        });
+      } catch (error) { if (current(g) && token === evaluationEpoch) { $("#evaluation-error").textContent = error.message || String(error); $("#evaluation-error").classList.remove("hidden"); } }
+      finally { evaluationPending = false; if (current(g)) display(); }
+    },
+  });
+  display();
+}
+
 /* ============================== jobs ============================== */
 const STAGES = ["validating", "resolving", "downloading", "syncing", "draining", "stopping", "reclaiming", "starting-cluster", "loading", "testing", "routing", "healthy"];
 const STAGE_HELP = {
@@ -909,6 +1073,12 @@ async function viewJob(id) {
   onAct({
     cancel: async () => { const r = await POST(`/api/v1/jobs/${enc(id)}/cancel`); toast(r.note); },
     logs: () => go("#/logs"),
+    "compatibility-retry": async (el) => {
+      const previous = await GET(`/api/v1/jobs/${enc(id)}`);
+      if (!current(g)) return;
+      const job = await busy(el, () => POST("/api/v1/integrations/check", { alias: previous.payload.alias }));
+      if (current(g)) go("#/jobs/" + enc(job.job_id));
+    },
     "prepared-activate": async (el) => {
       const job = await GET(`/api/v1/jobs/${enc(id)}`);
       await activateFlow(job.payload.profile, job.profile_revision, el);
@@ -927,13 +1097,15 @@ function jobHtml(job) {
   const running = ["running", "pending"].includes(job.state);
   const activation = ["activation", "rollback", "recovery"].includes(job.kind);
   const preparation = ["prepare", "integration"].includes(job.kind);
+  const compatibility = job.kind === "compatibility";
+  const evaluation = job.kind === "evaluation";
   const done = Object.fromEntries((job.steps || []).map(s => [s.stage, s]));
   const stages = activation ? STAGES : preparation ? [...(job.kind === "integration" ? ["pinning"] : []), ...STAGES.slice(0, 4)] : (job.steps || []).map(s => s.stage);
   const pl = job.payload || {};
-  const title = activation ? `${job.kind === "activation" ? "Switch to" : job.kind === "rollback" ? "Roll back to" : "Recover"} ${pl.profile || ""} ${pl.label || ""}` : preparation ? `Prepare ${pl.profile || ""} ${pl.revision || ""}` : job.kind === "stage" ? `Stage ${pl.repo || ""}@${sha(pl.revision, 8)}` : job.kind;
+  const title = activation ? `${job.kind === "activation" ? "Switch to" : job.kind === "rollback" ? "Roll back to" : "Recover"} ${pl.profile || ""} ${pl.label || ""}` : preparation ? `Prepare ${pl.profile || ""} ${pl.revision || ""}` : compatibility ? `Check connection ${pl.alias || ""}` : evaluation ? `Evaluation report ${pl.alias || ""}` : job.kind === "stage" ? `Stage ${pl.repo || ""}@${sha(pl.revision, 8)}` : job.kind;
   let h = `<div class="view"><div class="view-head"><div><div class="crumbs"><a href="#/jobs">Jobs</a> / <span class="mono">${esc(job.job_id)}</span></div>
     <h1>${esc(title)} ${tag(job.state, { completed: "good", failed: "bad", running: "info", cancelled: "muted" }[job.state] || "muted")}</h1><p>started ${esc(when(job.created_at))} · ${esc(dur(job.created_at, running ? null : job.updated_at))}</p></div>
-    <div class="row">${running ? `<button class="btn danger" data-act="cancel">Cancel</button>` : ""}${activation ? `<button class="btn" data-act="logs">Container logs</button>` : ""}${pl.profile ? `<a class="btn" href="#/profiles/${enc(pl.profile)}">Profile</a>` : ""}</div></div>`;
+    <div class="row">${running ? `<button class="btn danger" data-act="cancel">Cancel</button>` : ""}${activation ? `<button class="btn" data-act="logs">Container logs</button>` : ""}${compatibility || evaluation ? '<a class="btn" href="#/integrations">Integrations</a>' : ""}${pl.profile ? `<a class="btn" href="#/profiles/${enc(pl.profile)}">Profile</a>` : ""}</div></div>`;
   if (job.state === "failed") {
     h += `<div class="callout bad"><div><b>${esc(job.error || "failed")}</b>${(job.guidance || []).length ? `<ul>${job.guidance.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}${job.rollback ? `<div style="margin-top:6px"><b>Rollback:</b> ${esc(job.rollback)}</div>` : ""}</div></div>`;
   } else if (job.state === "completed" && activation) {
@@ -941,9 +1113,11 @@ function jobHtml(job) {
   }
   if (preparation) h += `<div class="callout ${job.state === "completed" ? "good" : "info"}"><div><b>${job.state === "completed" ? "Preparation complete." : job.state === "failed" ? "Preparation stopped." : "Preparing recipe."}</b> Images, patches and weights are checked without switching the current deployment.${pl.dry_run ? " This was a simulation; real hardware still needs testing." : ""}${job.state === "completed" ? '<div class="row" style="margin-top:10px"><button class="btn primary" data-act="prepared-activate">Switch to prepared revision</button></div>' : job.kind === "integration" && job.state === "failed" ? '<div class="row" style="margin-top:10px"><button class="btn" data-act="integration-retry">Retry preparation</button><a class="btn" href="#/mods">Check patches</a></div>' : ""}</div></div>`;
   if (job.kind === "integration" && pl.resolved) h += `<div class="card"><h2>Recorded pins</h2><div class="kv">${[pl.resolved, pl.resolved.secondary].filter(Boolean).map((r,i) => `<b>${i ? "Node B" : pl.resolved.secondary ? "Node A" : "Model"}</b><span class="mono">${esc(r.model)}<br>${esc(r.image)}</span>`).join("")}</div>${(pl.pin_notes || []).map(n => `<p class="small muted">${esc(n)}</p>`).join("")}</div>`;
+  if (compatibility) h += `<div class="callout ${pl.dry_run ? "info" : ""}"><div><b>${pl.dry_run ? "Simulation — hardware compatibility still needs testing." : "Checks against the model connection."}</b> ${running ? "Results appear as each check finishes. " : ""}Run the client's own test after connecting.${pl.revision_id ? `<div class="small">Recipe revision: <span class="mono">${esc(pl.revision_id)}</span></div>` : ""}</div></div><div class="card"><div class="card-head"><h2>Compatibility results</h2>${!running ? '<button class="btn sm" data-act="compatibility-retry">Check again</button>' : ""}</div>${compatibilityChecksHtml(pl.checks, pl.dry_run)}</div>`;
+  if (evaluation) h += evaluationMetricsHtml(pl);
   for (const w of pl.warnings || []) h += `<div class="callout warn"><div>${esc(w)}</div></div>`;
-  h += `<div class="card"><div class="timeline">`;
-  for (const st of stages) {
+  if (!compatibility) h += `<div class="card"><div class="timeline">`;
+  for (const st of compatibility ? [] : stages) {
     const s = done[st];
     const cls = s ? s.status : "pending";
     const p = s && s.status === "running" ? Math.round((s.progress || 0) * 100) : 0;
@@ -952,7 +1126,7 @@ function jobHtml(job) {
       <div class="msg">${s ? esc(s.message || "") : `<span class="faint">${esc(STAGE_HELP[st] || "")}</span>`}${s && s.status === "running" ? `<div class="progress-line ${p ? "" : "indeterminate"}"><i style="width:${p}%"></i></div>` : ""}</div>
       <div class="dur">${s ? esc(dur(s.started_at, s.finished_at)) : ""}</div></div>`;
   }
-  h += `</div></div>`;
+  if (!compatibility) h += `</div></div>`;
   const excerpt = (job.steps || []).map(s => s.log_excerpt).filter(Boolean).pop();
   if (excerpt) h += `<div class="card"><h2>Log excerpt</h2>${codeBlock(excerpt, "log")}</div>`;
   if (pl.memory_estimate) {
@@ -967,10 +1141,10 @@ async function viewJobs() {
   const kind = sessionStorage.getItem("tsm_jobs_kind") || "";
   const draw = async () => {
     const jobs = await GET("/api/v1/jobs" + qs({ limit: 60, kind }));
-    render(g, `<div class="view"><div class="view-head"><div><h1>Jobs</h1><p>Switches, rollbacks, recoveries, staging and stops — newest first.</p></div>
-      <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
+    render(g, `<div class="view"><div class="view-head"><div><h1>Jobs</h1><p>Recipe preparation, connection checks and deployment changes — newest first.</p></div>
+      <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "compatibility", "evaluation", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
       <div class="card">${jobs.length ? `<div class="table-wrap"><table><thead><tr><th>Job</th><th>Kind</th><th>Target</th><th>State</th><th>Stage</th><th>Started</th><th>Took</th></tr></thead><tbody>
-      ${jobs.map(j => `<tr class="clickable" data-act="open" data-id="${esc(j.job_id)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.kind)}</td><td>${esc(j.payload.profile ? j.payload.profile + " " + (j.payload.label || "") : j.payload.repo || "")}</td>
+      ${jobs.map(j => `<tr class="clickable" data-act="open" data-id="${esc(j.job_id)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.kind)}</td><td>${esc(j.payload.alias || (j.payload.profile ? j.payload.profile + " " + (j.payload.label || "") : j.payload.repo || ""))}</td>
         <td>${tag(j.state, { completed: "good", failed: "bad", running: "info" }[j.state] || "muted")}${j.error ? `<div class="sub">${esc(j.error.slice(0, 120))}</div>` : ""}</td><td>${esc(j.stage || "")}</td><td>${esc(ago(j.created_at))}</td><td>${esc(dur(j.created_at, ["running", "pending"].includes(j.state) ? null : j.updated_at))}</td></tr>`).join("")}
       </tbody></table></div>` : empty("No jobs yet")}</div></div>`);
     const sel = $("#job-kind"); if (sel) sel.onchange = () => { sessionStorage.setItem("tsm_jobs_kind", sel.value); route(); };

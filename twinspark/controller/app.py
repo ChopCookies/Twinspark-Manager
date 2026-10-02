@@ -18,6 +18,7 @@ from ..api import (
     routes_cookbook,
     routes_diagnostics,
     routes_files,
+    routes_integrations,
     routes_profiles,
     routes_system,
 )
@@ -66,7 +67,8 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
         return JSONResponse(status_code=500, content={"detail": f"internal error ({type(exc).__name__})"})
 
     for r in (routes_profiles.router, routes_activation.router, routes_system.router,
-              routes_cookbook.router, routes_diagnostics.router, routes_files.router):
+              routes_cookbook.router, routes_diagnostics.router, routes_files.router,
+              routes_integrations.router):
         app.include_router(r)
 
     @app.get("/api/v1/health")
