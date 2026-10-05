@@ -37,10 +37,12 @@ SOFTWARE.
 
 ## xterm.js and @xterm/addon-fit — MIT
 
-`twinspark/web/{src,dist}/vendor/xterm.js`, `xterm.css` and `addon-fit.js` are the unmodified builds of
-[@xterm/xterm](https://github.com/xtermjs/xterm.js) 5.5.0 and @xterm/addon-fit 0.10.0 (the source-map
-comment at the end of each file was removed). Their licence text, with its copyright lines, is in
-[`twinspark/web/dist/vendor/LICENSE-xterm.txt`](twinspark/web/dist/vendor/LICENSE-xterm.txt).
+`twinspark/web/{src,dist}/vendor/xterm.js`, `xterm.css` and `addon-fit.js` are the builds of
+[@xterm/xterm](https://github.com/xtermjs/xterm.js) 5.5.0 and @xterm/addon-fit 0.10.0, unmodified except
+that the source-map comment at the end of the two `.js` files was removed. The MIT licence text with
+xterm.js's copyright lines is in
+[`twinspark/web/dist/vendor/LICENSE-xterm.txt`](twinspark/web/dist/vendor/LICENSE-xterm.txt);
+@xterm/addon-fit carries the same licence, "Copyright (c) 2019, The xterm.js authors".
 
 ## Recipe settings from other community projects
 

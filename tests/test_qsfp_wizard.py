@@ -214,3 +214,21 @@ def test_node_b_skips_the_step_when_the_join_address_is_on_the_second_interface(
     setup("--root", b_root, "--join", code, "--hf-cache-dir", tmp_path / "hfb", "--configure-qsfp")
     out = capsys.readouterr().out
     assert "the QSFP step is skipped" in out and not netplan_file(b_root).exists()
+
+
+def test_node_b_with_two_cabled_ports_uses_the_interface_from_the_join_code(tmp_path, monkeypatch, capsys):
+    install(monkeypatch, FakeNode(tmp_path / "spark-a"))
+    a_root, b_root = tmp_path / "a", tmp_path / "b"
+    setup("--root", a_root, "--hf-cache-dir", tmp_path / "hfa", "--qsfp-iface", PRIMARY)
+    code = next(line.split("--join ", 1)[1].strip() for line in capsys.readouterr().out.splitlines()
+                if "tsm setup --join tsm1." in line)
+    b = FakeNode(tmp_path / "spark-b")
+    for name, hca in (("enp1s0f0np0", "rocep1s0f0"), ("enP2p1s0f0np0", "roceP2p1s0f0")):
+        b.ifaces[name] = {"ips": [], "mtu": 1500, "up": True, "hca": hca, "roce": True, "virtual": False}
+    b.sync()
+    install(monkeypatch, b)
+    setup("--root", b_root, "--join", code, "--hf-cache-dir", tmp_path / "hfb", "--configure-qsfp")
+    out = capsys.readouterr().out
+    assert "--iface NAME" not in out
+    doc = yaml.safe_load(netplan_file(b_root).read_text())["network"]["ethernets"]
+    assert doc[PRIMARY]["addresses"] == ["192.168.100.2/24"] and doc[SECONDARY]["addresses"] == ["192.168.101.2/24"]

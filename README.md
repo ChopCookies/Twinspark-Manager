@@ -97,8 +97,9 @@ matches, stop any hand-started vLLM (`tsm foreign ls`) and on **each** node run:
 sudo tsm go-live        # runtime_mode: docker + restarts the agent;  `--revert` goes back
 ```
 
-Start small: the `smollm2-135m-smoke` recipe (260 MiB) checks the whole path in a minute; pin it with
-the image of the recipe you plan to run (`tsm pin smollm2-135m-smoke --image <image>`). `tsm doctor` checks everything
+Start small: the `smollm2-135m-smoke` recipe (260 MiB) checks the whole path in a minute. Import it and
+pin it with the image of the recipe you plan to run (`tsm cookbook import smollm2-135m-smoke`, then
+`tsm pin smollm2-135m-smoke --image <image>`). `tsm doctor` checks everything
 a fast, stable dual-Spark setup needs (driver parity, RDMA, headless, privd, SSH, disk).
 
 ### Unattended / scripted
@@ -210,7 +211,7 @@ tsm qsfp verify                           # ping the other Spark through each tw
 sudo tsm qsfp apply --node A              # make it permanent (netplan; `sudo tsm qsfp revert` undoes it)
 ```
 
-It refuses a port that carries the default route or your remote session, never edits a netplan
+It refuses the interface that carries the default route or your remote session, never edits a netplan
 file it did not write, validates with `netplan generate`, and puts the old settings back if the
 addresses do not come up. `tsm setup` offers the same step (answer *no* by default; `--configure-qsfp`
 does it unattended) and `tsm node doctor` reports the link. Details and the honest status — tested

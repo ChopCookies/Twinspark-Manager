@@ -254,10 +254,10 @@ def uplink(d: Discovery, port: Port) -> list[str]:
 
 def choose_port(d: Discovery, iface: Optional[str] = None, configured: Optional[str] = None, *,
                 strict: bool = False) -> Port:
-    """The port to manage: the one named, else the cabled one (preferring what controller.yaml says).
+    """The port to manage: the one named, else what the configuration says, else the cabled one.
 
-    A port whose twin carries the default route is cabled to the network, so it is never picked on its own.
-    ``strict`` (used when a change is planned) refuses to guess between two cabled ports.
+    A port whose twin carries the default route is usually cabled to the network, so it is not picked on
+    its own when another port has a link. ``strict`` (used when a change is planned) refuses to guess.
     """
     if not d.ports:
         raise QsfpError("no ConnectX port found (looked for enp1s0f1np1-style interfaces). Is this a DGX Spark? "
@@ -272,18 +272,21 @@ def choose_port(d: Discovery, iface: Optional[str] = None, configured: Optional[
     if not cabled:
         raise QsfpError("no QSFP link is up. Check that the cable sits in the SAME port on both Sparks, that the "
                         "other Spark is powered on, then try again (`ibdev2netdev` should show '(Up)').")
-    links = [p for p in cabled if not uplink(d, p)]
-    if not links:
-        names = ", ".join(n for p in cabled for n in uplink(d, p))
-        raise QsfpError(f"the only QSFP port with a link carries this machine's default route ({names}): it is "
-                        f"cabled to your network, not to the other Spark. Cable the Sparks together on the other "
-                        f"port, or name the port with --iface")
-    if len(links) == 1:
-        return links[0]
-    if configured:
-        pick = next((p for p in links if configured in p.names()), None)
+    if configured:                                        # what setup recorded as the link to the other Spark
+        pick = next((p for p in cabled if configured in p.names()), None)
         if pick:
             return pick
+    links = [p for p in cabled if not uplink(d, p)]
+    if not links:
+        if strict:
+            routes = ", ".join(n for p in cabled for n in uplink(d, p))
+            raise QsfpError(f"the only QSFP port with a link also carries this machine's default route ({routes}). "
+                            f"If it is the cable to the other Spark (node B reaching the internet through node A, "
+                            f"say), name it with --iface {cabled[0].primary.iface}; if it goes to your network, "
+                            f"cable the Sparks together on the other port")
+        links = cabled
+    if len(links) == 1:
+        return links[0]
     if strict:
         raise QsfpError(f"{len(links)} QSFP ports have a link ({', '.join(p.primary.iface for p in links)}). "
                         f"Say which one is the cable to the other Spark: --iface NAME")
@@ -356,6 +359,7 @@ class Plan:
     peer_ips: list[str]
     warnings: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)       # twins that already have an address from elsewhere
+    named: bool = False                                 # the port was named (--iface / configuration), not guessed
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -529,6 +533,7 @@ def plan_for_node(d: Discovery, node_id: Optional[str] = None, *, iface: Optiona
     """
     host = host or Host()
     port = choose_port(d, iface, configured, strict=True)
+    named = bool(iface) or bool(configured and configured in port.names())
     owned = owned_ifaces(host)
     foreign = next((t for t in port.twins if t.ipv4 and t.iface not in owned), None)
     state = managed_layout(host)
@@ -551,7 +556,13 @@ def plan_for_node(d: Discovery, node_id: Optional[str] = None, *, iface: Optiona
             base = state[1]
         else:
             base = DEFAULT_SUBNET
-    return make_plan(port, n, subnet=base, mtu=mtu, host=host, owned=owned)
+    plan = make_plan(port, n, subnet=base, mtu=mtu, host=host, owned=owned)
+    plan.named = named
+    on_route = [t for t in uplink(d, port) if t not in {e.iface for e in plan.entries}]
+    if named and on_route:
+        plan.warnings.append(f"{', '.join(on_route)} on the same port carries this machine's default route: make "
+                             f"sure this port is the cable to the other Spark, not to your network")
+    return plan
 
 
 # ---- pre-flight ------------------------------------------------------------------------------------
@@ -561,6 +572,16 @@ def ssh_client_ip(env: dict[str, str]) -> Optional[str]:
 
 
 TERMINAL_PORT = 9444          # tsm-termd: the GUI's Remote terminal (on node B it arrives over the link)
+
+
+def terminal_port(host: Host) -> int:
+    """The Remote terminal's port: ``remote_mgmt.terminal_port`` in this node's agent.yaml, else the default."""
+    try:
+        doc = yaml.safe_load(Path(host.root, "etc/twinspark/agent.yaml").read_text()) or {}
+        port = int((doc.get("remote_mgmt") or {}).get("terminal_port") or TERMINAL_PORT)
+        return port if 1 <= port <= 65535 else TERMINAL_PORT
+    except (OSError, ValueError, TypeError, AttributeError, yaml.YAMLError):
+        return TERMINAL_PORT
 
 
 def ssh_clients(host: Host) -> list[str]:
@@ -573,7 +594,7 @@ def ssh_clients(host: Host) -> list[str]:
     if ip:
         found.append(ip)
     rc, out = host.run2(["ss", "-Hnt", "state", "established",
-                         "(", "sport", "=", ":22", "or", "sport", "=", f":{TERMINAL_PORT}", ")"], 5)
+                         "(", "sport", "=", ":22", "or", "sport", "=", f":{terminal_port(host)}", ")"], 5)
     if rc == 0:
         for line in out.splitlines():
             cols = line.split()
@@ -586,13 +607,22 @@ def ssh_clients(host: Host) -> list[str]:
     return found
 
 
-def _session_problems(host: Host, d: Discovery, names: list[str]) -> list[str]:
-    """Reasons not to touch ``names``: they carry the default route or an SSH session, or we cannot tell."""
+def _session_problems(host: Host, d: Discovery, names: list[str],
+                      route_names: Optional[list[str]] = None) -> list[str]:
+    """Reasons not to touch ``names``: they carry the default route or a remote session, or we cannot tell.
+
+    ``route_names`` widens the default-route check (to the whole port when the port was guessed).
+    """
     problems: list[str] = []
-    on_route = sorted(set(names) & set(d.default_route_ifaces))
-    if on_route:
-        problems.append(f"{', '.join(on_route)} carries this machine's default route — it is the management "
-                        f"network, not the link to the other Spark; changing it could cut you off")
+    on_route = sorted(set(route_names or names) & set(d.default_route_ifaces))
+    for dev in on_route:
+        if dev in names:
+            problems.append(f"{dev} carries this machine's default route — it is the management network, not the "
+                            f"link to the other Spark; changing it could cut you off")
+        else:
+            problems.append(f"{dev} carries this machine's default route and shares the port with "
+                            f"{', '.join(names)}, so this port looks cabled to your network. If it really is the "
+                            f"cable to the other Spark, name it with --iface")
     if host.sandbox:
         return problems
     if not d.routes_known:
@@ -623,9 +653,10 @@ def preflight(host: Host, d: Discovery, plan: Plan, *, need_netplan: bool = True
     names = [e.iface for e in plan.entries]
     present = {i.name for i in d.ifaces}
     problems = [f"interface {n} does not exist on this machine" for n in names if n not in present]
-    # the whole port: a twin that carries the uplink or a session means the port is not the Spark-to-Spark link
+    # a guessed port whose other twin carries the default route is probably cabled to the network
     port = next((p for p in d.ports if p.key == plan.port), None)
-    problems += _session_problems(host, d, sorted(set(names) | set(port.names() if port else [])))
+    whole = sorted(set(names) | set(port.names() if port else []))
+    problems += _session_problems(host, d, names, route_names=names if plan.named else whole)
     mine = host.managed_file
     if mine.exists() and not is_ours(mine):
         problems.append(f"{mine} exists and was not written by TwinSpark; not touching it")
@@ -984,7 +1015,7 @@ def checks(d: Discovery, *, port: Optional[Port] = None, configured_iface: Optio
         except QsfpError as exc:
             out.append(_chk("fail" if d.ports else "warn", "qsfp link", str(exc)))
             return out
-    cabled = [p.key for p in d.ports if p.cabled]
+    cabled = [p.key for p in d.ports if p.cabled and (p is port or not uplink(d, p))]   # a LAN uplink is no 2nd cable
     twins = port.twins
     up = [t for t in twins if t.link_up]
     if not up:

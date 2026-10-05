@@ -129,3 +129,16 @@ async def test_dry_run_plan_works_through_the_full_stack(demo):
             assert r.status_code in (200, 422), f"{name}: {r.text}"     # a clear message, never a 500
         ok = await c.get(f"/api/v1/profiles/{names[0]}/draft/launch-plan")
         assert ok.status_code == 200 and ok.json()["plan"]["containers"] and ok.json()["commands"]
+
+
+async def test_a_reused_demo_directory_reports_the_ports_it_really_uses(tmp_path):
+    from twinspark.demo import banner
+
+    async with DemoCluster(tmp_path) as first:
+        url = first.url
+    second = DemoCluster(tmp_path)
+    async with second:
+        assert second.url == url and url in banner(second)
+        async with httpx.AsyncClient(timeout=10) as c:
+            assert (await c.get(f"{second.url}/api/v1/health")).status_code == 200
+    assert second.a_layout.controller_yaml.read_text().count("\ndemo: true") == 1

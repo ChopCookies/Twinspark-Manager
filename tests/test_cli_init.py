@@ -50,3 +50,12 @@ def test_running_init_twice_keeps_the_keys(tmp_path, capsys):
     run("--secrets-dir", sec, "init")
     assert SecretsVault(sec).get("management_api_key") == first
     assert "join-code" not in capsys.readouterr().out          # nothing new to hand to node B
+
+
+def test_show_with_a_lost_master_key_creates_no_new_one(tmp_path):
+    sec = tmp_path / "secrets"
+    run("--secrets-dir", sec, "init")
+    (sec / ".master.key").unlink()
+    with pytest.raises(SystemExit, match="missing or empty"):
+        run("--secrets-dir", sec, "init", "--show")
+    assert not (sec / ".master.key").exists()

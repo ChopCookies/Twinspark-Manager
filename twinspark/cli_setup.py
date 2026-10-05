@@ -114,7 +114,8 @@ def _print_checks(con: Console, checks: list[dict[str, str]]) -> None:
 
 
 def _qsfp_step(args, con: Console, rep: hostprobe.HostReport, *, node_id: str, iface: Optional[str] = None,
-               host_number: Optional[int] = None, subnet: Optional[str] = None) -> bool:
+               host_number: Optional[int] = None, subnet: Optional[str] = None,
+               configured: Optional[str] = None) -> bool:
     """Offer to give both twins of the QSFP port an address (``tsm qsfp apply``). True if the network changed.
 
     The network is only touched when the person says yes here or passed ``--configure-qsfp``; ``--yes``
@@ -128,9 +129,10 @@ def _qsfp_step(args, con: Console, rep: hostprobe.HostReport, *, node_id: str, i
     if not any(p.cabled for p in d.ports) or (iface and d.port_of(iface) is None):
         return False                                      # no ConnectX link (single Spark, dev machine): nothing to do
     try:
-        plan = qsfp.plan_for_node(d, node_id, iface=iface, subnet=subnet, host_number=host_number, host=host)
+        plan = qsfp.plan_for_node(d, node_id, iface=iface, subnet=subnet, host_number=host_number, host=host,
+                                  configured=configured)
     except qsfp.QsfpError as exc:
-        con.say(f"  ! QSFP automation skipped: {exc}")
+        con.say(f"  ! QSFP automation skipped: {str(exc).replace('--iface', '--qsfp-iface')}")
         return False
     if not plan.entries:
         for w in plan.warnings:
@@ -324,7 +326,7 @@ def gather_agent(args, con: Console, rep: hostprobe.HostReport, a: Answers, info
         host_number = int(a.qsfp_ip.rsplit(".", 1)[1])
         subnet = a.qsfp_ip.rsplit(".", 1)[0] + ".0/24"
     if host_number is not None and _qsfp_step(args, con, rep, node_id="B", iface=args.qsfp_iface,
-                                              host_number=host_number, subnet=subnet):
+                                              host_number=host_number, subnet=subnet, configured=a.qsfp_iface):
         ifs = {i.name: i for i in rep.ifaces}
     mine = next((i for i in rep.ifaces if a.qsfp_ip and a.qsfp_ip in [x.split('/')[0] for x in i.ipv4]), None)
     if mine:
@@ -450,9 +452,8 @@ def cmd_setup(args, api=None):
 def _sandbox_note(con: Console, lay: Layout) -> None:
     if lay.sandbox:
         con.say(f"\n  [sandbox] Everything was written under {lay.root}; nothing on this machine changed.")
-        con.say("  The steps below are what a real install prints. To run this sandbox's services:")
-        cfg = lay.controller_yaml if lay.controller_yaml.exists() else lay.agent_yaml
-        con.say(f"       tsm serve {'controller' if cfg == lay.controller_yaml else 'agent'} --config {cfg}")
+        con.say("  It is there to inspect the generated files; the steps below are what a real install prints.")
+        con.say("  A complete local cluster to click through: tsm demo")
 
 
 def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None:

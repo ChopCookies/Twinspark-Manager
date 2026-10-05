@@ -123,6 +123,10 @@ def cmd_init(args, api=None):
         "agent_token", "management_api_key", "inference_api_key", "backend_api_key"]
     if args.show and not (args.agent_token or args.backend_api_key or args.hf_token):
         # --show only reads: pointed at the wrong directory it must not mint a fresh set of keys
+        key = vault.key_file
+        if any(vault.dir.glob("*.enc")) and not (key.exists() and key.stat().st_size):
+            raise SystemExit(f"{key} is missing or empty, so the secrets in {vault.dir} cannot be read "
+                             "(restore it from a backup; `sudo tsm setup` creates new secrets)")
         found = {s: vault.get(s) for s in slots}
         if not any(found.values()):
             raise SystemExit(f"no secrets in {vault.dir}: this is not an installed node, or the vault is "

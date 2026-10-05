@@ -75,7 +75,7 @@ def test_plan_json(fake, capsys):
 def test_plan_reports_blockers(fake, capsys):
     fake.default_dev = SECONDARY
     fake.ssh_clients = []
-    assert "cabled to your network" in run(fake, "plan", "--node", "A", expect="msg")
+    assert "default route" in run(fake, "plan", "--node", "A", expect="msg")
     out = run(fake, "plan", "--node", "A", "--iface", PRIMARY, capsys=capsys)
     assert "default route" in out and "Not safe to apply yet" in out
 

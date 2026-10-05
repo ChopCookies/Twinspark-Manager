@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -103,8 +104,14 @@ class DemoCluster:
         a.agent_port = self.agent_port
         pa = Provisioner(a, self.a_layout, systemd=False)
         pa.apply()
-        with self.a_layout.controller_yaml.open("a", encoding="utf-8") as f:
-            f.write("\n# tsm demo: the GUI notes that its commands are meant for real Sparks\ndemo: true\n")
+        cy = self.a_layout.controller_yaml
+        if not re.search(r"(?m)^demo: true$", cy.read_text(encoding="utf-8")):
+            with cy.open("a", encoding="utf-8") as f:
+                f.write("\n# tsm demo: the GUI notes that its commands are meant for real Sparks\ndemo: true\n")
+        # a reused --dir keeps its earlier config files (and their ports): report what will really listen
+        from .schemas.config import ControllerConfig, load_config
+        cfg = load_config(cy, ControllerConfig)
+        self.mgmt_port, self.gateway_port = cfg.listener.port, cfg.gateway_listener.port
         code = provision.make_join(a, pa.vault, pa.pubkey)
         info = provision.decode_join(code)
         b = Answers(role="agent", node_id="B", hostname="demo-b", qsfp_iface="lo",

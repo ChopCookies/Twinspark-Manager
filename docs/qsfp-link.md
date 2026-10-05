@@ -101,13 +101,14 @@ setup snippet told people to create exactly that name — it is left alone and T
 
 The machines are headless, so a wrong network change cannot be fixed with a keyboard. `apply`:
 
-1. **refuses a port that carries the default route** — on either of its twins, so the second half of a
-   QSFP port that is cabled to your network is never configured — and one that a remote session is
+1. **refuses the interface that carries the default route**, and an interface that a remote session is
    coming in through: SSH, or TwinSpark's Remote terminal (on node B that arrives over the link). It reads
    `SSH_CONNECTION` and the live connection table, because `sudo` usually drops the former; IPv6
    link-local sessions are matched by their interface. If the routing table cannot be read it stops
-   rather than guess. A port cabled to the network is never chosen automatically, and with two cabled
-   ports it asks for `--iface` instead of guessing;
+   rather than guess. A port whose *other* twin carries the default route looks like a QSFP uplink to
+   your network: it is never guessed, and is only configured when you name it with `--iface` (for
+   example when node B reaches the internet through node A over the link). With two cabled ports it
+   asks for `--iface` instead of guessing;
 2. **never edits a netplan file it did not write.** Its own file starts with the marker line
    `# Managed by TwinSpark (tsm qsfp)`; anything else is foreign. If a foreign file already configures
    one of the interfaces, the plan says so and stops — nothing is touched;

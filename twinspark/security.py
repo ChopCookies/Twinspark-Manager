@@ -92,9 +92,10 @@ class SecretsVault:
             return ""
         try:
             return self._f().decrypt(p.read_bytes()).decode()
-        except PermissionError:
-            raise PermissionError(f"cannot read the secret {p}: it belongs to another user (often root after "
-                                  f"a sudo command). Fix: sudo chown --reference={self.dir} {p}") from None
+        except PermissionError as exc:
+            bad = exc.filename or p                    # the secret itself, or the master key
+            raise PermissionError(f"cannot read {bad}: it belongs to another user (often root after a sudo "
+                                  f"command). Fix: sudo chown --reference={self.dir} {bad}") from None
 
     def ensure(self, name: str) -> tuple[str, bool]:
         """Return (value, created). Generates a random value if the slot is empty."""

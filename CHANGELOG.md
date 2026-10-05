@@ -13,11 +13,14 @@ pre-release review. The repository is MIT-licensed from this release on ([LICENS
   An unreadable secret now says how to fix it.
 - **`tsm init --show`** only reads. Pointed at a missing vault, it no longer creates new keys.
 - **`tsm qsfp` port choice:**
-  - A port whose twin carries the default route is never picked automatically, and the safety checks
-    cover the whole port, not only the interfaces being changed.
-  - Two cabled ports need `--iface` before anything is planned.
+  - A port whose twin carries the default route is not guessed: a QSFP uplink to a switch is never picked
+    when another port has a link, and planning on such a port needs `--iface` (or the interface setup
+    recorded). The default-route check then covers the whole port; sessions are checked on the twins that
+    change, so adding the second twin next to an SSH session on the first one still works.
+  - Two cabled ports need `--iface` before anything is planned (setup uses the interface from the join code).
+  - `status` no longer counts a network uplink as a second cable.
   - `revert --temporary` leaves the permanent layout alone.
-  - Remote-terminal sessions count like SSH sessions.
+  - Remote-terminal sessions count like SSH sessions (on the port set in agent.yaml).
 - **Request limits:** the gateway caps request bodies at 32 MiB while reading them. With
   `management_auth: none`, the management API only answers loopback host names, which stops DNS rebinding.
 - **Installer:** `install.sh` normalises `TSM_HOME` and refuses home and system directories. It marks its

@@ -47,8 +47,9 @@ is not in `ALLOWED_AGENT_ACTIONS`, and the agent refuses anything it does not im
 - The QSFP link is changed **only by a person running `sudo tsm qsfp apply` (or `revert`) on that machine**.
   No agent action, API route or GUI button can do it, and nothing runs as part of a service. It writes one
   root-owned netplan file (0600) that it recognises by a marker line, refuses to edit anyone else's, refuses
-  a port that carries the default route or your remote session (SSH or the Remote terminal), validates with
-  `netplan generate` and puts the previous file back if the addresses do not come up. `tsm qsfp scan --identify` uses key-only SSH
+  the interface that carries the default route or your remote session (SSH or the Remote terminal), does
+  not guess a port that looks cabled to your network, validates with `netplan generate` and puts the
+  previous file back if the addresses do not come up. `tsm qsfp scan --identify` uses key-only SSH
   (`BatchMode`), a validated user name and no password prompt. Details: [qsfp-link.md](qsfp-link.md).
 
 ## Known limits (deliberately not fixed yet)

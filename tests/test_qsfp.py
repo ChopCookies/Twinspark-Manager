@@ -215,8 +215,8 @@ def test_preflight_passes_on_a_clean_machine(node):
 
 def test_it_refuses_the_interface_with_the_default_route(node):
     node.default_dev = SECONDARY
-    with pytest.raises(qsfp.QsfpError, match="cabled to your network"):
-        plan_a(node)                                                 # never picked on its own
+    with pytest.raises(qsfp.QsfpError, match="also carries this machine's default route.*--iface"):
+        plan_a(node)                                                 # never guessed
     host, d, plan = plan_a(node, iface=PRIMARY)                      # named: the guard still stops it
     problems = qsfp.preflight(host, d, plan)
     assert any(SECONDARY in p and "default route" in p for p in problems)
@@ -243,12 +243,44 @@ def test_a_port_cabled_to_the_network_is_never_chosen_even_with_an_address(node)
     assert qsfp.choose_port(d).key == "f1np1"                        # status picks the same port
 
 
-def test_the_twin_of_a_network_port_is_not_configured_when_named(node):
+def test_the_twin_of_a_network_port_is_only_configured_when_named_and_with_a_warning(node):
     _second_port(node, uplink=True)
     host, d, plan = plan_a(node, iface="enP2p1s0f0np0")
-    assert any("enp1s0f0np0" in p and "default route" in p for p in qsfp.preflight(host, d, plan))
-    with pytest.raises(qsfp.QsfpError, match="default route"):
-        qsfp.apply(host, plan, d=d)
+    assert plan.named and any("enp1s0f0np0" in w and "default route" in w for w in plan.warnings)
+    assert qsfp.preflight(host, d, plan) == []                       # the person said this port; they were warned
+    plan.named = False                                               # a guessed port is refused
+    assert any("enp1s0f0np0" in p and "looks cabled to your network" in p for p in qsfp.preflight(host, d, plan))
+
+
+def test_node_b_reaching_the_internet_through_node_a_can_add_its_second_twin(node):
+    """The only port carries B's default route (via A); named by configuration, the second twin is added."""
+    node.ifaces[PRIMARY]["ips"] = ["192.168.100.2/24"]
+    node.write_netplan("50-mine.yaml", yaml.safe_dump({"network": {"version": 2, "ethernets": {PRIMARY: {}}}}))
+    node.default_dev = PRIMARY
+    node.sync()
+    with pytest.raises(qsfp.QsfpError, match="--iface"):
+        plan_a(node, "B")
+    host, d, plan = plan_a(node, "B", configured=PRIMARY)
+    assert [e.iface for e in plan.entries] == [SECONDARY] and plan.kept[0].startswith(PRIMARY)
+    assert qsfp.preflight(host, d, plan) == []
+
+
+def test_a_session_on_the_kept_twin_does_not_block_adding_the_other_one(node):
+    node.ifaces[PRIMARY]["ips"] = ["192.168.100.2/24"]
+    node.write_netplan("50-mine.yaml", yaml.safe_dump({"network": {"version": 2, "ethernets": {PRIMARY: {}}}}))
+    node.ssh_clients = ["192.168.100.1"]                             # logged in from node A over the kept twin
+    node.sync()
+    host = node.host(real=True)
+    d = qsfp.discover(host)
+    plan = qsfp.plan_for_node(d, "B", host=host)
+    assert [e.iface for e in plan.entries] == [SECONDARY]
+    assert qsfp.preflight(host, d, plan) == []
+
+
+def test_status_does_not_count_a_network_uplink_as_a_second_cable(node, monkeypatch):
+    _second_port(node, uplink=True)
+    by = checks_by_name(node)
+    assert "qsfp ports" not in by                                    # no "unplug the second cable" advice
 
 
 def test_two_spark_cables_need_iface_before_anything_is_planned(node):
@@ -574,6 +606,12 @@ def test_remote_terminal_sessions_count_as_sessions(node):
     assert qsfp.ssh_clients(host) == ["192.168.100.2"]
     ss = next(c for c in node.calls if c[0] == "ss")
     assert ":22" in ss and f":{qsfp.TERMINAL_PORT}" in ss and "or" in ss
+    agent = node.root / "etc/twinspark/agent.yaml"
+    agent.parent.mkdir(parents=True, exist_ok=True)
+    agent.write_text(yaml.safe_dump({"remote_mgmt": {"terminal_port": 9555}}))
+    node.calls.clear()
+    qsfp.ssh_clients(host)
+    assert ":9555" in next(c for c in node.calls if c[0] == "ss")      # the port this node's agent.yaml sets
 
 
 def test_temporary_in_a_sandbox_records_the_commands_without_running_them(node):

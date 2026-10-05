@@ -5,7 +5,7 @@ These are shipped (unmodified apart from the removed source-map comment, see bel
 | file | package | version | license |
 |---|---|---|---|
 | `xterm.js`, `xterm.css` | [@xterm/xterm](https://github.com/xtermjs/xterm.js) | 5.5.0 | MIT (`LICENSE-xterm.txt`) |
-| `addon-fit.js` | @xterm/addon-fit | 0.10.0 | MIT (same licence text) |
+| `addon-fit.js` | @xterm/addon-fit | 0.10.0 | MIT (same licence text; "Copyright (c) 2019, The xterm.js authors") |
 
 Only the source-map comment at the end of each file was removed (the maps are not shipped).
 To update: `npm pack @xterm/xterm@<v> @xterm/addon-fit@<v>` and copy `lib/*.js` and `css/xterm.css` here.

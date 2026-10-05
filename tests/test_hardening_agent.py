@@ -374,6 +374,21 @@ def test_an_unreadable_secret_says_how_to_fix_it(tmp_path, monkeypatch):
         vault.get("hf_token")
 
 
+def test_an_unreadable_master_key_is_named_in_the_error(tmp_path, monkeypatch):
+    SecretsVault(tmp_path / "s").set("hf_token", "hf_x")
+    vault = SecretsVault(tmp_path / "s")                            # fresh instance: the key is read again
+    real = Path.read_bytes
+
+    def denied(self):
+        if self.name == ".master.key":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    with pytest.raises(PermissionError, match=r"cannot read .*\.master\.key"):
+        vault.get("hf_token")
+
+
 def test_empty_master_key_left_by_a_crash_is_recreated_and_instances_agree(tmp_path):
     d = tmp_path / "s"
     d.mkdir()
