@@ -121,18 +121,32 @@ def cmd_init(args, api=None):
     vault = SecretsVault(args.secrets_dir)
     slots = ["agent_token"] if args.role == "agent" else [
         "agent_token", "management_api_key", "inference_api_key", "backend_api_key"]
+    if args.show and not (args.agent_token or args.backend_api_key or args.hf_token):
+        # --show only reads: pointed at the wrong directory it must not mint a fresh set of keys
+        key = vault.key_file
+        if any(vault.dir.glob("*.enc")) and not (key.exists() and key.stat().st_size):
+            raise SystemExit(f"{key} is missing or empty, so the secrets in {vault.dir} cannot be read "
+                             "(restore it from a backup; `sudo tsm setup` creates new secrets)")
+        found = {s: vault.get(s) for s in slots}
+        if not any(found.values()):
+            raise SystemExit(f"no secrets in {vault.dir}: this is not an installed node, or the vault is "
+                             "elsewhere (`tsm --secrets-dir DIR init --show`). `sudo tsm setup` creates it.")
+        for s, val in found.items():
+            print(f"{s:20} {val or '(not on this node)'}")
+        return
     if args.role == "agent" and args.agent_token:
         vault.set("agent_token", args.agent_token)
         slots = ["backend_api_key"]
         if args.backend_api_key:
             vault.set("backend_api_key", args.backend_api_key)
             slots = []
+    made = []
     for s in slots:
         val, created = vault.ensure(s)
+        made.append(created)
         print(f"{s:20} {'created' if created else 'exists '}  {val if args.show else '(hidden, use --show)'}")
-    if args.role == "controller":
-        print("\nOn node B run:  tsm init --role agent --agent-token <agent_token> "
-              "--backend-api-key <backend_api_key>   (tsm init --show prints them)")
+    if args.role == "controller" and any(made):
+        print("\nNode B gets the shared secrets through the join code: `sudo tsm join-code` prints it.")
     if args.hf_token:
         vault.set("hf_token", args.hf_token)
         print("hf_token             stored (set it on both nodes: the controller pins, the agents download)")
@@ -917,12 +931,13 @@ def build_parser() -> argparse.ArgumentParser:
         s.set_defaults(fn=fn)
         return s
 
-    s = cmd("init", cmd_init, "create secrets in the local vault")
+    s = cmd("init", cmd_init, "create (or --show) the secrets in the local vault")
     s.add_argument("--role", choices=["controller", "agent"], default="controller")
     s.add_argument("--agent-token")
     s.add_argument("--backend-api-key")
     s.add_argument("--hf-token")
-    s.add_argument("--show", action="store_true", help="print secret values")
+    s.add_argument("--show", action="store_true",
+                   help="print the secret values; on its own it only reads and never creates anything")
 
     s = cmd("serve", cmd_serve, "run a service (used by systemd)")
     s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
@@ -1038,9 +1053,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_remote, cli_setup
+    from . import cli_qsfp, cli_remote, cli_setup
     cli_setup.add_parsers(sub, cmd)
     cli_remote.add_parsers(sub, cmd)
+    cli_qsfp.add_parsers(sub, cmd)
     from . import demo
     demo.add_parsers(sub, cmd)
     return p

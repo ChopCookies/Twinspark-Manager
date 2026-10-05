@@ -27,6 +27,25 @@ _RETRYABLE_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.Poo
 _FAILOVER_STATUS = {503}
 
 
+# A request body is parsed in the controller process (which also serves the GUI), so it is bounded.
+# 32 MiB holds a prompt of about a million tokens or a few inline images.
+MAX_REQUEST_BYTES = 32 * 1024 ** 2
+
+
+async def _read_bounded(request: Request, limit: int) -> bytes | None:
+    """The request body, or None when it is (or turns out to be) larger than ``limit``."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class _ResponseLimitExceeded(httpx.ReadError):
     """The in-process compatibility proxy exceeded its upstream byte budget."""
 
@@ -44,7 +63,8 @@ def _model_entry(st: RouteState) -> dict:
     return entry
 
 
-def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None) -> Starlette:
+def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None,
+                      max_request_bytes: int = MAX_REQUEST_BYTES) -> Starlette:
     # Probes use a cap before their in-process ASGI transport can buffer a body.
     # Ordinary inference traffic keeps its existing streaming behavior.
     if max_response_bytes is not None and (isinstance(max_response_bytes, bool)
@@ -85,8 +105,12 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
             return _error(404, f"unsupported endpoint /v1/{path}", "not_found")
         if not gateway.check_key(request.headers.get("authorization")):
             return _error(401, "invalid api key", "invalid_api_key")
+        raw = await _read_bounded(request, max_request_bytes)
+        if raw is None:
+            return _error(413, f"request body larger than {max_request_bytes // 1024 ** 2} MiB",
+                          "invalid_request_error")
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             return _error(400, "request body must be JSON", "invalid_request_error")
         if not isinstance(body, dict):

@@ -1,3 +1,5 @@
+> **Historical note, in German.** Review of the 0.2 alpha build (September 2026): what was broken then and how 0.2 fixed it. Commands and file names in it are from that version; see the README and CHANGELOG for the current state.
+
 # Review der Alpha-Build → 0.2
 
 Kurzfassung: Die Architektur des Agents (Controller / typisierter Agent / Gateway, unveränderliche Revisionen, UMA-Planner) war richtig gedacht. In der gelieferten Form hätte das Programm aber nicht funktioniert: Es startet nicht, und hätte es gestartet, hätte jede Aktivierung „HEALTHY“ gemeldet, ohne einen Container zu starten. Unten stehen alle gefundenen Fehler, danach der Stand von 0.2 und was noch offen ist.

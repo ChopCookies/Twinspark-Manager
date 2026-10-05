@@ -156,7 +156,7 @@ class PrivClient:
         except (FileNotFoundError, ConnectionRefusedError, PermissionError) as exc:
             raise PrivdUnavailable(
                 f"tsm-privd is not reachable at {self.socket_path} ({type(exc).__name__}) — "
-                "install deploy/systemd/twinspark-privd.service") from exc
+                "start it with `sudo systemctl enable --now twinspark-privd` (installed by `tsm setup`)") from exc
         resp = json.loads(payload.decode() or "{}")
         if not resp.get("ok"):
             raise RuntimeError(resp.get("error", "privd error"))

@@ -1,13 +1,17 @@
 # TwinSpark — Optimal Dual DGX Spark Profiles
 
+> **Research note (2026-09).** This is the desk research that seeded the built-in recipes. It was
+> written before any run on real hardware. Model versions and figures may be out of date; the Cookbook
+> and `tsm fit` are the current source.
+>
 > **Target hardware:** 2 × NVIDIA DGX Spark (GB10 Blackwell, 128 GiB unified memory each,
 > ~273 GB/s, ~1000 TOPS FP4, ARM64, connected via QSFP).
-> **Rule from spec §3:** two Sparks are never a pooled 256 GiB pool — every config is
+> **Rule:** two Sparks are never a pooled 256 GiB pool — every config is
 > validated **per node** against a 128 GiB budget.
 > **Status:** research-grounded (figures from Hugging Face configs / safetensors indices and
 > verified deployment blogs). Precision figures are `VERIFIED` (source-lifted) or `ESTIMATED`
-> (math on top of a VERIFIED basis). Nothing here has been run on real Sparks — Phase 0
-> measurement required (see README).
+> (math on top of a VERIFIED basis). Nothing here had been run on real Sparks when it was
+> written — measure first (section 8).
 
 There are two independent levers on a dual-Spark rig:
 
@@ -627,4 +631,4 @@ Reederey87, Enntity, bird/DSv4-Flash-spark; eugr/spark-vllm-docker, jasl/vllm fo
 dspark image**; Spark Arena + Novita AI + Baseten benchmarks. All weight figures are the
 **published repo file sizes** (not estimates); all performance figures are **measured in the
 cited community set-ups**.
-Companion research file: `research/glm-mtp-research.md`.*
+Companion research file: [glm-mtp-research.md](glm-mtp-research.md).*

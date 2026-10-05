@@ -58,7 +58,8 @@ async def _local_image(ctrl: "Controller", ref: str, nodes: list[str]) -> dict[s
     name = split_image_ref(ref)[0] if not _LOCAL_ID.match(ref) else (
         (info.get("repo_tags") or ["local"])[0].split(":")[0])
     return {"image": name or "local", "digest": next(iter(ids.values())), "source": "local",
-            "versions": info.get("versions") or {}, "labels": info.get("labels") or {}}
+            "versions": info.get("versions") or {}, "labels": info.get("labels") or {},
+            "simulated": bool(info.get("simulated"))}
 
 
 async def _registry_image(ctrl: "Controller", ref: str, nodes: list[str]) -> dict[str, Any]:
@@ -142,6 +143,9 @@ async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
         notes.append("kept the previously pinned image")
     else:
         raise PinError("no image to pin — pass an image (registry ref) or a local image tag")
+    if img.get("simulated"):
+        notes.append(f"the image ID of local image {img['image']!r} is SIMULATED (the nodes are in dry-run, nothing "
+                     f"looked at Docker): fine for planning, but pin again after `tsm go-live` before activating")
     versions = img.get("versions") or {}
     # ---- extra models ------------------------------------------------------------
     extras = []

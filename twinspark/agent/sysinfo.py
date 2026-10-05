@@ -198,12 +198,33 @@ def rdma_devices(sysfs: str = "/sys/class/infiniband") -> list[dict[str, Any]]:
     return out
 
 
+# enp1s0f1np1 (first PCIe half) and enP2p1s0f1np1 (second half, PCI domain 2) are the twins of port f1np1
+TWIN_RE = re.compile(r"^en(?:P(?P<dom>\d+))?p(?P<bus>\d+)s(?P<slot>\d+)f(?P<fn>\d+)np(?P<port>\d+)$")
+
+
+def port_key(iface: str) -> Optional[str]:
+    """``enP2p1s0f1np1`` and ``enp1s0f1np1`` are the same physical QSFP port: both give ``f1np1``."""
+    m = TWIN_RE.match(iface or "")
+    return f"f{m.group('fn')}np{m.group('port')}" if m else None
+
+
+def _device_port_key(dev: dict[str, Any]) -> Optional[str]:
+    for nd in dev.get("netdevs") or []:
+        key = port_key(nd)
+        if key:
+            return key
+    return None
+
+
 def suggest_rdma(devices: list[dict[str, Any]], qsfp_ip: Optional[str],
                  prefix_len: int = 24) -> dict[str, Any]:
-    """Pick the HCAs + GID index NCCL should use for traffic to the peer subnet.
+    """Pick the HCAs + GID index NCCL should use for traffic to the peer.
 
-    A GB10 QSFP port appears as two RoCE devices (one per PCIe x4 half); both
-    carry a GID on the cabled subnet when netplan gives both netdevs an address.
+    A GB10 QSFP port appears as two RoCE devices (one per PCIe x4 half, ~100 Gb/s each). The layout
+    recommended by NVIDIA and by eugr/spark-vllm-docker gives each half its *own* /24, so the half that
+    does not carry ``qsfp_ip`` is on a different subnet. Every ACTIVE device on the same physical port as
+    a device that has an address in the ``qsfp_ip`` subnet is therefore taken, whatever subnet its own
+    address is in; ``tsm qsfp apply`` sets that layout up.
     """
     if not qsfp_ip:
         return {"hcas": [], "gid_index": None, "note": "qsfp_ip is not configured"}
@@ -211,22 +232,32 @@ def suggest_rdma(devices: list[dict[str, Any]], qsfp_ip: Optional[str],
         net = ipaddress.ip_network(f"{qsfp_ip}/{prefix_len}", strict=False)
     except ValueError:
         return {"hcas": [], "gid_index": None, "note": f"bad qsfp_ip {qsfp_ip!r}"}
-    hcas, idx = [], []
-    for d in devices:
-        if not d["active"]:
+    active = [d for d in devices if d["active"]]
+    in_net = {d["hca"]: [g for g in d["roce_v2_ipv4"] if ipaddress.ip_address(g["ipv4"]) in net] for d in active}
+    keys = {_device_port_key(d) for d in active if in_net[d["hca"]]} - {None}
+    hcas, idx, nets = [], [], []
+    for d in active:
+        hits = in_net[d["hca"]]
+        pick = hits[0] if hits else None
+        if pick is None and keys and _device_port_key(d) in keys and d["roce_v2_ipv4"]:
+            pick = d["roce_v2_ipv4"][0]               # the other twin: its address is on its own subnet
+        if pick is None:
             continue
-        hits = [g for g in d["roce_v2_ipv4"] if ipaddress.ip_address(g["ipv4"]) in net]
-        if hits:
-            hcas.append(d["hca"])
-            idx.append(hits[0]["index"])
+        hcas.append(d["hca"])
+        idx.append(pick["index"])
+        nets.append(ipaddress.ip_network(f"{pick['ipv4']}/{prefix_len}", strict=False))
     gid = idx[0] if idx and all(i == idx[0] for i in idx) else None
     note = ""
     if len(hcas) == 1:
-        note = ("only one RoCE device has an address on the QSFP subnet — NCCL tops out "
-                "around 100 Gb/s. Give the second PCIe half's netdev (enP2p1s0f*np*) an "
-                "address on the same subnet to reach ~200 Gb/s.")
+        note = ("only one RoCE device has an address — NCCL tops out around 100 Gb/s. Give the second PCIe "
+                "half's netdev (enP2p1s0f*np*) an address on its own subnet to reach ~200 Gb/s: "
+                "`sudo tsm qsfp apply` does this.")
     elif not hcas:
         note = "no ACTIVE RoCE v2 device with an address on the QSFP subnet"
     elif gid is None:
         note = "RoCE devices use different GID indices; NCCL_IB_GID_INDEX cannot cover both"
+    elif len(set(nets)) < len(nets):
+        note = ("both PCIe halves share one subnet. eugr/spark-vllm-docker and NVIDIA's playbook use a "
+                "different subnet per half (192.168.100.x and 192.168.101.x), because the kernel then "
+                "sends everything out of one of them. `sudo tsm qsfp plan` shows the layout.")
     return {"hcas": hcas, "gid_index": gid, "note": note}

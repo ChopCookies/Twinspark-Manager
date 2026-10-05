@@ -11,7 +11,7 @@ python3.12 -m venv .venv
 .venv/bin/pytest                    # all Python tests, including merged recipe / setup / remote workflows
 node --test tests/*.test.cjs         # all web-client tests, no browser needed
 .venv/bin/ruff check .
-python -m pip wheel --no-deps . --wheel-dir dist     # installable wheel incl. cookbook + web UI
+.venv/bin/pip wheel --no-deps . --wheel-dir dist    # installable wheel incl. cookbook + web UI
 ```
 
 On Windows (PowerShell):
@@ -61,9 +61,9 @@ if they drift.
 ## Web client
 
 ```bash
-python scripts/build_web.py          # src/ -> dist/ (vanilla assets, no bundler)
-python scripts/preview_web.py        # http://127.0.0.1:18744/ with an in-memory database
-python scripts/preview_web.py --demo-nodes   # labeled sample telemetry + a simulated maintenance run
+.venv/bin/python scripts/build_web.py          # src/ -> dist/ (vanilla assets, no bundler)
+.venv/bin/python scripts/preview_web.py        # http://127.0.0.1:18744/ with an in-memory database
+.venv/bin/python scripts/preview_web.py --demo-nodes   # labeled sample telemetry + a simulated maintenance run
 ```
 
 The preview serves the built `web/dist` assets: rebuild and refresh after editing `web/src`.
@@ -83,6 +83,12 @@ maintenance). When you fix a bug, add its test next to those. Pinning needs Hugg
 end-to-end activation tests (`tests/test_activation.py`) stub the resolver; real pinning and real
 containers are only exercised on site.
 
+`tests/qsfp_fakes.py` is a fake Spark for the QSFP code (`tsm qsfp`, the setup step, `node doctor`): a
+`/sys` tree built from a small state table, and `ip`, `ss`, `ping` and `netplan` answered from that state —
+`netplan apply` really reads the YAML under the scratch root and turns it into addresses, and can be told to
+fail, so rollback is tested end to end. Use it for any new network feature; never run `netplan` or `ip addr`
+for real in a test.
+
 ## On-site checklist (first contact with real hardware)
 
 1. Install with the default dry-run mode; `tsm plan …` and compare with the command you run by
@@ -91,3 +97,6 @@ containers are only exercised on site.
 3. Maintenance window: stop the hand-started vLLM, `sudo tsm go-live` on both nodes, activate a
    small `single-a` profile first, then `tp2`.
 4. Register real model specs (or pin, which resolves them) so the memory fit check runs before every switch.
+5. QSFP link (never run on real Sparks yet): on each node `tsm qsfp status`, `tsm qsfp plan --node A|B`, then
+   `sudo tsm qsfp apply --temporary`, `tsm qsfp verify`, and only then the permanent `sudo tsm qsfp apply`.
+   Run it from the management network, not over the QSFP link. [docs/qsfp-link.md](qsfp-link.md)

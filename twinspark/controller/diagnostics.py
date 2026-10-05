@@ -84,7 +84,7 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
     for n, f in facts.items():
         if f.get("runtime_mode") == "dry-run":
             _check(res, "runtime mode", n, "warn", "dry-run — activations simulate everything",
-                   "set runtime_mode: docker in agent.yaml once `tsm plan` looks right")
+                   f"once `tsm plan` matches what you run by hand: `sudo tsm go-live` on node {n}")
         d = f.get("docker")
         if d is not None:
             _check(res, "docker", n, "pass" if d.get("ok") else "fail",
@@ -101,7 +101,8 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
         _check(res, "privd", n, "pass" if f.get("privd_available") else "warn",
                "reachable" if f.get("privd_available") else "not reachable — page cache cannot be "
                "dropped before launch, headless mode cannot be switched",
-               "" if f.get("privd_available") else "install deploy/systemd/twinspark-privd.service")
+               "" if f.get("privd_available") else f"on node {n}: `sudo systemctl enable --now twinspark-privd` "
+               "(installed by `tsm setup`; re-run `sudo tsm setup` if the unit is missing)")
         free = f.get("disk_free_gib") or 0
         _check(res, "disk", n, "pass" if free > 250 else ("warn" if free > 50 else "fail"),
                f"{free:.0f} GiB free in {f.get('hf_cache_dir')}",
@@ -142,7 +143,9 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
                 if not r["configured"]["rdma_hcas"]:
                     _check(res, "rdma config", n, "fail",
                            "nodes.%s.rdma_hcas is empty — NCCL uses TCP sockets" % n,
-                           f"set in controller.yaml under nodes.{n}:\n{r['yaml']}")
+                           (f"`sudo tsm rdma --apply && sudo systemctl restart twinspark-controller` "
+                            f"(sets in controller.yaml under nodes.{n}:\n{r['yaml']})") if sug.get("hcas") else
+                           "no RoCE device was found: check the QSFP link with `tsm qsfp status` on that node")
                 elif not r["matches_config"]:
                     _check(res, "rdma config", n, "warn",
                            f"configured {r['configured']} but discovered {sug['hcas']} "

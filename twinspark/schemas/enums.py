@@ -99,7 +99,7 @@ class JobState(str, Enum):
 
 
 class VerificationStatus(str, Enum):
-    VERIFIED = "verified"          # ran on this rig (known-good revision)
+    VERIFIED = "verified"          # ran on the maintainers' two DGX Sparks (see the recipe's source note)
     COMMUNITY = "community"        # published, measured dual-Spark recipe
     EXPERIMENTAL = "experimental"  # derived / untested
 

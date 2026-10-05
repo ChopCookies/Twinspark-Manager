@@ -88,7 +88,7 @@ class Mount(BaseModel):
         # Local Windows plans/dry-run agents use native cache paths. Spark agents
         # validate this same schema on Linux and continue to accept POSIX hosts only.
         # The drive prefix is the only permitted colon; UNC/device paths are excluded.
-        # Windows may expose a user's temp directory through an 8.3 name such as DANNYG~1.
+        # Windows may expose a user's temp directory through an 8.3 name such as SPARKU~1.
         if os.name == "nt" and _WINDOWS_MOUNT_PATH_RE.fullmatch(v):
             parts = re.split(r"[/\\]+", v[3:])
             if ".." not in parts and any(part not in ("", ".") for part in parts):
@@ -274,7 +274,7 @@ class LaunchPlanner:
         adv = rev.draft.advanced
         backend = self.resolve_backend(rev)
         notes: list[str] = [
-            "Verify every flag against the pinned image once (Phase 0): vLLM CLI flags "
+            "Verify every flag against the pinned image once before the first activation: vLLM CLI flags "
             "change between releases.",
         ]
 

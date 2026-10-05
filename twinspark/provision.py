@@ -421,12 +421,6 @@ def installed_terminal_unit(lay: Layout) -> str:
     return render_terminal_unit(SimpleNamespace(service_user=m.group(1)), lay)       # type: ignore[arg-type]
 
 
-def netplan_snippet(iface: str, ip: str, prefix: int = 24) -> str:
-    return (f"# /etc/netplan/60-twinspark-qsfp.yaml   (apply with: sudo netplan apply)\n"
-            f"network:\n  version: 2\n  ethernets:\n    {iface}:\n"
-            f"      dhcp4: false\n      addresses: [{ip}/{prefix}]\n      mtu: 9000\n")
-
-
 # ---- editing generated files in place ----------------------------------------------------------
 def set_runtime_mode(path: Path, mode: str) -> bool:
     """Flip ``runtime_mode`` keeping comments. Returns True if the file changed."""

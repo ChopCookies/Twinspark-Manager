@@ -176,6 +176,7 @@ async def test_pin_local_image_then_activate_needs_mods(cluster, monkeypatch):
     rev = res["revision"]
     assert rev["identity"]["image_source"] == "local"
     assert rev["identity"]["image_digest"].startswith("sha256:")
+    assert any("SIMULATED" in n and "tsm go-live" in n for n in res["notes"])   # dry-run never saw Docker
     assert rev["identity"]["model_revision"] == SHA and calls == [
         "deepseek-ai/DeepSeek-V4-Flash-0731@main"]
     assert c.model_spec("deepseek-ai/DeepSeek-V4-Flash-0731").weight_bytes == 20 * 1024**3
@@ -446,14 +447,31 @@ def _fake_sysfs(root: Path, dev: str, ndev: str, ip_hex: str, active=True):
 
 
 def test_rdma_discovery_suggests_both_pcie_halves(tmp_path):
+    # the layout NVIDIA and eugr/spark-vllm-docker recommend: one /24 per PCIe half
     _fake_sysfs(tmp_path, "rocep1s0f1", "enp1s0f1np1", "c0a8:6401")        # 192.168.100.1
-    _fake_sysfs(tmp_path, "roceP2p1s0f1", "enP2p1s0f1np1", "c0a8:6403")    # 192.168.100.3
+    _fake_sysfs(tmp_path, "roceP2p1s0f1", "enP2p1s0f1np1", "c0a8:6501")    # 192.168.101.1
     _fake_sysfs(tmp_path, "rocep1s0f0", "enp1s0f0np0", "0a00:0001", active=False)
     devs = rdma_devices(str(tmp_path))
     sug = suggest_rdma(devs, "192.168.100.1")
     assert sug == {"hcas": ["roceP2p1s0f1", "rocep1s0f1"], "gid_index": 3, "note": ""}
     one = suggest_rdma([d for d in devs if d["hca"] == "rocep1s0f1"], "192.168.100.1")
-    assert "100 Gb/s" in one["note"]
+    assert "100 Gb/s" in one["note"] and "tsm qsfp apply" in one["note"]
+
+
+def test_rdma_discovery_warns_when_both_halves_share_one_subnet(tmp_path):
+    _fake_sysfs(tmp_path, "rocep1s0f1", "enp1s0f1np1", "c0a8:6401")        # 192.168.100.1
+    _fake_sysfs(tmp_path, "roceP2p1s0f1", "enP2p1s0f1np1", "c0a8:6403")    # 192.168.100.3
+    sug = suggest_rdma(rdma_devices(str(tmp_path)), "192.168.100.1")
+    assert sug["hcas"] == ["roceP2p1s0f1", "rocep1s0f1"] and sug["gid_index"] == 3
+    assert "share one subnet" in sug["note"] and "tsm qsfp plan" in sug["note"]
+
+
+def test_rdma_discovery_ignores_other_ports_and_foreign_subnets(tmp_path):
+    _fake_sysfs(tmp_path, "rocep1s0f1", "enp1s0f1np1", "c0a8:6401")        # the cabled port, 192.168.100.1
+    _fake_sysfs(tmp_path, "rocep1s0f0", "enp1s0f0np0", "0a00:0032")        # ACTIVE other port, 10.0.0.50
+    sug = suggest_rdma(rdma_devices(str(tmp_path)), "192.168.100.1")
+    assert sug["hcas"] == ["rocep1s0f1"]                                  # the other port is not "the twin"
+    assert suggest_rdma(rdma_devices(str(tmp_path)), "172.16.0.1")["hcas"] == []
 
 
 def test_parse_ib_write_bw():

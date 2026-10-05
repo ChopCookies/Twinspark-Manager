@@ -1,20 +1,20 @@
 {
-  "title": "DeepSeek V4 Flash 0731 — B12X + DSpark (your proven setup)",
+  "title": "DeepSeek V4 Flash 0731 — B12X + DSpark (eugr recipe)",
   "url": "https://github.com/eugr/spark-vllm-docker/blob/main/recipes/deepseek-v4-flash-0731.yaml",
-  "author": "eugr/spark-vllm-docker (captured from this rig on 2026-09-28)",
+  "author": "eugr/spark-vllm-docker (MIT licence) — snapshot of 2026-09-28, run by the TwinSpark maintainers",
   "verification": "verified",
   "measured": {
-    "context": "max-model-len auto → 1,048,576 tokens on this rig",
+    "context": "max-model-len auto → 1,048,576 tokens on two DGX Sparks",
     "speculation": "DSpark, 5 tokens, probabilistic drafting",
     "gpu_memory_utilization": "0.85"
   },
   "requirements": [
-    "Local image vllm-node-b12x on BOTH nodes — already built on this rig (spark-vllm-docker build-and-copy.sh with --exp-b12x). Pin uses the local image ID and checks it is identical on both nodes.",
-    "Mod instanttensor-hybrid-draft-loader on both nodes: `tsm mods import-eugr ~/spark-vllm-docker/mods --only instanttensor-hybrid-draft-loader`.",
-    "Weights deepseek-ai/DeepSeek-V4-Flash-0731 (~155 GiB) — already in your HF cache on both nodes."
+    "Local image vllm-node-b12x on BOTH nodes, built with eugr/spark-vllm-docker (`./build-and-copy.sh --exp-b12x` builds it and copies it to the other node). Pin uses the local image ID and checks it is identical on both nodes.",
+    "Mod instanttensor-hybrid-draft-loader on both nodes: `tsm mods import-eugr <your spark-vllm-docker checkout>/mods --only instanttensor-hybrid-draft-loader`.",
+    "Weights deepseek-ai/DeepSeek-V4-Flash-0731 (~155 GiB) on both nodes: staged on the first activation, or reused from your Hugging Face cache."
   ],
   "notes": [
-    "This is byte-for-byte the recipe the running deployment was started with; TwinSpark only replaces host/port wiring and adds NCCL/RoCE env from controller.yaml.",
-    "Stop the eugr-launched vllm_node containers before the first TwinSpark activation (Diagnostics → foreign containers)."
+    "The recipe text is eugr's, as published on 2026-09-28 (it has changed upstream since; import the current one from the Cookbook's community recipes). TwinSpark only replaces the host/port wiring and adds the NCCL/RoCE settings from controller.yaml.",
+    "If the model was started with eugr's launcher before, stop its vllm_node containers before the first TwinSpark activation (Diagnostics → foreign containers)."
   ]
 }

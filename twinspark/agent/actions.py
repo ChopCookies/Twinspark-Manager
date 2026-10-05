@@ -235,7 +235,10 @@ class AgentActions:
             raise ActionError("image_ref must be pinned by digest")
         if self.runtime.image_present(ref):
             return {"present": True, "pulled": False}
-        if ref.startswith("sha256:") or not self.rt.allow_image_pull:
+        if ref.startswith("sha256:"):
+            raise ActionError(f"local image {ref} is not on this node. Build or copy it here; if the profile was "
+                              f"pinned while the nodes were in dry-run, its image ID was simulated: pin it again")
+        if not self.rt.allow_image_pull:
             raise ActionError(f"image is not cached and pulling is disabled: {ref}")
         self.runtime.pull(ref)
         return {"present": True, "pulled": True}

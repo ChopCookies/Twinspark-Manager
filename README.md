@@ -4,10 +4,11 @@ One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA
 (GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
 and keep the machines headless.
 
-> **Status: alpha (0.4.1).** The control path is covered by automated tests, and real Docker
-> activation, chat, streaming and shutdown passed on DGX Spark with a 135M model (single node
-> and two-node PP2) on 2026-09-28 — see [small-model development](SMALL-MODEL-DEVELOPMENT.md).
-> Large-model activation and other topologies still need on-site validation, which is why a
+> **Status: alpha (0.5.0).** The control path is covered by automated tests (about 900). Real Docker
+> activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
+> and two-node PP2) on 2026-09-28, at the code of that day — see the
+> [validation note](docs/notes/small-model-validation-2026-09-28.md). Large models, other topologies
+> and the newer features (remote management, `tsm qsfp`) still need on-site validation, which is why a
 > new install starts in **dry-run** (nothing is run on your machines) until you say otherwise.
 
 ---
@@ -21,13 +22,18 @@ python3.12 -m venv .venv && .venv/bin/pip install -e .
 ```
 
 `tsm demo` starts two simulated Sparks, the controller, the gateway and the web GUI on this
-machine (real HTTP between them, containers simulated) and prints the URL and key. Click
-through the Cookbook, pin a recipe, press *Plan*. Ctrl-C removes everything.
+machine (real HTTP between them, containers simulated) and prints the URL, the keys and a line that
+points the CLI at it. Open a profile and press *Plan*, browse the Cookbook; pinning a recipe looks up
+the model and image online, so it needs internet access. Ctrl-C removes everything.
+
+Linux and Windows (use `.venv\Scripts\tsm`) work as they are. On macOS the simulated node B needs a
+second loopback address first: `sudo ifconfig lo0 alias 127.0.0.2 up`.
 
 ## Install on your two Sparks (about 10 minutes)
 
 You need: both Sparks cabled QSFP-to-QSFP, Docker (ships with DGX OS), Python 3.12+ (Ubuntu 24.04
-has it), and a user with `sudo`. Setup never changes your network configuration.
+has it), and a user with `sudo`. Setup does not change your network configuration unless you say so
+(see the QSFP step below).
 
 **1. Node A** (the machine that will host the controller and the OpenAI endpoint):
 
@@ -41,7 +47,7 @@ detects almost everything and only asks what it cannot know:
 
 | Step | What it does for you |
 |---|---|
-| QSFP link | finds the cabled interface, its address and RoCE devices; prints a netplan snippet if the link has no address yet |
+| QSFP link | finds the cabled interface, its addresses and both RoCE devices; if the link has no (or only one) address it shows the two-subnet plan and **asks** before writing any netplan file — [`tsm qsfp`](docs/qsfp-link.md) |
 | Who / where | reuses your existing Hugging Face cache (`~/.cache/huggingface`) and runs as your user, so your docker group and SSH setup just work |
 | Reach the GUI | `localhost` + SSH tunnel by default; offers your Tailscale address if it sees one |
 | Ports | moves to a free port if `8000` / `8100` are taken by a hand-started vLLM |
@@ -57,7 +63,8 @@ git clone https://github.com/ChopCookies/Twinspark-Manager && cd Twinspark-Manag
 sudo ./install.sh --join tsm1.…
 ```
 
-Lost the line? `sudo tsm join-code` on node A prints it again.
+Lost the line? `sudo tsm join-code` on node A prints it again. To keep the code out of the process
+list and your shell history, use `--join -` and paste it at the prompt.
 
 **3. Open the GUI.** From your laptop: `ssh -L 8443:localhost:8443 you@node-a`, browse to
 <http://localhost:8443/> and paste the management key (`tsm init --show` prints it again).
@@ -66,12 +73,18 @@ The **Get started** page checks both nodes and shows the next step with the exac
 **4. Run a model.**
 
 ```bash
-tsm cookbook list                      # built-in dual-Spark recipes
-tsm cookbook import deepseek-v4-flash-0731-b12x
-tsm pin deepseek-v4-flash-0731-b12x    # freezes the model commit + image digest
-tsm plan  deepseek-v4-flash-0731-b12x  # the exact docker/vllm commands for A and B, nothing started
-tsm activate deepseek-v4-flash-0731-b12x
+tsm cookbook list                          # built-in dual-Spark recipes
+tsm cookbook show glm-5.3-flash-nvfp4-tp2  # what it needs: image, weights, mods
+tsm cookbook import glm-5.3-flash-nvfp4-tp2
+tsm pin glm-5.3-flash-nvfp4-tp2            # freezes the model commit + image digest (needs Hub + registry access)
+tsm plan glm-5.3-flash-nvfp4-tp2           # the exact docker/vllm commands for A and B, nothing started
+tsm activate glm-5.3-flash-nvfp4-tp2       # downloads the weights once, copies them to B over QSFP, starts
 ```
+
+Each recipe lists what it needs. Some use a public image that pinning resolves and activation pulls (the
+GLM example above, about 184 GiB of weights). Others, such as `deepseek-v4-flash-0731-b12x`, run on a
+vLLM image you build yourself with [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker);
+`tsm cookbook show` says how.
 
 Clients use `http://node-a:8000/v1`, model `default`, with the `inference_api_key`
 (`tsm init --show`).
@@ -84,7 +97,9 @@ matches, stop any hand-started vLLM (`tsm foreign ls`) and on **each** node run:
 sudo tsm go-live        # runtime_mode: docker + restarts the agent;  `--revert` goes back
 ```
 
-Start with a small `single-a` profile, then your large model. `tsm doctor` checks everything
+Start small: the `smollm2-135m-smoke` recipe (260 MiB) checks the whole path in a minute. Import it and
+pin it with the image of the recipe you plan to run (`tsm cookbook import smollm2-135m-smoke`, then
+`tsm pin smollm2-135m-smoke --image <image>`). `tsm doctor` checks everything
 a fast, stable dual-Spark setup needs (driver parity, RDMA, headless, privd, SSH, disk).
 
 ### Unattended / scripted
@@ -92,7 +107,7 @@ a fast, stable dual-Spark setup needs (driver parity, RDMA, headless, privd, SSH
 ```bash
 sudo ./install.sh --yes --qsfp-iface enp1s0f1np1 --qsfp-ip 192.168.100.1 --runtime-mode dry-run
 sudo tsm setup --dry          # show what would be written, change nothing
-sudo tsm setup --root /tmp/stage --yes --no-start      # build a complete install in a scratch directory
+tsm setup --root /tmp/stage --yes --no-start           # build a complete install in a scratch directory (no root needed)
 ```
 
 `tsm setup --help` lists every flag. Re-running setup is safe: existing config files are kept
@@ -148,7 +163,9 @@ sudo tsm setup --root /tmp/stage --yes --no-start      # build a complete instal
   and a hand-started vLLM is never touched.
 - **`tsm-privd`** is a tiny root helper over a Unix socket with an allowlist (drop page cache,
   headless switch, maintenance).
-- Secrets live in an encrypted vault; configs contain none.
+- Secrets live in the vault (encrypted files, mode 0600, owned by the service user); configs contain none.
+- The service user is in the `docker` group, which makes it root-equivalent on that machine — keep the
+  management key as safe as a root password. See [docs/security.md](docs/security.md).
 
 | Port | Where | Purpose |
 |---|---|---|
@@ -174,10 +191,31 @@ tsm logs                       # container logs of the active deployment on both
 tsm headless headless-max --now    # stop the desktop session, free its memory
 tsm link --mode rdma           # QSFP / NCCL link test
 tsm rdma --apply               # write discovered RoCE devices into controller.yaml
+tsm qsfp status                # QSFP link on THIS node: both twins, addresses, MTU, RoCE (docs/qsfp-link.md)
 tsm stop                       # drain and stop the active model
 ```
 
 Everything in the GUI is the same API the CLI uses; `tsm --help` lists all commands.
+
+### The QSFP link (both interfaces, ~200 Gb/s)
+
+Each QSFP port is fed by two PCIe halves — two interfaces, two RoCE devices — and NCCL only reaches
+~200 Gb/s when both have an address, on **separate subnets** (the layout NVIDIA's playbook and
+[eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) use). `tsm qsfp` sets that up
+without the controller and without risking the management network:
+
+```bash
+tsm qsfp plan --node A                    # what would change; writes nothing
+sudo tsm qsfp apply --node A --temporary  # try it: addresses only until the next reboot
+tsm qsfp verify                           # ping the other Spark through each twin, jumbo frames
+sudo tsm qsfp apply --node A              # make it permanent (netplan; `sudo tsm qsfp revert` undoes it)
+```
+
+It refuses the interface that carries the default route or your remote session, never edits a netplan
+file it did not write, validates with `netplan generate`, and puts the old settings back if the
+addresses do not come up. `tsm setup` offers the same step (answer *no* by default; `--configure-qsfp`
+does it unattended) and `tsm node doctor` reports the link. Details and the honest status — tested
+against a fake machine, not yet on real Sparks — are in [docs/qsfp-link.md](docs/qsfp-link.md).
 
 ### When a node misbehaves (headless)
 
@@ -201,6 +239,7 @@ switch it on, on that node.
 | `cannot reach the controller` | `systemctl status twinspark-controller`; from a laptop you need the SSH tunnel (`ssh -L 8443:localhost:8443 …`) |
 | GUI says *invalid management key* | `tsm init --show` on node A prints it |
 | Node B "unreachable" on Get started | `journalctl -u twinspark-agent` on B. `401` = token mismatch: re-run `sudo tsm join-code` on A and `sudo tsm setup --join …` on B. Otherwise check B's QSFP address (`ip -br addr`) |
+| NCCL tops out near 100 Gb/s | only one QSFP interface has an address: `tsm qsfp status`, then `sudo tsm qsfp apply` (see [docs/qsfp-link.md](docs/qsfp-link.md)) |
 | `rdma_hcas is empty` / NCCL falls back to TCP | `sudo tsm rdma --apply && sudo systemctl restart twinspark-controller` |
 | `permission denied … docker.sock` | the service user needs the docker group: `sudo usermod -aG docker <user>` and restart the agent |
 | `port 8000 / 8100 already in use` | a hand-started vLLM is running: `tsm foreign ls` / `tsm foreign stop`, or let setup pick other ports |
@@ -226,10 +265,20 @@ Update both nodes (the Get started page warns when versions differ).
 - [Agent clients and evaluation harnesses](docs/agent-integrations.md)
 - [Monitoring and coordinated maintenance](docs/maintenance.md)
 - [Remote management: terminal, logs, power, Wake-on-LAN, network boot](docs/remote-management.md)
+- [The QSFP link: both interfaces, addresses, MTU, verification](docs/qsfp-link.md)
 - [Development, testing and the demo harness](docs/development.md)
-- [Security model and known limits](docs/security.md)
-- [Changelog](CHANGELOG.md) · [Review notes](REVIEW.md) · [Researched profiles](OPTIMAL-PROFILES.md)
-- [Two-node DeepSeek startup commands](DEEPSEEK-TWO-NODE-STARTUP.md) · [Small-model validation](SMALL-MODEL-DEVELOPMENT.md)
+- [Security model and known limits](docs/security.md) · [Reporting a vulnerability](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+- [Field notes and research](docs/notes/): the first hardware validation, a DeepSeek launch with eugr's
+  launcher, the research behind the built-in profiles
 
 **Not in this alpha:** mTLS between nodes (bearer token over the direct QSFP link for now),
 web OAuth / multi-user (single management key).
+
+## Licence and credits
+
+MIT — see [LICENSE](LICENSE). The bundled DeepSeek recipe is eugr's (MIT) and the GUI ships xterm.js
+(MIT); notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The recipe format, the
+two-subnet QSFP layout and much of what TwinSpark knows about running vLLM on two Sparks come from
+[eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker), NVIDIA's DGX Spark playbooks and
+the community recipe authors credited in each built-in recipe.

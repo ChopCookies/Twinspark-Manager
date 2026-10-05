@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -17,11 +18,12 @@ from typing import Any, Callable, Optional
 import httpx
 import yaml
 
-from . import __version__, hostprobe, provision
+from . import __version__, hostprobe, provision, qsfp
 from .agent import sysinfo
 from .provision import Answers, Layout, Provisioner, SetupError
 
 _ICON = {"pass": "✓", "info": "·", "warn": "!", "fail": "✗"}
+_IPV4 = re.compile(r"\d{1,3}(\.\d{1,3}){3}")
 
 
 class Console:
@@ -111,6 +113,74 @@ def _print_checks(con: Console, checks: list[dict[str, str]]) -> None:
                 con.say(f"    → {line}")
 
 
+def _qsfp_step(args, con: Console, rep: hostprobe.HostReport, *, node_id: str, iface: Optional[str] = None,
+               host_number: Optional[int] = None, subnet: Optional[str] = None,
+               configured: Optional[str] = None) -> bool:
+    """Offer to give both twins of the QSFP port an address (``tsm qsfp apply``). True if the network changed.
+
+    The network is only touched when the person says yes here or passed ``--configure-qsfp``; ``--yes``
+    alone never does it. Anything unsafe (the management interface, a netplan file TwinSpark did not write)
+    is reported and skipped; setup carries on either way.
+    """
+    lay = Layout(Path(args.root))
+    host = qsfp.Host(root=lay.root, sysfs=lay.root)
+    d = qsfp.discover(host, ifaces=rep.ifaces, rdma=rep.rdma, routes=rep.default_routes,
+                      routes_known=rep.routes_known)
+    if not any(p.cabled for p in d.ports) or (iface and d.port_of(iface) is None):
+        return False                                      # no ConnectX link (single Spark, dev machine): nothing to do
+    try:
+        plan = qsfp.plan_for_node(d, node_id, iface=iface, subnet=subnet, host_number=host_number, host=host,
+                                  configured=configured)
+    except qsfp.QsfpError as exc:
+        con.say(f"  ! QSFP automation skipped: {str(exc).replace('--iface', '--qsfp-iface')}")
+        return False
+    if not plan.entries:
+        for w in plan.warnings:
+            con.say(f"  ! {w}")
+        return False
+    if qsfp.is_current(host, d, plan):
+        return False                                      # applied earlier (e.g. a second run of setup)
+    problems = qsfp.preflight(host, d, plan, need_root=False)
+    con.say(f"  Port {plan.port} has two interfaces (two PCIe halves). NCCL only reaches ~200 Gb/s with an address on")
+    con.say("  each, on separate subnets — the layout NVIDIA and eugr/spark-vllm-docker use:")
+    for e in plan.entries:
+        con.say(f"    {e.iface:15} {e.cidr}   mtu {plan.mtu}")
+    for k in plan.kept:
+        con.say(f"    {k.split()[0]:15} {k.split()[1]}   (already set up; left alone)")
+    for w in plan.warnings:
+        con.say(f"  ! {w}")
+    for p in problems:
+        con.say(f"  ✗ {p}")
+    if problems:
+        con.say("    Not changing the network. Fix that, then run `sudo tsm qsfp apply`.")
+        return False
+    if args.dry:
+        con.say("  (dry run: the network is not changed)")
+        return False
+    if args.configure_qsfp:
+        go = True
+    elif con.yes:
+        con.say("  → not changing the network unattended (add --configure-qsfp, or run `sudo tsm qsfp apply` later)")
+        go = False
+    else:
+        go = con.confirm(f"Write {plan.path} and apply it now? (the management network is not touched)", False)
+    if not go:
+        con.say(f"  Later: sudo tsm qsfp apply --node {node_id}      (preview: tsm qsfp plan)")
+        return False
+    try:
+        res = qsfp.apply(host, plan, d=d)
+    except qsfp.QsfpError as exc:
+        con.say(f"  ✗ {exc}")
+        con.say("    The previous network settings are untouched; setup continues without this.")
+        return False
+    con.say(f"  ✓ {res['message']}" + ("   (undo: sudo tsm qsfp revert)" if res.get("changed") else ""))
+    if not lay.sandbox:
+        fresh = hostprobe.probe_host(user=args.service_user or hostprobe.default_service_user())
+        rep.ifaces, rep.rdma = fresh.ifaces, fresh.rdma
+        rep.default_routes, rep.routes_known = fresh.default_routes, fresh.routes_known
+    return bool(res.get("changed"))
+
+
 def gather_controller(args, con: Console, rep: hostprobe.HostReport, a: Answers) -> None:
     """Questions for node A (or a single machine)."""
     real = [i for i in rep.ifaces if not i.virtual]
@@ -127,6 +197,8 @@ def gather_controller(args, con: Console, rep: hostprobe.HostReport, a: Answers)
     else:
         iface = None
         a.qsfp_iface = con.ask("QSFP interface name", "enp1s0f1np1")
+    if a.role != "single" and _qsfp_step(args, con, rep, node_id="A", iface=a.qsfp_iface):
+        iface = next((i for i in rep.ifaces if i.name == a.qsfp_iface), iface)
     a.qsfp_ip = args.qsfp_ip or (iface.addr if iface and iface.addr else None)
     if a.role == "single":
         a.qsfp_ip = a.qsfp_ip or "127.0.0.1"
@@ -134,9 +206,7 @@ def gather_controller(args, con: Console, rep: hostprobe.HostReport, a: Answers)
         if not a.qsfp_ip:
             a.qsfp_ip = con.ask("This node's address on the QSFP link", "192.168.100.1")
             con.say("    ! that interface has no IPv4 address yet; setup does NOT change your network.")
-            con.say("      Put this in a netplan file and apply it yourself:")
-            for line in provision.netplan_snippet(a.qsfp_iface or "enp1s0f1np1", a.qsfp_ip).splitlines():
-                con.say(f"        {line}")
+            con.say("      Plug the cable into the same port on both Sparks, then run: sudo tsm qsfp apply --node A")
         else:
             con.say(f"  This node: {a.qsfp_ip}")
         a.peer_ip = args.peer_ip or con.ask("Other Spark's address on the link",
@@ -247,6 +317,17 @@ def gather_agent(args, con: Console, rep: hostprobe.HostReport, a: Answers, info
     provision.apply_join(a, info)
     con.say(f"  This node: {a.qsfp_ip}   Node A: {a.peer_ip}   runtime: {a.runtime_mode}")
     ifs = {i.name: i for i in rep.ifaces}
+    host_number = subnet = None
+    on_secondary = bool(a.qsfp_iface and (m := sysinfo.TWIN_RE.match(a.qsfp_iface)) and m.group("dom"))
+    if on_secondary:
+        con.say("  ! the join code's address sits on the second interface of the port; the QSFP step is skipped "
+                "here (run `sudo tsm qsfp apply --node B` yourself)")
+    elif a.qsfp_ip and _IPV4.fullmatch(a.qsfp_ip):
+        host_number = int(a.qsfp_ip.rsplit(".", 1)[1])
+        subnet = a.qsfp_ip.rsplit(".", 1)[0] + ".0/24"
+    if host_number is not None and _qsfp_step(args, con, rep, node_id="B", iface=args.qsfp_iface,
+                                              host_number=host_number, subnet=subnet, configured=a.qsfp_iface):
+        ifs = {i.name: i for i in rep.ifaces}
     mine = next((i for i in rep.ifaces if a.qsfp_ip and a.qsfp_ip in [x.split('/')[0] for x in i.ipv4]), None)
     if mine:
         a.qsfp_iface = mine.name
@@ -254,10 +335,8 @@ def gather_agent(args, con: Console, rep: hostprobe.HostReport, a: Answers, info
     else:
         con.say(f"  ! no interface has {a.qsfp_ip} yet; setup does NOT change your network.")
         g = hostprobe.guess_qsfp(rep.ifaces)
-        iface = (args.qsfp_iface or (g.name if g else None) or a.qsfp_iface or "enp1s0f1np1")
-        a.qsfp_iface = iface
-        for line in provision.netplan_snippet(iface, a.qsfp_ip or "192.168.100.2").splitlines():
-            con.say(f"      {line}")
+        a.qsfp_iface = args.qsfp_iface or (g.name if g else None) or a.qsfp_iface or "enp1s0f1np1"
+        con.say("      Plug the cable into the same port as on node A, then run: sudo tsm qsfp apply --node B")
     if a.qsfp_iface in ifs:
         sug = sysinfo.suggest_rdma(rep.rdma, a.qsfp_ip)
         if sug["hcas"]:
@@ -304,6 +383,11 @@ def cmd_setup(args, api=None):
     a.hostname = hostprobe.platform.node()
     a.docker_group = hostprobe.group_exists("docker")
     info: Optional[dict[str, Any]] = None
+    if args.join == "-":                  # read it instead of putting secrets on the command line
+        args.join = (getpass.getpass("Join code from node A (input hidden): ") if sys.stdin.isatty()
+                     else sys.stdin.readline()).strip()
+        if not args.join:
+            sys.exit("error: no join code given")
     if args.join:
         try:
             info = provision.decode_join(args.join)
@@ -365,9 +449,17 @@ def cmd_setup(args, api=None):
     _after(args, con, lay, a, pv)
 
 
+def _sandbox_note(con: Console, lay: Layout) -> None:
+    if lay.sandbox:
+        con.say(f"\n  [sandbox] Everything was written under {lay.root}; nothing on this machine changed.")
+        con.say("  It is there to inspect the generated files; the steps below are what a real install prints.")
+        con.say("  A complete local cluster to click through: tsm demo")
+
+
 def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None:
     v = pv.vault
     live = pv.systemd and not any(s.status == "failed" for s in pv.steps)
+    _sandbox_note(con, lay)
     if a.role == "agent":
         if live:
             tok = v.get("agent_token")
@@ -394,7 +486,8 @@ def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None
     if code:
         con.say(f"  {n}. On the OTHER Spark run (this code contains secrets — it expires when you rotate keys):")
         con.say(f"       sudo tsm setup --join {code}")
-        con.say("       (no tsm there yet?  git clone … && sudo ./install.sh --join <code>)")
+        con.say("       (no tsm there yet?  git clone … && sudo ./install.sh --join <code>;"
+                " `--join -` asks for the code instead)")
         n += 1
     key = v.get("management_api_key")
     host = a.hostname or "this-machine"
@@ -405,7 +498,8 @@ def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None
         con.say(f"  {n}. Open http://{a.mgmt_bind if a.mgmt_bind != '0.0.0.0' else host}:{a.mgmt_port}/")
     n += 1
     con.say(f"  {n}. The GUI asks for the management key:  {key}")
-    con.say("       (print it again any time with `tsm init --show`)")
+    con.say("       (print it again any time with `tsm init --show`"
+            + (f"; for this sandbox: `tsm --secrets-dir {lay.secrets} init --show`)" if lay.sandbox else ")"))
     n += 1
     con.say(f"  {n}. Follow the 'Get started' page in the GUI, or:  tsm doctor")
     if not a.remote.get("terminal"):
@@ -490,7 +584,8 @@ for _fn in (cmd_setup, cmd_join_code, cmd_go_live):
 
 def add_parsers(sub, cmd) -> None:
     s = cmd("setup", cmd_setup, "guided first-run setup (config, secrets, services); --join for node B")
-    s.add_argument("--join", metavar="CODE", help="node B: the join code printed by node A")
+    s.add_argument("--join", metavar="CODE", help="node B: the join code printed by node A "
+                   "(`--join -` asks for it, so it stays out of the process list and shell history)")
     s.add_argument("--single", action="store_true", help="one Spark only (controller + agent)")
     s.add_argument("-y", "--yes", action="store_true", help="accept every detected default (unattended)")
     s.add_argument("--dry", action="store_true", help="show what would be written; change nothing")
@@ -502,6 +597,9 @@ def add_parsers(sub, cmd) -> None:
     s.add_argument("--create-user", action="store_true")
     s.add_argument("--qsfp-iface")
     s.add_argument("--qsfp-ip")
+    s.add_argument("--configure-qsfp", action="store_true",
+                   help="also set the addresses on both QSFP interfaces (netplan; same as `sudo tsm qsfp apply`). "
+                        "--yes alone never changes the network")
     s.add_argument("--peer-ip")
     s.add_argument("--peer-ssh-user")
     s.add_argument("--hf-cache-dir")

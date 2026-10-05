@@ -121,4 +121,4 @@ async def build(ctrl: "Controller") -> dict[str, Any]:
     nxt: Optional[dict[str, Any]] = next((s for s in steps if s["required"] and s["status"] != "done"), None)
     return {"steps": steps, "done": done, "total": len(req), "complete": done == len(req),
             "next": nxt["id"] if nxt else None,
-            "dry_run": bool(dry) if ok else None}
+            "dry_run": bool(dry) if ok else None, "demo": bool(getattr(ctrl.config, "demo", False))}

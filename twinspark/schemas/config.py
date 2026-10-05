@@ -226,6 +226,7 @@ class ControllerConfig(BaseModel):
     nodes: dict[str, NodeEndpoint] = Field(default_factory=dict)   # {"A": ..., "B": ...}
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     autostart: bool = True                  # re-activate the last healthy revision at boot
+    demo: bool = False                      # set by `tsm demo`: the GUI says its commands are for real Sparks
     # after a power cut both nodes boot together: wait this long for the other agent before the
     # autostart decides what to do (0 = do not wait)
     startup_wait_s: int = Field(default=180, ge=0, le=1800)

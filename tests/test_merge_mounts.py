@@ -21,7 +21,7 @@ def platform(monkeypatch, name):
 
 
 @pytest.mark.parametrize("host", [r"C:\Users\spark\.cache\huggingface", "D:/cache/hf", r"C:\cache/hf+v1@main",
-                                 r"C:\Users\DANNYG~1\AppData\Local\Temp\twinspark-demo\node-a\hf"])
+                                 r"C:\Users\SPARKU~1\AppData\Local\Temp\twinspark-demo\node-a\hf"])
 def test_native_windows_drive_hosts_are_accepted_only_on_windows(monkeypatch, host):
     platform(monkeypatch, "nt")
     assert Mount(host=host, container="/root/.cache/huggingface").host == host

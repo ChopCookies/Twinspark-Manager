@@ -54,7 +54,7 @@ class SecretsVault:
                 return key
             new = Fernet.generate_key()
             try:                       # exclusive: two first starts cannot overwrite each other
-                _write_private(self.key_file, new, exclusive=True)
+                _write_private(self.key_file, new, exclusive=True, owner=self._owner())
                 return new
             except FileExistsError:
                 if self.key_file.exists() and self.key_file.stat().st_size == 0:
@@ -68,16 +68,34 @@ class SecretsVault:
             self._fernet = Fernet(self._load_or_create_key())
         return self._fernet
 
+    def _owner(self) -> Optional[tuple[int, int]]:
+        """Owner for files root writes into the vault: the directory's owner.
+
+        The services read the vault as the service user. ``sudo tsm init --hf-token …`` or
+        ``sudo tsm remote plug-token`` would otherwise leave a root-owned 0600 file the
+        controller cannot read after its next restart.
+        """
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return None
+        st = self.dir.stat()
+        return (st.st_uid, st.st_gid) if st.st_uid != 0 else None
+
     def set(self, name: str, value: str) -> None:
         if name not in SECRET_SLOTS:
             raise ValueError(f"'{name}' is not a known secret slot")
-        _write_private(self.dir / f"{name}.enc", self._f().encrypt(value.encode()))
+        data = self._f().encrypt(value.encode())
+        _write_private(self.dir / f"{name}.enc", data, owner=self._owner())
 
     def get(self, name: str) -> str:
         p = self.dir / f"{name}.enc"
         if not p.exists():
             return ""
-        return self._f().decrypt(p.read_bytes()).decode()
+        try:
+            return self._f().decrypt(p.read_bytes()).decode()
+        except PermissionError as exc:
+            bad = exc.filename or p                    # the secret itself, or the master key
+            raise PermissionError(f"cannot read {bad}: it belongs to another user (often root after a sudo "
+                                  f"command). Fix: sudo chown --reference={self.dir} {bad}") from None
 
     def ensure(self, name: str) -> tuple[str, bool]:
         """Return (value, created). Generates a random value if the slot is empty."""
@@ -99,12 +117,14 @@ class SecretsVault:
         return text
 
 
-def _write_private(path: Path, data: bytes, *, exclusive: bool = False) -> None:
+def _write_private(path: Path, data: bytes, *, exclusive: bool = False,
+                   owner: Optional[tuple[int, int]] = None) -> None:
     """Write ``data`` to ``path`` with mode 0600 from the first byte, atomically.
 
     A temporary sibling is written in full (short writes looped), fsynced, then renamed over
     the target, so a full disk or a crash can never leave a truncated secret behind.
-    ``exclusive`` refuses to replace an existing file (used for the master key).
+    ``exclusive`` refuses to replace an existing file (used for the master key). ``owner``
+    (uid, gid) is applied to the temporary file before it becomes visible.
     """
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -114,6 +134,8 @@ def _write_private(path: Path, data: bytes, *, exclusive: bool = False) -> None:
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view):]
+        if owner is not None:
+            os.fchown(fd, *owner)
         os.fsync(fd)
     except BaseException:
         os.close(fd)
