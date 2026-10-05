@@ -274,7 +274,7 @@ class LaunchPlanner:
         adv = rev.draft.advanced
         backend = self.resolve_backend(rev)
         notes: list[str] = [
-            "Verify every flag against the pinned image once (Phase 0): vLLM CLI flags "
+            "Verify every flag against the pinned image once before the first activation: vLLM CLI flags "
             "change between releases.",
         ]
 
