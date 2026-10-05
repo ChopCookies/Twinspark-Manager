@@ -69,7 +69,7 @@ def fake_run(argv, timeout=8):
     if argv[:2] == ["ip", "-j"]:
         return 0, IP_JSON
     if argv[:2] == ["id", "-nG"]:
-        return 0, "chopc sudo docker"
+        return 0, "sparkuser sudo docker"
     if argv[-1] == "{{.Server.Version}}":
         return 0, "27.0.1\n"
     return 1, ""
@@ -136,7 +136,7 @@ def test_host_checks_explain_each_problem_and_its_fix(machine):
 
 # ---- join codes -----------------------------------------------------------------------------------
 def test_join_code_roundtrip_and_resistance_to_paste_damage(tmp_path):
-    a = Answers(qsfp_ip="192.168.100.1", peer_ip="192.168.100.2", qsfp_iface="enp1s0f1np1", peer_ssh_user="chopc",
+    a = Answers(qsfp_ip="192.168.100.1", peer_ip="192.168.100.2", qsfp_iface="enp1s0f1np1", peer_ssh_user="sparkuser",
                 rdma_hcas=["rocep1s0f1", "roceP2p1s0f1"], ib_gid_index=3)
     v = SecretsVault(tmp_path / "s")
     v.ensure("agent_token")
@@ -156,10 +156,10 @@ def test_join_code_roundtrip_and_resistance_to_paste_damage(tmp_path):
 
 # ---- generated files ------------------------------------------------------------------------------
 def answers_a(tmp_path, **kw) -> Answers:
-    base = dict(role="controller", node_id="A", hostname="gx10-d95c-node1", service_user="chopc",
+    base = dict(role="controller", node_id="A", hostname="spark-a", service_user="sparkuser",
                 qsfp_iface="enp1s0f1np1", qsfp_ip="192.168.100.1", peer_ip="192.168.100.2",
                 peer_iface="enp1s0f1np1", rdma_hcas=["rocep1s0f1", "roceP2p1s0f1"], ib_gid_index=3,
-                peer_ssh_user="chopc", hf_cache_dir=str(tmp_path / "hf"), docker_group=True)
+                peer_ssh_user="sparkuser", hf_cache_dir=str(tmp_path / "hf"), docker_group=True)
     base.update(kw)
     return Answers(**base)
 
@@ -171,7 +171,7 @@ def test_generated_configs_load_with_the_real_schemas(tmp_path):
     lay.controller_yaml.write_text(provision.render_controller_yaml(a, lay))
     lay.agent_yaml.write_text(provision.render_agent_yaml(a, lay))
     c = load_config(lay.controller_yaml, ControllerConfig)
-    assert c.nodes["B"].agent_url == "http://192.168.100.2:9443" and c.nodes["B"].ssh_user == "chopc"
+    assert c.nodes["B"].agent_url == "http://192.168.100.2:9443" and c.nodes["B"].ssh_user == "sparkuser"
     assert c.nodes["A"].rdma_hcas == ["rocep1s0f1", "roceP2p1s0f1"] and c.nodes["A"].ib_gid_index == 3
     assert c.runtime.hf_cache_dir == str(tmp_path / "hf") and c.runtime.ssh_key.endswith("ssh/id_ed25519")
     assert c.listener.bind == "127.0.0.1" and c.gateway_listener.port == 8000
@@ -204,7 +204,7 @@ def test_units_follow_the_service_user_and_paths(tmp_path):
     lay = Layout(tmp_path)
     units = provision.render_units(answers_a(tmp_path), lay)
     agent = units["twinspark-agent.service"]
-    assert "User=chopc" in agent and "SupplementaryGroups=docker twinspark" in agent
+    assert "User=sparkuser" in agent and "SupplementaryGroups=docker twinspark" in agent
     assert str(tmp_path / "hf") in agent and "ProtectSystem=strict" in agent    # model cache stays writable
     assert "--group twinspark" in units["twinspark-privd.service"]
     assert "twinspark-controller.service" in units
@@ -324,7 +324,7 @@ def run_cli(*argv) -> int:
 
 def test_wizard_unattended_on_node_a_detects_the_qsfp_link_and_rdma(machine, tmp_path, capsys):
     root = tmp_path / "a"
-    assert run_cli("setup", "--root", root, "--yes", "--service-user", "chopc", "--no-start",
+    assert run_cli("setup", "--root", root, "--yes", "--service-user", "sparkuser", "--no-start",
                    "--hf-cache-dir", tmp_path / "hf") == 0
     out = capsys.readouterr().out
     lay = Layout(root)
@@ -332,7 +332,7 @@ def test_wizard_unattended_on_node_a_detects_the_qsfp_link_and_rdma(machine, tmp
     assert c.nodes["A"].qsfp_iface == "enp1s0f1np1" and c.nodes["A"].qsfp_ip == "192.168.100.1"
     assert c.nodes["B"].qsfp_ip == "192.168.100.2"
     assert sorted(c.nodes["A"].rdma_hcas) == ["roceP2p1s0f1", "rocep1s0f1"] and c.nodes["A"].ib_gid_index == 3
-    assert "sudo tsm setup --join tsm1." in out and "ssh -L 8443:localhost:8443 chopc@" in out
+    assert "sudo tsm setup --join tsm1." in out and "ssh -L 8443:localhost:8443 sparkuser@" in out
     assert "dry-run" in out and "sudo tsm go-live" in out
     # the printed management key is the one in the vault
     assert SecretsVault(lay.secrets).get("management_api_key") in out
@@ -340,11 +340,11 @@ def test_wizard_unattended_on_node_a_detects_the_qsfp_link_and_rdma(machine, tmp
 
 def test_join_flow_end_to_end_node_b_gets_the_same_secrets(machine, tmp_path, capsys):
     a_root, b_root = tmp_path / "a", tmp_path / "b"
-    run_cli("setup", "--root", a_root, "--yes", "--service-user", "chopc", "--no-start",
+    run_cli("setup", "--root", a_root, "--yes", "--service-user", "sparkuser", "--no-start",
             "--hf-cache-dir", tmp_path / "hfa")
     out = capsys.readouterr().out
     code = next(line.split("--join ", 1)[1].strip() for line in out.splitlines() if "tsm setup --join tsm1." in line)
-    assert run_cli("setup", "--root", b_root, "--yes", "--join", code, "--no-start", "--service-user", "chopc",
+    assert run_cli("setup", "--root", b_root, "--yes", "--join", code, "--no-start", "--service-user", "sparkuser",
                    "--hf-cache-dir", tmp_path / "hfb", "--qsfp-iface", "enp1s0f1np1") == 0
     va, vb = SecretsVault(Layout(a_root).secrets), SecretsVault(Layout(b_root).secrets)
     assert va.get("agent_token") == vb.get("agent_token") != ""
@@ -358,19 +358,19 @@ def test_join_flow_end_to_end_node_b_gets_the_same_secrets(machine, tmp_path, ca
     run_cli("join-code", "--root", a_root)
     again = capsys.readouterr().out.split("--join ", 1)[1].strip()
     info = provision.decode_join(again)
-    assert info["agent_token"] == va.get("agent_token") and info["b_user"] == "chopc"
+    assert info["agent_token"] == va.get("agent_token") and info["b_user"] == "sparkuser"
 
 
 def test_join_code_can_be_read_from_stdin_instead_of_argv(machine, tmp_path, capsys, monkeypatch):
     import io
 
     a_root, b_root = tmp_path / "a", tmp_path / "b"
-    run_cli("setup", "--root", a_root, "--yes", "--service-user", "chopc", "--no-start",
+    run_cli("setup", "--root", a_root, "--yes", "--service-user", "sparkuser", "--no-start",
             "--hf-cache-dir", tmp_path / "hfa")
     code = next(line.split("--join ", 1)[1].strip() for line in capsys.readouterr().out.splitlines()
                 if "tsm setup --join tsm1." in line)
     monkeypatch.setattr("sys.stdin", io.StringIO(code + "\n"))
-    assert run_cli("setup", "--root", b_root, "--yes", "--join", "-", "--no-start", "--service-user", "chopc",
+    assert run_cli("setup", "--root", b_root, "--yes", "--join", "-", "--no-start", "--service-user", "sparkuser",
                    "--hf-cache-dir", tmp_path / "hfb", "--qsfp-iface", "enp1s0f1np1") == 0
     assert SecretsVault(Layout(b_root).secrets).get("agent_token") == SecretsVault(Layout(a_root).secrets).get(
         "agent_token") != ""
@@ -385,7 +385,7 @@ def test_wizard_rejects_a_damaged_join_code_without_writing(machine, tmp_path):
 
 def test_wizard_moves_off_ports_that_are_taken(machine, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(hostprobe, "port_free", lambda port, host="0.0.0.0": port not in (8000, 8100))
-    run_cli("setup", "--root", tmp_path / "a", "--yes", "--service-user", "chopc", "--no-start",
+    run_cli("setup", "--root", tmp_path / "a", "--yes", "--service-user", "sparkuser", "--no-start",
             "--hf-cache-dir", tmp_path / "hf")
     c = load_config(Layout(tmp_path / "a").controller_yaml, ControllerConfig)
     assert c.gateway_listener.port != 8000 and c.runtime.vllm_port != 8100
@@ -395,10 +395,10 @@ def test_wizard_moves_off_ports_that_are_taken(machine, tmp_path, monkeypatch, c
 def test_wizard_stops_on_a_failed_check_but_can_be_overridden(machine, tmp_path, monkeypatch):
     monkeypatch.setattr(hostprobe, "python_ok", lambda: (False, "3.10.0"))
     with pytest.raises(SystemExit, match="Fix the"):
-        run_cli("setup", "--root", tmp_path / "a", "--yes", "--service-user", "chopc",
+        run_cli("setup", "--root", tmp_path / "a", "--yes", "--service-user", "sparkuser",
                 "--hf-cache-dir", tmp_path / "hf")
     assert run_cli("setup", "--root", tmp_path / "a", "--yes", "--skip-checks", "--no-start",
-                   "--service-user", "chopc", "--hf-cache-dir", tmp_path / "hf") == 0
+                   "--service-user", "sparkuser", "--hf-cache-dir", tmp_path / "hf") == 0
 
 
 def test_wizard_interactive_answers_and_abort(machine, tmp_path, monkeypatch, capsys):
@@ -411,14 +411,14 @@ def test_wizard_interactive_answers_and_abort(machine, tmp_path, monkeypatch, ca
     monkeypatch.setattr("builtins.input", fake_input)
     monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
     with pytest.raises(SystemExit, match="aborted"):
-        run_cli("setup", "--root", tmp_path / "a", "--service-user", "chopc", "--hf-cache-dir", tmp_path / "hf")
+        run_cli("setup", "--root", tmp_path / "a", "--service-user", "sparkuser", "--hf-cache-dir", tmp_path / "hf")
     assert not (tmp_path / "a").exists(), "declining the final question must leave the machine untouched"
     assert any("cabled to the other Spark" not in p and "Other Spark" in p for p in seen) or seen
 
 
 def test_go_live_and_revert_flip_the_mode(machine, tmp_path, monkeypatch, capsys):
     root = tmp_path / "a"
-    run_cli("setup", "--root", root, "--yes", "--service-user", "chopc", "--no-start",
+    run_cli("setup", "--root", root, "--yes", "--service-user", "sparkuser", "--no-start",
             "--hf-cache-dir", tmp_path / "hf")
     monkeypatch.setattr(hostprobe, "docker_status", lambda user=None, run=None: {
         "installed": True, "reachable": True, "in_group": True, "detail": "ok"})

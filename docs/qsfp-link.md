@@ -101,10 +101,13 @@ setup snippet told people to create exactly that name — it is left alone and T
 
 The machines are headless, so a wrong network change cannot be fixed with a keyboard. `apply`:
 
-1. **refuses an interface that carries the default route**, or one that an SSH session is coming in
-   through (it reads `SSH_CONNECTION` and the live sshd connection table, because `sudo` usually drops
-   the former; IPv6 link-local sessions are matched by their interface). If the routing table cannot be
-   read it stops rather than guess;
+1. **refuses a port that carries the default route** — on either of its twins, so the second half of a
+   QSFP port that is cabled to your network is never configured — and one that a remote session is
+   coming in through: SSH, or TwinSpark's Remote terminal (on node B that arrives over the link). It reads
+   `SSH_CONNECTION` and the live connection table, because `sudo` usually drops the former; IPv6
+   link-local sessions are matched by their interface. If the routing table cannot be read it stops
+   rather than guess. A port cabled to the network is never chosen automatically, and with two cabled
+   ports it asks for `--iface` instead of guessing;
 2. **never edits a netplan file it did not write.** Its own file starts with the marker line
    `# Managed by TwinSpark (tsm qsfp)`; anything else is foreign. If a foreign file already configures
    one of the interfaces, the plan says so and stops — nothing is touched;
@@ -126,7 +129,8 @@ The machines are headless, so a wrong network change cannot be fixed with a keyb
 the addresses that file had set; it has the same default-route and SSH guards as `apply`, and refuses a
 file without the marker. `sudo tsm qsfp revert --temporary` removes the addresses set with
 `--temporary` (they are recorded in `/run`, which a reboot clears together with the addresses) and puts
-the MTU back.
+the MTU back. It never touches what TwinSpark's netplan file configures; that is what `revert` without
+`--temporary` is for.
 
 ## You already have one twin set up
 
@@ -173,7 +177,8 @@ one has a cable). All commands accept `--json` before the sub-command (`tsm --js
 | No answer at all | the other Spark has no addresses yet, or is cabled to the other port. `tsm qsfp scan` shows what answers. |
 | `already configures …` | a foreign netplan file mentions the interface. Move it away or add the second twin there by hand; TwinSpark will not edit it. |
 | `carries this machine's default route` | you picked the management NIC. The QSFP twins are `enp1s0f1np1` / `enP2p1s0f1np1` (or the `f0np0` pair). |
-| Two cables | one cable gives the full bandwidth; `status` warns and uses `f1np1` unless `--iface` says otherwise. |
+| `2 QSFP ports have a link` | one cable gives the full bandwidth. `status` warns and shows `f1np1`; `plan` and `apply` need `--iface` to say which port goes to the other Spark. |
+| `cabled to your network, not to the other Spark` | the only port with a link carries the default route (a QSFP uplink to a switch). Cable the Sparks together on the other port. |
 
 ## RoCE GID index
 

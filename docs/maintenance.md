@@ -96,8 +96,8 @@ controller holds for review.
 ## Safe local preview
 
 ```
-python scripts/build_web.py
-python scripts/preview_web.py --demo-nodes
+.venv/bin/python scripts/build_web.py
+.venv/bin/python scripts/preview_web.py --demo-nodes
 ```
 
 Open `http://127.0.0.1:18744/#/system`. Sample metrics are visibly labeled.

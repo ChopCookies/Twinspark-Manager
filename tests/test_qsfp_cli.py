@@ -177,7 +177,7 @@ def test_scan_lists_hosts_and_can_name_the_gpu(tmp_path, monkeypatch, capsys):
     n = FakeNode(tmp_path, primary_ips=["192.168.100.1/24"], secondary_ips=["192.168.101.1/24"], mtu=9000)
     monkeypatch.setattr(qsfp, "RUN", n.run)
     monkeypatch.setattr(qsfp, "_tcp_connect", lambda ip, port, timeout, src: ip.endswith(".2"))
-    out = run(n, "scan", "--identify", "--user", "chopc", capsys=capsys)
+    out = run(n, "scan", "--identify", "--user", "sparkuser", capsys=capsys)
     assert "192.168.100.2" in out and "via enp1s0f1np1" in out and "NVIDIA GB10" in out
     assert "192.168.101.2" in out
 

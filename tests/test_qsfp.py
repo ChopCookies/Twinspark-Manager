@@ -698,15 +698,15 @@ def test_scan_finds_hosts_that_answer_on_ssh_and_skips_itself(tmp_path, monkeypa
 
 def test_identify_asks_ssh_for_the_gpu_and_rejects_odd_user_names(tmp_path, monkeypatch):
     n = good_node(tmp_path, monkeypatch)
-    assert qsfp.identify("192.168.100.2", "chopc", n.host()) == "NVIDIA GB10"
+    assert qsfp.identify("192.168.100.2", "sparkuser", n.host()) == "NVIDIA GB10"
     ssh = [c for c in n.calls if c[0] == "ssh"][0]
-    assert "BatchMode=yes" in ssh and "chopc@192.168.100.2" in ssh
+    assert "BatchMode=yes" in ssh and "sparkuser@192.168.100.2" in ssh
     with pytest.raises(qsfp.QsfpError, match="not a user name"):
         qsfp.identify("192.168.100.2", "x; rm -rf /", n.host())
     with pytest.raises(qsfp.QsfpError):
         qsfp.identify("192.168.100.2", "-oProxyCommand=evil", n.host())
     with pytest.raises(qsfp.QsfpError, match="not an IPv4 address"):
-        qsfp.identify("-oProxyCommand=evil", "chopc", n.host())
+        qsfp.identify("-oProxyCommand=evil", "sparkuser", n.host())
 
 
 def test_describe_is_json_safe(tmp_path, monkeypatch):

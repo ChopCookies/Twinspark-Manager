@@ -309,7 +309,7 @@ test("navigation lists Get started first and routes to it", () => {
 
 // ---- Remote page -------------------------------------------------------------------------------
 const NODE_B = {
-  node: "B", reachable: true, hostname: "gx10-cba3-node2", uptime_s: 93784, kernel: "6.11.0-nvidia", version: "0.4.1",
+  node: "B", reachable: true, hostname: "spark-b", uptime_s: 93784, kernel: "6.11.0-nvidia", version: "0.4.1",
   privd: true, terminal_service: true, wake_configured: true, plug_configured: true, mac: "aa:bb:cc:dd:ee:ff",
   plug_actions: ["off", "on"], power_pending: [],
   policy: { terminal: true, reboot: false, poweroff: false, boot_next: false, wol: false, error: null },

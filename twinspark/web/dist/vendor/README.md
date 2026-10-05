@@ -1,6 +1,6 @@
 # Vendored front-end libraries
 
-These are shipped unmodified so the GUI works on a headless machine with no internet access.
+These are shipped (unmodified apart from the removed source-map comment, see below) so the GUI works on a headless machine with no internet access.
 
 | file | package | version | license |
 |---|---|---|---|

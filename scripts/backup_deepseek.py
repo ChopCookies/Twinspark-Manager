@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Capture the existing two-Spark deployment without copying weights or stopping it."""
+"""Capture a running two-Spark DeepSeek deployment (eugr launcher) without copying weights or stopping it.
+
+Environment: TSM_EUGR_DIR (your spark-vllm-docker checkout, default ~/spark-vllm-docker) and
+TSM_PEER (user@address of node B, default $USER@192.168.100.2). The copy goes to backups/ (git-ignored).
+See docs/notes/deepseek-v4-flash-two-node-startup.md.
+"""
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tarfile
@@ -11,8 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = Path('/home/chopc/spark-vllm-docker')
-PEER = 'chopc@192.168.100.2'
+SOURCE = Path(os.environ.get('TSM_EUGR_DIR', '~/spark-vllm-docker')).expanduser()
+PEER = os.environ.get('TSM_PEER') or f'{getpass.getuser()}@192.168.100.2'
 
 
 def run(*args: str) -> str:

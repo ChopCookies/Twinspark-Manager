@@ -1,3 +1,6 @@
+# Copied from eugr/spark-vllm-docker, recipes/deepseek-v4-flash-0731.yaml (2026-09-28).
+# Copyright (c) 2026 Eugene Rakhmatulin — MIT License, full text in THIRD_PARTY_NOTICES.md
+# (https://github.com/eugr/spark-vllm-docker/blob/main/LICENSE).
 # Recipe: DeepSeek V4 Flash 0731
 # DeepSeek V4 Flash using the B12X-optimized serving stack on an SM121 cluster
 

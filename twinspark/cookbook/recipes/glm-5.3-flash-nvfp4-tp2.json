@@ -49,7 +49,7 @@
       "boot": "~13-15 min (checkpoint load dominates)"
     },
     "requirements": [
-      "Weights RedHatAI/GLM-5.3-Flash-NVFP4 (184 GiB) on both nodes — you staged revision 18d55bfd on 2026-09-28; Pin with model ref 18d55bfd5a2194887738da73753975c9d3842f46 to keep exactly that snapshot.",
+      "Weights RedHatAI/GLM-5.3-Flash-NVFP4 (184 GiB) on both nodes. The settings were measured with revision 18d55bfd; Pin with model ref 18d55bfd5a2194887738da73753975c9d3842f46 to use exactly that snapshot.",
       "Image ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 (Pin resolves the multi-arch digest; the first activation pulls it on both nodes).",
       "The himorishige repo also bind-mounts sparse_attn_indexer_kpool_sm121.py (SM121 top-k fix). If loading fails with a sparse-MLA / top-k assert, package that file as a mod (run.sh copying it over vLLM's copy) and add it to advanced.mods."
     ],

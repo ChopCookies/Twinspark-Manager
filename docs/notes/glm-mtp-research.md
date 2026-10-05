@@ -1,5 +1,7 @@
 # Dual-DGX-Spark vLLM Appliance: GLM Model & Speculative Decoding Research
 
+> **Research note (2026-09-21).** Background for the GLM recipes; figures and versions may be out of date.
+
 > **Date:** September 21, 2026 | **Status:** Research complete — findings marked VERIFIED (from source configs/docs) or ESTIMATED (where real benchmarks are unavailable)
 
 ---

@@ -92,9 +92,10 @@ the recipe; older images may not accept the multi-node flags.
 
 ## On-site validation
 
-The new implementation is locally tested with simulated agents and mocked HTTP
-backends. Existing older on-site SmolLM single-node and PP2 records are not proof
-that 0.4.1 or any large community model runs on the current hardware.
+The implementation is tested with simulated agents and mocked HTTP backends. The
+[on-site SmolLM run of 2026-09-28](notes/small-model-validation-2026-09-28.md)
+(single node and PP2) showed that the real Docker path works on GB10 at that day's code;
+it is not proof that the current version or a large community model runs on your hardware.
 
 1. Install the same manager build on controller and agents. Run the full Python
    suite on Linux, including filesystem tests skipped on Windows.

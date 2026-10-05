@@ -26,8 +26,9 @@
   "source": {
     "title": "SmolLM2-135M smoke test (single-a; duplicate as pp2 to test both nodes)",
     "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct",
-    "author": "TwinSpark dev run 2026-09-28 (single-a and pp2 passed on this rig)",
-    "requirements": ["Nothing big: ~260 MiB of weights. 9 attention heads do not split over TP2 — use pp2 for a two-node test."],
+    "author": "TwinSpark maintainers — single-a and pp2 passed on two DGX Sparks on 2026-09-28",
+    "requirements": ["Nothing big: ~260 MiB of weights. 9 attention heads do not split over TP2 — use pp2 for a two-node test.",
+                     "A vLLM image that runs on DGX Spark (GB10, sm_121). The image hint is the local build the maintainers used (eugr/spark-vllm-docker, vllm-node-b12x); with another image, name it when you pin (Pin → image)."],
     "notes": ["Serves under the alias 'smoke', so it never replaces your 'default' model in clients' configs — but activating it still stops the running deployment (one deployment at a time)."]
   }
 }

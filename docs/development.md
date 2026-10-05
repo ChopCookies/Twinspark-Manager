@@ -11,7 +11,7 @@ python3.12 -m venv .venv
 .venv/bin/pytest                    # all Python tests, including merged recipe / setup / remote workflows
 node --test tests/*.test.cjs         # all web-client tests, no browser needed
 .venv/bin/ruff check .
-python -m pip wheel --no-deps . --wheel-dir dist     # installable wheel incl. cookbook + web UI
+.venv/bin/pip wheel --no-deps . --wheel-dir dist    # installable wheel incl. cookbook + web UI
 ```
 
 On Windows (PowerShell):
@@ -61,9 +61,9 @@ if they drift.
 ## Web client
 
 ```bash
-python scripts/build_web.py          # src/ -> dist/ (vanilla assets, no bundler)
-python scripts/preview_web.py        # http://127.0.0.1:18744/ with an in-memory database
-python scripts/preview_web.py --demo-nodes   # labeled sample telemetry + a simulated maintenance run
+.venv/bin/python scripts/build_web.py          # src/ -> dist/ (vanilla assets, no bundler)
+.venv/bin/python scripts/preview_web.py        # http://127.0.0.1:18744/ with an in-memory database
+.venv/bin/python scripts/preview_web.py --demo-nodes   # labeled sample telemetry + a simulated maintenance run
 ```
 
 The preview serves the built `web/dist` assets: rebuild and refresh after editing `web/src`.

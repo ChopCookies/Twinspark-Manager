@@ -1,6 +1,44 @@
 # Changelog
 
-## Unreleased — recipe automation, agent integrations, setup, remote management and QSFP automation
+## 0.5.0 — 2026-10-05 — first public release
+
+Recipe automation, agent integrations, guided setup, remote management and QSFP automation, plus a
+pre-release review. The repository is MIT-licensed from this release on ([LICENSE](LICENSE),
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+
+### Pre-release review
+
+- **Vault ownership:** `sudo tsm init --hf-token …` and `sudo tsm remote plug-token` no longer leave
+  root-owned secret files. Before this fix, the controller could not read them after its next restart.
+  An unreadable secret now says how to fix it.
+- **`tsm init --show`** only reads. Pointed at a missing vault, it no longer creates new keys.
+- **`tsm qsfp` port choice:**
+  - A port whose twin carries the default route is never picked automatically, and the safety checks
+    cover the whole port, not only the interfaces being changed.
+  - Two cabled ports need `--iface` before anything is planned.
+  - `revert --temporary` leaves the permanent layout alone.
+  - Remote-terminal sessions count like SSH sessions.
+- **Request limits:** the gateway caps request bodies at 32 MiB while reading them. With
+  `management_auth: none`, the management API only answers loopback host names, which stops DNS rebinding.
+- **Installer:** `install.sh` normalises `TSM_HOME` and refuses home and system directories. It marks its
+  install directory, and `--uninstall` only deletes a marked one. `--purge` says that models downloaded
+  under `/var/lib/twinspark` are deleted too.
+- **Join code:** `tsm setup --join -` reads the code from a prompt, so it stays out of the process list and
+  the shell history.
+- **Dry-run pins** of local images are marked SIMULATED, and a missing local image says to pin again.
+  `tsm plan` on an unpinned profile suggests `--draft`.
+- **Messages:** doctor hints name today's commands (`tsm go-live`, privd, `tsm rdma --apply`). A sandbox
+  setup says that it ran in a sandbox.
+- **Demo:**
+  - The banner prints a working inference key and a `TSM_API`/`TSM_KEY` line.
+  - A missing `127.0.0.2` (macOS) gives a clear error instead of a traceback.
+  - The Get started page says that its commands are for real Sparks.
+- **Content:**
+  - The built-in recipes no longer describe the maintainer's machines as yours.
+  - The *verified* badge explains itself.
+  - Personal runbooks and research moved to [docs/notes/](docs/notes/), with neutral names and paths.
+  - The dev scripts take their hosts and image from the environment.
+
 
 ### QSFP link automation
 
@@ -79,7 +117,7 @@
 
 Everything below was found by exercising the stack on loopback (`DemoCluster`, dry-run runtime),
 fuzzing the API and driving the GUI at desktop and phone widths — nothing was tried on the live
-Sparks. Each fix has a regression test (`tests/test_hardening_*.py`, 296 tests in total).
+Sparks. Each fix has a regression test (`tests/test_hardening_*.py`).
 
 **Security**
 - Management and agent tokens are compared byte-wise in constant time, so a non-ASCII header can no
@@ -141,8 +179,8 @@ closed (`sudo tsm remote enable|disable|policy`, or `tsm setup --remote …`).
 - `tsm demo --with-terminal`, `DemoCluster(remote={...})`; the setup wizard asks which features to enable.
 - Controller→node traffic uses typed actions only (allowlist; no generic exec); the remote endpoints stay
   reachable during a maintenance run so a node can still be inspected.
-- 518 tests in total (222 new, covering the policy, root helper, terminal relay, controller, CLI and docs
-  examples); the Remote page was also checked in a real browser at desktop and phone width.
+- New tests cover the policy, root helper, terminal relay, controller, CLI and docs examples; the Remote
+  page was also checked in a real browser at desktop and phone width.
 - **Not verified on the hardware**: Wake-on-LAN, BootNext and network boot depend on DGX Spark firmware;
   the guide says how to test each once while the machine is still reachable.
 
@@ -169,9 +207,9 @@ closed (`sudo tsm remote enable|disable|policy`, or `tsm setup --remote …`).
   **13 web-client tests passed**. Recipe-file import, split composition and
   preparation were checked in the browser; the 0.4.1 wheel builds successfully.
 
-## Unreleased — v0.4 fixes
+### Fixes after 0.4.0 (released with 0.4.1)
 
-### Monitoring and maintenance
+#### Monitoring and maintenance
 
 - Add parallel per-node CPU, shared memory, GPU use/temperature/power, and network
   sampling, with bounded history, unknown sensor values, and stale-data handling.
@@ -187,7 +225,7 @@ closed (`sudo tsm remote enable|disable|policy`, or `tsm setup --remote …`).
 - Validate with isolated dry-run agents and mocked privileged commands. Actual
   Spark updates and firmware/reboot behavior remain to be validated on hardware.
 
-### GUI and web client
+#### GUI and web client
 
 - Search and filter profiles by state and built-in recipes by topology, with
   result counts, useful empty states, and filters retained during navigation.
@@ -203,7 +241,7 @@ closed (`sudo tsm remote enable|disable|policy`, or `tsm setup --remote …`).
 - Decode bundled recipes as UTF-8 to prevent garbled punctuation on Windows.
 - Add a local in-memory GUI preview and nine client regression tests.
 
-### Backend and packaging
+#### Backend and packaging
 
 - Include built-in recipes, recipe metadata, and the web UI in installation
   packages. Previously they were only available when running from the source tree.
@@ -224,7 +262,7 @@ closed (`sudo tsm remote enable|disable|policy`, or `tsm setup --remote …`).
 
 ## 0.4.0 — 2026-09-30
 
-Launches now match the proven dual-Spark setup, community recipes import losslessly,
+Launches now match the community's proven dual-Spark setup (eugr/spark-vllm-docker), recipes import losslessly,
 and model files / mods are managed on both nodes.
 
 ### Launch wiring
@@ -239,7 +277,7 @@ and model files / mods are managed on both nodes.
 
 ### Recipes
 - eugr/spark-vllm-docker YAML importer with a mapping report (mapped / raw / dropped).
-- Built-in: DeepSeek V4 Flash 0731 B12X (your running setup), GLM-5.3-Flash NVFP4 (+ DFlash2),
+- Built-in: DeepSeek V4 Flash 0731 B12X (the maintainer's running setup), GLM-5.3-Flash NVFP4 (+ DFlash2),
   MiMo-V2.6-Flash, Qwen3.8-Flash-Next, SmolLM2 smoke test.
 - Community browser for GitHub recipe folders (`recipe_sources`), import by URL or paste.
 - One-click Pin: HF commit sha, multi-arch registry digest or local image ID (checked identical
@@ -267,5 +305,5 @@ and model files / mods are managed on both nodes.
 
 ### Not verified on hardware yet
 - Everything was tested against dry-run agents (80 tests). First run on the Sparks:
-  `tsm doctor`, `tsm rdma`, then `tsm plan <profile>` and compare with your eugr command
+  `tsm doctor`, `tsm rdma`, then `tsm plan <profile>` and compare with the command you use today
   before the first `tsm activate`.

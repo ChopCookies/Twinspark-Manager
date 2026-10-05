@@ -38,7 +38,7 @@ def install(monkeypatch, node: FakeNode) -> None:
 
 
 def setup(*argv):
-    return cli.main(["setup", "--yes", "--service-user", "chopc", "--no-start", *map(str, argv)])
+    return cli.main(["setup", "--yes", "--service-user", "sparkuser", "--no-start", *map(str, argv)])
 
 
 def netplan_file(root: Path) -> Path:
@@ -76,7 +76,7 @@ def test_configure_qsfp_writes_the_netplan_file_for_both_twins(fresh, tmp_path, 
 
 def test_an_interactive_yes_applies_and_the_default_is_no(fresh, tmp_path, capsys):
     root = tmp_path / "a"
-    args = type("A", (), {"root": str(root), "dry": False, "configure_qsfp": False, "service_user": "chopc"})()
+    args = type("A", (), {"root": str(root), "dry": False, "configure_qsfp": False, "service_user": "sparkuser"})()
     rep = hostprobe.probe_host()
     answers = iter(["", "y"])
     con = cli_setup.Console(yes=False, input_fn=lambda prompt: next(answers), out=lambda *a: None)

@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Prepare and exercise a bounded SmolLM deployment through the real manager.
 
-Run from the repository: .venv/bin/python scripts/dev_cluster.py prepare|test|serve
+Run from the repository on node A: .venv/bin/python scripts/dev_cluster.py prepare|deploy|stage|test|serve
 Node B needs this source and the agent dependencies under /tmp/twinspark-manager-dev.
+
+Environment:
+  TSM_DEV_PEER      user@address of node B over the QSFP link (default: $USER@192.168.100.2)
+  TSM_DEV_IMAGE_ID  local image ID of a vLLM build present on both nodes (required by `prepare`):
+                    docker image inspect --format '{{.Id}}' vllm-node-b12x
+See docs/notes/small-model-validation-2026-09-28.md.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
+import os
 import secrets
 import shlex
 import subprocess
@@ -32,10 +40,11 @@ from twinspark.schemas.profile import ProfileDraft
 from twinspark.security import SecretsVault
 
 WORK = Path('/tmp/twinspark-manager-dev')
-PEER = 'chopc@192.168.100.2'
+PEER = os.environ.get('TSM_DEV_PEER') or f'{getpass.getuser()}@192.168.100.2'
+PEER_USER, _, PEER_HOST = PEER.rpartition('@')
 MODEL = 'HuggingFaceTB/SmolLM2-135M-Instruct'
 REVISION = '12fd25f77366fa6b3b4b768ec3050bf629380bac'
-IMAGE_ID = 'sha256:d43f15877df4176dfc70b7ebca336d5de698e1696da02fc3738b0338a65f5db2'
+IMAGE_ID = os.environ.get('TSM_DEV_IMAGE_ID', '')
 
 
 def write_json(path, obj):
@@ -43,6 +52,9 @@ def write_json(path, obj):
 
 
 def prepare():
+    if not IMAGE_ID.startswith('sha256:'):
+        sys.exit("set TSM_DEV_IMAGE_ID to the local image ID of a vLLM build on both nodes, e.g.\n"
+                 "  export TSM_DEV_IMAGE_ID=$(docker image inspect --format '{{.Id}}' vllm-node-b12x)")
     WORK.mkdir(parents=True, exist_ok=True, mode=0o700)
     vault = SecretsVault(WORK / 'secrets')
     for name in ('agent_token', 'backend_api_key', 'management_api_key', 'inference_api_key'):
@@ -53,7 +65,7 @@ def prepare():
                    compile_cache_dir=str(WORK / 'compile'), max_download_gib=0.35,
                    min_disk_free_gib=5, allow_image_pull=False)
     common = dict(runtime=runtime, secrets_dir=str(WORK / 'secrets'))
-    for node, bind in [('A', '127.0.0.1'), ('B', '192.168.100.2')]:
+    for node, bind in [('A', '127.0.0.1'), ('B', PEER_HOST)]:
         doc = dict(common, node=dict(node_id=node, role='agent'),
                    listener=dict(bind=bind, port=19443), runtime_mode='docker')
         (WORK / f'agent-{node}.yaml').write_text(yaml.safe_dump(doc))
@@ -62,9 +74,9 @@ def prepare():
                listener=dict(bind='127.0.0.1', port=18443),
                gateway_listener=dict(bind='127.0.0.1', port=18000),
                nodes={n: dict(agent_url=f'http://{ip}:19443', qsfp_ip=qsfp,
-                              qsfp_iface='enp1s0f1np1', ssh_user='chopc')
+                              qsfp_iface='enp1s0f1np1', ssh_user=PEER_USER or getpass.getuser())
                       for n, ip, qsfp in [('A', '127.0.0.1', '192.168.100.1'),
-                                          ('B', '192.168.100.2', '192.168.100.2')]})
+                                          ('B', PEER_HOST, PEER_HOST)]})
     (WORK / 'controller.yaml').write_text(yaml.safe_dump(cfg))
     resolved = resolve_hf_revision(f'{MODEL}@{REVISION}')
     write_json(WORK / 'model-info.json', resolved)
@@ -114,8 +126,8 @@ def deploy():
 
 async def stage():
     actions = AgentActions(load_config(WORK / 'agent-A.yaml', AgentConfig))
-    for action, params in [('download', {}), ('sync', {'target_host': '192.168.100.2',
-                                                       'ssh_user': 'chopc'})]:
+    for action, params in [('download', {}), ('sync', {'target_host': PEER_HOST,
+                                                       'ssh_user': PEER_USER or getpass.getuser()})]:
         result = await actions.dispatch(action, dict(repo=MODEL, revision=REVISION, **params))
         while True:
             state = actions.task_status(result)

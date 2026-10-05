@@ -396,11 +396,11 @@ def test_empty_master_key_left_by_a_crash_is_recreated_and_instances_agree(tmp_p
 
 # ---- join code and authorised key --------------------------------------------------------------------------------
 GOOD = {"v": 1, "agent_token": "t", "backend_api_key": "b", "a_ip": "192.168.100.1", "b_ip": "192.168.100.2",
-        "b_user": "chopc", "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYEXAMPLEKEY twinspark-sync@a"}
+        "b_user": "sparkuser", "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYEXAMPLEKEY twinspark-sync@a"}
 
 
 def test_join_code_is_validated_field_by_field():
-    assert decode_join(encode_join(GOOD))["b_user"] == "chopc"
+    assert decode_join(encode_join(GOOD))["b_user"] == "sparkuser"
     for patch, message in (({"a_ip": "not-an-ip"}, "invalid address"),
                            ({"b_user": "Robert'); DROP"}, "invalid user"),
                            ({"pubkey": GOOD["pubkey"] + "\nssh-ed25519 AAAAATTACKER x"}, "single OpenSSH"),

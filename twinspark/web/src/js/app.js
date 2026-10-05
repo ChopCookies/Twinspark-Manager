@@ -88,7 +88,14 @@ function dur(a, b) {
 function when(t) { const ms = toTs(t); return ms ? new Date(ms).toLocaleString() : "—"; }
 const tag = (t, c = "") => `<span class="tag ${c}">${esc(t)}</span>`;
 const dot = (c = "", pulse = false) => `<span class="dot ${c} ${pulse ? "pulse" : ""}"></span>`;
-function verifTag(v) { return tag(v, { verified: "good", community: "info", experimental: "warn" }[v] || "muted"); }
+const VERIF_HELP = {
+  verified: "Ran on the TwinSpark maintainers' two DGX Sparks (date and details in the recipe's source note)",
+  community: "Published and measured by its author on two DGX Sparks; not run by the TwinSpark maintainers",
+  experimental: "Derived or untested: compare `tsm plan` with the source before the first activation",
+};
+function verifTag(v) {
+  return `<span title="${esc(VERIF_HELP[v] || "")}">${tag(v, { verified: "good", community: "info", experimental: "warn" }[v] || "muted")}</span>`;
+}
 function levelClass(l) { return { SAFE: "good", LOW: "warn", CRITICAL: "bad" }[l] || "muted"; }
 function empty(title, text = "") { return `<div class="empty"><b>${esc(title)}</b>${esc(text)}</div>`; }
 function codeBlock(text, cls = "") {
