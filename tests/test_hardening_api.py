@@ -344,3 +344,30 @@ async def test_wait_for_rate_window_helper_sanity():
     exc = _too_many()
     assert 1 <= int(exc.headers["Retry-After"]) <= 60 and exc.status_code == 429
     assert time.time() > 0
+
+
+# ---- management_auth: none and DNS rebinding -----------------------------------------------------
+def _keyless_app(tmp_path):
+    from twinspark.controller.controller import Controller
+    from twinspark.gateway.gateway import Gateway
+    from twinspark.schemas.config import ControllerConfig
+
+    cfg = ControllerConfig(node=NodeIdentity(node_id="A", role="controller"), db_path=str(tmp_path / "s.db"),
+                           secrets_dir=str(tmp_path / "secrets"), management_auth="none", autostart=False)
+    return create_app(Controller(cfg, Gateway("i", "b"), {}), "", run_startup=False, background=False)
+
+
+@pytest.mark.parametrize("host", ["attacker.example:8443", "attacker.example", "192.168.1.10:8443", ""])
+async def test_without_a_key_only_loopback_host_names_are_served(tmp_path, host):
+    """A rebinding page reaches 127.0.0.1 under its own name; that name is in Host."""
+    app = _keyless_app(tmp_path)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://x") as c:
+        r = await c.get("/api/v1/audit", headers={"host": host})
+        assert r.status_code == 403, host
+
+
+@pytest.mark.parametrize("host", ["localhost:8443", "127.0.0.1:8443", "[::1]:8443", "localhost", "127.0.0.2"])
+async def test_without_a_key_the_tunnel_still_works(tmp_path, host):
+    app = _keyless_app(tmp_path)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://x") as c:
+        assert (await c.get("/api/v1/audit", headers={"host": host})).status_code == 200, host

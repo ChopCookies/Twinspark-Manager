@@ -315,6 +315,65 @@ def test_vault_files_are_private_and_the_master_key_is_never_overwritten(tmp_pat
     assert vault.key_file.read_bytes() == key
 
 
+def _as_root(monkeypatch) -> list:
+    """Pretend to be root and record fchown calls (works without real root)."""
+    calls = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    return calls
+
+
+def test_root_writes_secrets_owned_by_the_vault_directory_owner(tmp_path, monkeypatch):
+    """`sudo tsm init --hf-token` / `sudo tsm remote plug-token` must not leave root-owned files the
+    service user cannot read (the controller would then fail on its next restart)."""
+    calls = _as_root(monkeypatch)
+    d = tmp_path / "s"
+    d.mkdir()
+    real = d.stat()
+    monkeypatch.setattr(Path, "stat", lambda self, **kw: os.stat_result(
+        (real.st_mode, 0, 0, 1, 4242, 4343, 0, 0, 0, 0)) if self == d else os.stat(self, **kw))
+    SecretsVault(d).set("plug_token", "p")
+    assert calls == [(4242, 4343), (4242, 4343)]                    # the new master key and the secret
+
+
+def test_root_writing_into_a_root_owned_vault_changes_no_owner(tmp_path, monkeypatch):
+    calls = _as_root(monkeypatch)
+    d = tmp_path / "s"
+    d.mkdir()
+    real = d.stat()
+    monkeypatch.setattr(Path, "stat", lambda self, **kw: os.stat_result(
+        (real.st_mode, 0, 0, 1, 0, 0, 0, 0, 0, 0)) if self == d else os.stat(self, **kw))
+    SecretsVault(d).set("hf_token", "hf_x")
+    assert calls == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs real root to chown")
+def test_real_root_hands_new_secret_files_to_the_service_user(tmp_path):
+    d = tmp_path / "s"
+    d.mkdir()
+    os.chown(d, 65534, 65534)
+    vault = SecretsVault(d)
+    vault.set("hf_token", "hf_x")
+    for p in d.iterdir():
+        assert (p.stat().st_uid, p.stat().st_gid) == (65534, 65534), p
+        assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+def test_an_unreadable_secret_says_how_to_fix_it(tmp_path, monkeypatch):
+    vault = SecretsVault(tmp_path / "s")
+    vault.set("hf_token", "hf_x")
+    target, real = vault.dir / "hf_token.enc", Path.read_bytes
+
+    def denied(self):
+        if self == target:
+            raise PermissionError(13, "Permission denied")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    with pytest.raises(PermissionError, match="chown --reference"):
+        vault.get("hf_token")
+
+
 def test_empty_master_key_left_by_a_crash_is_recreated_and_instances_agree(tmp_path):
     d = tmp_path / "s"
     d.mkdir()

@@ -215,12 +215,48 @@ def test_preflight_passes_on_a_clean_machine(node):
 
 def test_it_refuses_the_interface_with_the_default_route(node):
     node.default_dev = SECONDARY
-    host, d, plan = plan_a(node)
+    with pytest.raises(qsfp.QsfpError, match="cabled to your network"):
+        plan_a(node)                                                 # never picked on its own
+    host, d, plan = plan_a(node, iface=PRIMARY)                      # named: the guard still stops it
     problems = qsfp.preflight(host, d, plan)
     assert any(SECONDARY in p and "default route" in p for p in problems)
     with pytest.raises(qsfp.QsfpError, match="default route"):
         qsfp.apply(host, plan, d=d)
     assert not host.managed_file.exists()
+
+
+def _second_port(node, *, up=True, uplink=False):
+    """Give the fake the left-hand port f0np0 with both twins; ``uplink`` cables it to the LAN (DHCP, default)."""
+    for name, hca in (("enp1s0f0np0", "rocep1s0f0"), ("enP2p1s0f0np0", "roceP2p1s0f0")):
+        node.ifaces[name] = {"ips": [], "mtu": 1500, "up": up, "hca": hca, "roce": True, "virtual": False}
+    if uplink:
+        node.ifaces["enp1s0f0np0"]["ips"] = ["10.0.1.50/24"]
+        node.default_dev = "enp1s0f0np0"
+    node.sync()
+
+
+def test_a_port_cabled_to_the_network_is_never_chosen_even_with_an_address(node):
+    """f0 goes to a switch (DHCP address, default route), f1 is the fresh cable to the other Spark."""
+    _second_port(node, uplink=True)
+    host, d, plan = plan_a(node)
+    assert plan.port == "f1np1" and {e.iface for e in plan.entries} == {PRIMARY, SECONDARY}
+    assert qsfp.choose_port(d).key == "f1np1"                        # status picks the same port
+
+
+def test_the_twin_of_a_network_port_is_not_configured_when_named(node):
+    _second_port(node, uplink=True)
+    host, d, plan = plan_a(node, iface="enP2p1s0f0np0")
+    assert any("enp1s0f0np0" in p and "default route" in p for p in qsfp.preflight(host, d, plan))
+    with pytest.raises(qsfp.QsfpError, match="default route"):
+        qsfp.apply(host, plan, d=d)
+
+
+def test_two_spark_cables_need_iface_before_anything_is_planned(node):
+    _second_port(node)
+    with pytest.raises(qsfp.QsfpError, match="--iface"):
+        plan_a(node)
+    assert plan_a(node, iface="enp1s0f0np0")[2].port == "f0np0"
+    assert plan_a(node, configured=PRIMARY)[2].port == "f1np1"       # controller.yaml decides
 
 
 def test_it_refuses_an_interface_an_ssh_session_arrives_through(node):
@@ -232,7 +268,7 @@ def test_it_refuses_an_interface_an_ssh_session_arrives_through(node):
     d = qsfp.discover(host)
     plan = qsfp.make_plan(d.ports[0], 1, host=host, owned={PRIMARY, SECONDARY})        # force a plan that touches it
     problems = qsfp.preflight(host, d, plan)
-    assert any("SSH session (192.168.100.2) arrives through " + PRIMARY in p for p in problems)
+    assert any("remote session (192.168.100.2) arrives through " + PRIMARY in p for p in problems)
 
 
 def test_the_ssh_session_is_found_through_the_environment_too(node):
@@ -240,7 +276,7 @@ def test_the_ssh_session_is_found_through_the_environment_too(node):
     host = node.host(real=True, env={"SSH_CONNECTION": "192.168.100.2 5555 192.168.100.1 22"})
     d = qsfp.discover(host)
     plan = qsfp.make_plan(d.ports[0], 1, host=host, owned={PRIMARY, SECONDARY})
-    assert any("SSH session" in p for p in qsfp.preflight(host, d, plan))
+    assert any("remote session" in p for p in qsfp.preflight(host, d, plan))
     assert qsfp.ssh_clients(host)[0] == "192.168.100.2"
 
 
@@ -521,6 +557,25 @@ def test_revert_temporary_removes_just_those_addresses(node):
         qsfp.revert(host, temporary=True)
 
 
+def test_revert_temporary_leaves_the_permanent_layout_alone(node):
+    """After a permanent apply (or a reboot that cleared /run) there is nothing temporary to remove."""
+    host, d, plan = real(node)
+    qsfp.apply(host, plan, d=d)
+    node.calls.clear()
+    with pytest.raises(qsfp.QsfpError, match="without --temporary"):
+        qsfp.revert(host, temporary=True, plan=plan)
+    assert not [c for c in node.calls if c[:3] == ["ip", "addr", "del"]]
+    assert [t.ipv4 for t in qsfp.discover(host).ports[0].twins] == [["192.168.100.1/24"], ["192.168.101.1/24"]]
+
+
+def test_remote_terminal_sessions_count_as_sessions(node):
+    node.ssh_clients = ["192.168.100.2"]
+    host = node.host(real=True)
+    assert qsfp.ssh_clients(host) == ["192.168.100.2"]
+    ss = next(c for c in node.calls if c[0] == "ss")
+    assert ":22" in ss and f":{qsfp.TERMINAL_PORT}" in ss and "or" in ss
+
+
 def test_temporary_in_a_sandbox_records_the_commands_without_running_them(node):
     host, d, plan = plan_a(node)
     out = qsfp.apply(host, plan, temporary=True, d=d)
@@ -751,7 +806,7 @@ def test_revert_has_the_same_guards_as_apply(node):
     host, d, plan = real(node)
     qsfp.apply(host, plan, d=d)
     node.ssh_clients = ["192.168.100.2"]
-    with pytest.raises(qsfp.QsfpError, match="SSH session"):
+    with pytest.raises(qsfp.QsfpError, match="remote session"):
         qsfp.revert(host)
     assert host.managed_file.exists()
     node.ssh_clients = []
@@ -765,7 +820,7 @@ def test_an_ipv6_link_local_ssh_session_names_its_interface(node):
     d = qsfp.discover(host)
     plan = qsfp.plan_for_node(d, "A", host=host)
     node.ssh_clients = [f"[fe80::1%{SECONDARY}]"]
-    assert any("SSH session (fe80::1%" in p for p in qsfp.preflight(host, d, plan))
+    assert any("remote session (fe80::1%" in p for p in qsfp.preflight(host, d, plan))
     node.ssh_clients = ["[fe80::1%enP7s7]"]
     assert qsfp.preflight(host, d, plan) == []
 

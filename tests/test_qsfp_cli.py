@@ -75,7 +75,8 @@ def test_plan_json(fake, capsys):
 def test_plan_reports_blockers(fake, capsys):
     fake.default_dev = SECONDARY
     fake.ssh_clients = []
-    out = run(fake, "plan", "--node", "A", capsys=capsys)
+    assert "cabled to your network" in run(fake, "plan", "--node", "A", expect="msg")
+    out = run(fake, "plan", "--node", "A", "--iface", PRIMARY, capsys=capsys)
     assert "default route" in out and "Not safe to apply yet" in out
 
 
@@ -116,8 +117,10 @@ def test_apply_without_a_terminal_needs_yes(fake, monkeypatch):
 
 def test_apply_refuses_when_it_is_not_safe(fake, capsys):
     fake.default_dev = PRIMARY
-    msg = run(fake, "apply", "--node", "A", "--yes", expect="msg")
-    assert "not safe to continue" in msg
+    assert "default route" in run(fake, "apply", "--node", "A", "--yes", expect="msg")
+    capsys.readouterr()
+    msg = run(fake, "apply", "--node", "A", "--yes", "--iface", SECONDARY, expect="msg")
+    assert "not safe to continue" in msg and "default route" in capsys.readouterr().out
     assert not list(fake.netplan_dir().glob("*.yaml"))
 
 

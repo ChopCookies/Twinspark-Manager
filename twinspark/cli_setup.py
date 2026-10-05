@@ -381,6 +381,11 @@ def cmd_setup(args, api=None):
     a.hostname = hostprobe.platform.node()
     a.docker_group = hostprobe.group_exists("docker")
     info: Optional[dict[str, Any]] = None
+    if args.join == "-":                  # read it instead of putting secrets on the command line
+        args.join = (getpass.getpass("Join code from node A (input hidden): ") if sys.stdin.isatty()
+                     else sys.stdin.readline()).strip()
+        if not args.join:
+            sys.exit("error: no join code given")
     if args.join:
         try:
             info = provision.decode_join(args.join)
@@ -442,9 +447,18 @@ def cmd_setup(args, api=None):
     _after(args, con, lay, a, pv)
 
 
+def _sandbox_note(con: Console, lay: Layout) -> None:
+    if lay.sandbox:
+        con.say(f"\n  [sandbox] Everything was written under {lay.root}; nothing on this machine changed.")
+        con.say("  The steps below are what a real install prints. To run this sandbox's services:")
+        cfg = lay.controller_yaml if lay.controller_yaml.exists() else lay.agent_yaml
+        con.say(f"       tsm serve {'controller' if cfg == lay.controller_yaml else 'agent'} --config {cfg}")
+
+
 def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None:
     v = pv.vault
     live = pv.systemd and not any(s.status == "failed" for s in pv.steps)
+    _sandbox_note(con, lay)
     if a.role == "agent":
         if live:
             tok = v.get("agent_token")
@@ -471,7 +485,8 @@ def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None
     if code:
         con.say(f"  {n}. On the OTHER Spark run (this code contains secrets — it expires when you rotate keys):")
         con.say(f"       sudo tsm setup --join {code}")
-        con.say("       (no tsm there yet?  git clone … && sudo ./install.sh --join <code>)")
+        con.say("       (no tsm there yet?  git clone … && sudo ./install.sh --join <code>;"
+                " `--join -` asks for the code instead)")
         n += 1
     key = v.get("management_api_key")
     host = a.hostname or "this-machine"
@@ -482,7 +497,8 @@ def _after(args, con: Console, lay: Layout, a: Answers, pv: Provisioner) -> None
         con.say(f"  {n}. Open http://{a.mgmt_bind if a.mgmt_bind != '0.0.0.0' else host}:{a.mgmt_port}/")
     n += 1
     con.say(f"  {n}. The GUI asks for the management key:  {key}")
-    con.say("       (print it again any time with `tsm init --show`)")
+    con.say("       (print it again any time with `tsm init --show`"
+            + (f"; for this sandbox: `tsm --secrets-dir {lay.secrets} init --show`)" if lay.sandbox else ")"))
     n += 1
     con.say(f"  {n}. Follow the 'Get started' page in the GUI, or:  tsm doctor")
     if not a.remote.get("terminal"):
@@ -567,7 +583,8 @@ for _fn in (cmd_setup, cmd_join_code, cmd_go_live):
 
 def add_parsers(sub, cmd) -> None:
     s = cmd("setup", cmd_setup, "guided first-run setup (config, secrets, services); --join for node B")
-    s.add_argument("--join", metavar="CODE", help="node B: the join code printed by node A")
+    s.add_argument("--join", metavar="CODE", help="node B: the join code printed by node A "
+                   "(`--join -` asks for it, so it stays out of the process list and shell history)")
     s.add_argument("--single", action="store_true", help="one Spark only (controller + agent)")
     s.add_argument("-y", "--yes", action="store_true", help="accept every detected default (unattended)")
     s.add_argument("--dry", action="store_true", help="show what would be written; change nothing")

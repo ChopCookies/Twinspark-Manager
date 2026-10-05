@@ -34,7 +34,8 @@ function startHtml(ob) {
     <p>${ob.complete ? "Everything required is done. Your cluster is ready." : `${ob.done} of ${ob.total} required steps done — the highlighted step is next.`}</p></div>
     <div class="row"><a class="btn" href="#/diagnostics/doctor">Full health check</a></div></div>
     <div class="progress-line" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%"></i></div>`;
-  if (ob.dry_run) html += `<div class="callout warn"><div><b>Dry-run mode.</b> Activations are simulated and nothing starts on the Sparks. That is the safe way to rehearse; use the “Real containers” step when you are ready.</div></div>`;
+  if (ob.demo) html += `<div class="callout info"><div><b>This is <span class="mono">tsm demo</span>.</b> Two simulated Sparks run on this computer. The commands below are what you would run on real Sparks; nothing here needs them (and <span class="mono">sudo</span> commands would act on this computer).</div></div>`;
+  else if (ob.dry_run) html += `<div class="callout warn"><div><b>Dry-run mode.</b> Activations are simulated and nothing starts on the Sparks. That is the safe way to rehearse; use the “Real containers” step when you are ready.</div></div>`;
   html += `<div class="start-list">${ob.steps.map(s => startStep(s, s.id === ob.next)).join("")}</div></div>`;
   return html;
 }

@@ -74,6 +74,35 @@ async def test_agents_reject_calls_without_the_shared_token(demo):
         assert ok.status_code == 200 and ok.json()["result"]["node_id"] == "B"
 
 
+async def test_the_banner_gives_working_keys_and_a_working_cli_line(demo, monkeypatch, capsys):
+    import asyncio
+    import shlex
+
+    from twinspark import cli
+    from twinspark.demo import banner
+
+    text = banner(demo)
+    assert "tsm init --show --secrets-dir" not in text                 # the old line did not parse
+    inference = SecretsVault(demo.a_layout.secrets).get("inference_api_key")
+    assert inference in text and demo.key in text
+    async with httpx.AsyncClient(base_url=demo.gateway_url, timeout=10) as c:
+        assert (await c.get("/v1/models", headers={"Authorization": f"Bearer {inference}"})).status_code == 200
+    export = next(line for line in text.splitlines() if "TSM_API" in line).split("CLI", 1)[1].strip()
+    if not export.startswith("export "):
+        pytest.skip("PowerShell syntax on Windows")
+    for kv in shlex.split(export)[1:]:
+        k, v = kv.split("=", 1)
+        monkeypatch.setenv(k, v)
+    capsys.readouterr()
+    assert await asyncio.to_thread(cli.main, ["status"]) == 0
+    assert "active" in capsys.readouterr().out
+    name = (await asyncio.to_thread(lambda: httpx.get(f"{demo.url}/api/v1/profiles?summary=true",
+                                                      headers=auth(demo)).json()))[0]["name"]
+    with pytest.raises(SystemExit) as e:
+        await asyncio.to_thread(cli.main, ["plan", name])
+    assert f"tsm plan {name} --draft" in (str(e.value) + capsys.readouterr().err + capsys.readouterr().out)
+
+
 async def test_gateway_requires_the_inference_key_and_answers_503_or_404_when_idle(demo):
     async with httpx.AsyncClient(base_url=demo.gateway_url, timeout=10) as c:
         r = await c.post("/v1/chat/completions", json={"model": "default", "messages": []})
@@ -89,6 +118,7 @@ async def test_checklist_progresses_as_the_operator_works(demo):
         assert steps["recipe"]["status"] == "done"             # the demo seeds recipes
         assert steps["pin"]["status"] == "todo" and ob["dry_run"] is True
         assert ob["next"] in ("link", "pin") and not ob["complete"]
+        assert ob["demo"] is True                              # the GUI says these commands are for real Sparks
 
 
 async def test_dry_run_plan_works_through_the_full_stack(demo):

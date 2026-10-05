@@ -178,7 +178,7 @@ def test_missing_local_image_is_never_pulled(tmp_path):
             return False
         def pull(self, ref):
             pytest.fail('must not pull a local image ID')
-    with pytest.raises(ActionError, match='pulling is disabled'):
+    with pytest.raises(ActionError, match='not on this node.*pin it again'):
         AgentActions(cfg, runtime=Runtime()).image_ensure({'image_ref': 'sha256:' + 'a' * 64})
 
 

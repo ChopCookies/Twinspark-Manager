@@ -176,6 +176,7 @@ async def test_pin_local_image_then_activate_needs_mods(cluster, monkeypatch):
     rev = res["revision"]
     assert rev["identity"]["image_source"] == "local"
     assert rev["identity"]["image_digest"].startswith("sha256:")
+    assert any("SIMULATED" in n and "tsm go-live" in n for n in res["notes"])   # dry-run never saw Docker
     assert rev["identity"]["model_revision"] == SHA and calls == [
         "deepseek-ai/DeepSeek-V4-Flash-0731@main"]
     assert c.model_spec("deepseek-ai/DeepSeek-V4-Flash-0731").weight_bytes == 20 * 1024**3

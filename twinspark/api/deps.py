@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import time
 from typing import Optional
 
@@ -34,6 +35,21 @@ def _too_many() -> HTTPException:
     return HTTPException(429, "rate limit exceeded", headers={"Retry-After": str(max(1, wait))})
 
 
+def _loopback_host(host_header: str) -> bool:
+    """True when the Host header names this machine's loopback (``localhost``, ``127.x``, ``[::1]``)."""
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def check_key(request: Request) -> None:
     """CSRF + management-key check, from headers only (safe to run before the body is read)."""
     ctrl: Controller = request.app.state.controller
@@ -48,7 +64,12 @@ def check_key(request: Request) -> None:
         elif request.headers.get("sec-fetch-site", "").lower() == "cross-site":
             raise HTTPException(403, "cross-site request rejected")
 
-    if cfg.management_auth != "none":
+    if cfg.management_auth == "none":
+        # Without a key, a web page could reach the API through DNS rebinding (its own name resolving to
+        # 127.0.0.1); such a request carries that name in Host, so only loopback names are accepted.
+        if not _loopback_host(request.headers.get("host", "")):
+            raise HTTPException(403, "management_auth is 'none': only http://localhost / 127.0.0.1 is accepted")
+    else:
         expected: str = request.app.state.management_key
         if not expected:
             raise HTTPException(503, "management key not configured — run `tsm init`")

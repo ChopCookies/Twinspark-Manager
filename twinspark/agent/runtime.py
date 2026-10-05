@@ -207,7 +207,7 @@ class DryRunRuntime:
         digest = "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
         return {"id": ref if ref.startswith("sha256:") else digest, "repo_tags": [ref],
                 "repo_digests": [], "architecture": "arm64", "labels": {}, "versions": {},
-                "size_bytes": 0, "created": None}
+                "size_bytes": 0, "created": None, "simulated": True}
 
     def pull(self, image_ref: str) -> None:
         self.history.append([self.docker, "pull", image_ref])

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import os
 import socket
 import sys
 import tempfile
@@ -29,9 +30,20 @@ from .provision import Answers, Layout, Provisioner
 from .security import SecretsVault
 
 
+class DemoError(RuntimeError):
+    """The demo cannot start on this machine (reported as one line, not a traceback)."""
+
+
 def free_port(host: str = "127.0.0.1") -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, 0))
+        try:
+            s.bind((host, 0))
+        except OSError as e:
+            if host == "127.0.0.1":
+                raise
+            # Linux and Windows route all of 127.0.0.0/8 to loopback; macOS only has 127.0.0.1
+            raise DemoError(f"the demo's node B needs the loopback address {host}, which this machine does "
+                            f"not have ({e.strerror}). On macOS: sudo ifconfig lo0 alias {host} up") from None
         return s.getsockname()[1]
 
 
@@ -91,6 +103,8 @@ class DemoCluster:
         a.agent_port = self.agent_port
         pa = Provisioner(a, self.a_layout, systemd=False)
         pa.apply()
+        with self.a_layout.controller_yaml.open("a", encoding="utf-8") as f:
+            f.write("\n# tsm demo: the GUI notes that its commands are meant for real Sparks\ndemo: true\n")
         code = provision.make_join(a, pa.vault, pa.pubkey)
         info = provision.decode_join(code)
         b = Answers(role="agent", node_id="B", hostname="demo-b", qsfp_iface="lo",
@@ -160,21 +174,36 @@ class DemoCluster:
         await self.stop()
 
 
+def banner(demo: DemoCluster, *, with_terminal: bool = False) -> str:
+    """What ``tsm demo`` prints once everything is up: every URL, key and command to get going."""
+    inference = SecretsVault(demo.a_layout.secrets).get("inference_api_key")
+    env = (f"$env:TSM_API='{demo.url}'; $env:TSM_KEY='{demo.key}'" if os.name == "nt"
+           else f"export TSM_API={demo.url} TSM_KEY={demo.key}")
+    lines = [
+        "TwinSpark demo — two simulated Sparks on this machine (containers are NOT run).",
+        f"  Web GUI      {demo.url}/",
+        f"  API key      {demo.key}",
+        f"  Gateway      {demo.gateway_url}/v1   (inference key {inference})",
+        f"  CLI          {env}",
+        "               then e.g. tsm status, tsm cookbook list, tsm plan <profile> --draft",
+        f"  Files        {demo.base}",
+        "  Try: open a profile in the GUI and press Plan. Pinning resolves the model and the image",
+        "       online (huggingface.co and the image registry), so it needs internet access.",
+        "  Ctrl-C stops everything" + (" and deletes the demo files." if demo._tmp
+                                       else f" (files stay in {demo.base})."),
+    ]
+    if with_terminal:
+        lines.append("  Remote page: the terminal is switched on — it opens a real shell as YOUR user on this machine.")
+    return "\n".join(lines)
+
+
 def cmd_demo(args, api=None) -> None:
     async def main() -> None:
         base = Path(args.dir) if args.dir else None
         demo = DemoCluster(base, seed=not args.empty, mgmt_port=args.port,
                            remote={"terminal": True} if getattr(args, "with_terminal", False) else None)
         await demo.start()
-        print("TwinSpark demo — two simulated Sparks on this machine (containers are NOT run).")
-        print(f"  Web GUI      {demo.url}/")
-        print(f"  API key      {demo.key}")
-        print(f"  Gateway      {demo.gateway_url}/v1   (inference key: tsm init --show --secrets-dir "
-              f"{demo.a_layout.secrets})")
-        print(f"  Files        {demo.base}")
-        print("  Try: import a recipe in the Cookbook, Pin & prepare it, press Plan. Ctrl-C stops and cleans up.")
-        if getattr(args, "with_terminal", False):
-            print("  Remote page: the terminal is switched on — it opens a real shell as YOUR user on this machine.")
+        print(banner(demo, with_terminal=getattr(args, "with_terminal", False)))
         try:
             await asyncio.gather(*demo.tasks)
         finally:
@@ -184,6 +213,8 @@ def cmd_demo(args, api=None) -> None:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\ndemo stopped")
+    except DemoError as e:
+        raise SystemExit(f"tsm demo: {e}") from None
 
 
 def add_parsers(sub, cmd) -> None:

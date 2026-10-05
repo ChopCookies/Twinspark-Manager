@@ -106,6 +106,27 @@ async def test_backend_down_gives_502():
     assert r.status_code == 502 and g.routes["default"].inflight == 0
 
 
+async def test_oversized_request_bodies_are_refused_before_parsing():
+    seen.clear()
+    g = Gateway("k", client=httpx.AsyncClient(transport=httpx.ASGITransport(app=fake_vllm())))
+    g.set_route("default", ["http://vllm"], "qwen")
+    app = build_gateway_app(g, max_request_bytes=1000)
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw",
+                               headers={"authorization": "Bearer k"})
+    big = {"model": "default", "messages": [{"role": "user", "content": "x" * 2000}]}
+    r = await client.post("/v1/chat/completions", json=big)
+    assert r.status_code == 413 and r.json()["error"]["type"] == "invalid_request_error"
+
+    async def chunks():                                     # no Content-Length: counted while reading
+        for _ in range(5):
+            yield b" " * 400
+
+    r = await client.post("/v1/chat/completions", content=chunks(), headers={"content-type": "application/json"})
+    assert r.status_code == 413 and not seen
+    ok = await client.post("/v1/chat/completions", json={"model": "default", "messages": []})
+    assert ok.status_code == 200 and len(seen) == 1
+
+
 # ---- management API ----------------------------------------------------------------
 def test_management_api_auth_and_profile_flow(cluster):
     app = create_app(cluster.controller, "mgmt-key", run_startup=False)

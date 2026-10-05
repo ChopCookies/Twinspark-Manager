@@ -361,6 +361,21 @@ def test_join_flow_end_to_end_node_b_gets_the_same_secrets(machine, tmp_path, ca
     assert info["agent_token"] == va.get("agent_token") and info["b_user"] == "chopc"
 
 
+def test_join_code_can_be_read_from_stdin_instead_of_argv(machine, tmp_path, capsys, monkeypatch):
+    import io
+
+    a_root, b_root = tmp_path / "a", tmp_path / "b"
+    run_cli("setup", "--root", a_root, "--yes", "--service-user", "chopc", "--no-start",
+            "--hf-cache-dir", tmp_path / "hfa")
+    code = next(line.split("--join ", 1)[1].strip() for line in capsys.readouterr().out.splitlines()
+                if "tsm setup --join tsm1." in line)
+    monkeypatch.setattr("sys.stdin", io.StringIO(code + "\n"))
+    assert run_cli("setup", "--root", b_root, "--yes", "--join", "-", "--no-start", "--service-user", "chopc",
+                   "--hf-cache-dir", tmp_path / "hfb", "--qsfp-iface", "enp1s0f1np1") == 0
+    assert SecretsVault(Layout(b_root).secrets).get("agent_token") == SecretsVault(Layout(a_root).secrets).get(
+        "agent_token") != ""
+
+
 def test_wizard_rejects_a_damaged_join_code_without_writing(machine, tmp_path):
     root = tmp_path / "b"
     with pytest.raises(SystemExit, match="damaged|not a TwinSpark join code"):

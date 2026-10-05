@@ -6,6 +6,7 @@
 #   Options:  --no-setup      install the program only
 #             --uninstall     stop services and remove the program (config and models are kept)
 #             --purge         with --uninstall: also delete /etc/twinspark and /var/lib/twinspark
+#                             (secrets, state, and models downloaded there)
 #             anything else   is passed to `tsm setup` (see `tsm setup --help`), e.g. --yes --single
 #
 # Environment (for staging / tests): TSM_HOME (default /opt/twinspark), TSM_BIN_DIR (default /usr/local/bin),
@@ -33,15 +34,20 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+[ "$(uname -s)" = "Linux" ] || die "TwinSpark targets Linux (the DGX Spark). On other systems use: python3.12 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/tsm demo"
+
 # $TSM_HOME is deleted by --uninstall and chown'ed by the install: it must be a dedicated directory.
 case "$TSM_HOME" in
-  /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
-    die "TSM_HOME=$TSM_HOME is a system directory; use a dedicated one such as /opt/twinspark" ;;
   /*) ;;
   *) die "TSM_HOME must be an absolute path (got '$TSM_HOME')" ;;
 esac
-
-[ "$(uname -s)" = "Linux" ] || die "TwinSpark targets Linux (the DGX Spark). On other systems use: python -m venv .venv && .venv/bin/pip install -e . && .venv/bin/tsm demo"
+TSM_HOME="$(realpath -m -- "$TSM_HOME")"          # no trailing slash, no //, no ..
+case "$TSM_HOME" in
+  /|/bin|/boot|/dev|/etc|/home|/home/*|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/root/*|/run|/sbin|/srv|/sys|/tmp|\
+  /usr|/usr/bin|/usr/lib|/usr/local|/usr/local/bin|/usr/local/lib|/usr/sbin|/usr/share|/var|/var/lib|/var/opt|/var/cache)
+    die "TSM_HOME=$TSM_HOME is a system or home directory; use a dedicated one such as /opt/twinspark" ;;
+esac
+MARKER="$TSM_HOME/.twinspark-install"             # written by the install; --uninstall only deletes a marked directory
 
 # Everything below writes to system locations: become root once, keeping the arguments.
 if [ "$(id -u)" -ne 0 ] && [ -z "${TSM_NO_SUDO:-}" ]; then
@@ -60,9 +66,15 @@ uninstall() {
     systemctl daemon-reload || true
   fi
   rm -f "$TSM_BIN_DIR/tsm"
-  rm -rf "$TSM_HOME"
+  if [ -f "$MARKER" ] || [ -x "$TSM_HOME/venv/bin/tsm" ]; then
+    rm -rf "$TSM_HOME"
+  elif [ -e "$TSM_HOME" ]; then
+    warn "not deleting $TSM_HOME: it does not look like a TwinSpark install (no $MARKER)"
+  fi
   if [ "$PURGE" -eq 1 ]; then
-    warn "purging /etc/twinspark and /var/lib/twinspark (secrets, state database, sync keys)"
+    size="$(du -sh /var/lib/twinspark 2>/dev/null | cut -f1 || true)"
+    warn "purging /etc/twinspark and /var/lib/twinspark${size:+ ($size)}: secrets, state database, sync keys" \
+         "and model files downloaded there (hf_cache_dir in agent.yaml, unless you pointed it elsewhere)"
     rm -rf /etc/twinspark /var/lib/twinspark /var/cache/twinspark
   else
     say "Kept /etc/twinspark and /var/lib/twinspark (use --purge to delete them). Model files were never touched."
@@ -105,6 +117,9 @@ command -v docker >/dev/null 2>&1 || warn "docker was not found. Setup can still
 # ---- 2. program -------------------------------------------------------------------------
 [ -f "$SRC/pyproject.toml" ] || die "run install.sh from a checkout of the TwinSpark repository (pyproject.toml not found next to it)"
 say "Installing TwinSpark into $TSM_HOME"
+if [ -d "$TSM_HOME" ] && [ ! -f "$MARKER" ] && [ ! -d "$TSM_HOME/venv" ] && [ -n "$(ls -A "$TSM_HOME")" ]; then
+  die "$TSM_HOME already exists and holds other files; choose an empty or new directory (TSM_HOME=...)"
+fi
 mkdir -p "$TSM_HOME"
 # An existing environment is reused and then run as root: it must not belong to somebody else.
 if [ -e "$TSM_HOME" ] && [ "$(stat -c %u "$TSM_HOME")" != "0" ]; then
@@ -121,6 +136,7 @@ fi
 # same version number, newer checkout (git pull): make sure the program itself is replaced
 "$TSM_HOME/venv/bin/python" -m pip install --quiet --force-reinstall --no-deps "$SRC" || die "pip could not refresh TwinSpark"
 rm -rf "$SRC/build" "$SRC"/*.egg-info 2>/dev/null || true
+echo "TwinSpark Manager program directory; \`install.sh --uninstall\` deletes it." > "$MARKER"
 # code that runs as root (privd) must not be writable by anyone else
 chown -R root:root "$TSM_HOME"
 chmod -R go-w "$TSM_HOME"

@@ -7,6 +7,8 @@ Object.assign(ICON, {
   remote: '<path d="M3 5h18v11H3zM8 20h8M12 16v4M7 9l2.5 2L7 13m4.5 0H15" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
 });
 NAV.splice(Math.max(0, NAV.findIndex(n => n[0] === "diagnostics") + 1), 0, ["remote", "Remote"]);
+// The docs are not part of the installed package: link to them on GitHub (the path also names the file in a checkout).
+const REMOTE_DOC = '<a href="https://github.com/ChopCookies/Twinspark-Manager/blob/main/docs/remote-management.md" target="_blank" rel="noopener noreferrer">docs/remote-management.md</a>';
 ROUTES.push([/^\/remote(?:\/([A-Za-z]))?$/, (m) => viewRemote(m[1] ? m[1].toUpperCase() : null)]);
 
 const REMOTE_FEATURES = [
@@ -150,7 +152,7 @@ function remotePowerHtml(n, ov) {
       <div class="row">${(n.plug_actions || []).includes("on") ? `<button class="btn sm" data-act="plug-on">Switch on</button>` : ""}
       ${(n.plug_actions || []).includes("off") ? `<button class="btn sm danger" data-act="plug-off">Cut power</button>` : ""}
       <button class="btn sm danger" data-act="plug-cycle">Power-cycle</button></div></div>`
-    : `<div class="item"><div class="grow"><b>Smart plug</b> ${tag("not configured", "muted")}<div class="small muted">Add nodes.${esc(n.node)}.plug to controller.yaml (docs/remote-management.md) to power-cycle a hung node.</div></div></div>`;
+    : `<div class="item"><div class="grow"><b>Smart plug</b> ${tag("not configured", "muted")}<div class="small muted">Add nodes.${esc(n.node)}.plug to controller.yaml (${REMOTE_DOC}) to power-cycle a hung node.</div></div></div>`;
   const wake = n.wake_configured && n.node !== ov.controller_node ? `<div class="item"><div class="grow"><b>Wake-on-LAN</b> ${tag(n.mac || "", "muted")}
       <div class="small muted">Sends a magic packet from this machine. It cannot be acknowledged; if the node does not appear in a minute or two, it is not working on that port.</div></div>
       <button class="btn sm" data-act="wake">Send packet</button></div>`
@@ -163,7 +165,7 @@ function remotePowerHtml(n, ov) {
       <div class="row"><button class="btn sm danger" data-act="poweroff" ${dis(n.reachable && remoteOn(n, "poweroff") && n.privd)}>Power off…</button></div></div>
     <div class="item"><div class="grow"><b>Cancel pending reboot / power-off</b></div>
       <div class="row"><button class="btn sm" data-act="cancel" ${dis(n.reachable && (n.power_pending || []).length > 0)}>Cancel</button></div></div>
-    <div class="item"><div class="grow"><b>Boot once from network / USB</b><div class="small muted">Rescue boot: the next start only. Needs a PXE server — see “tsm netboot” in docs/remote-management.md.</div>${need("boot_next")}</div>
+    <div class="item"><div class="grow"><b>Boot once from network / USB</b><div class="small muted">Rescue boot: the next start only. Needs a PXE server — see “tsm netboot” in ${REMOTE_DOC}.</div>${need("boot_next")}</div>
       <div class="row"><button class="btn sm" data-act="boot" ${dis(n.reachable && remoteOn(n, "boot_next") && n.privd)}>Choose…</button></div></div>
     <div class="item"><div class="grow"><b>Wake-on-LAN on the node</b><div class="small muted">Lets the node be woken by a magic packet. Test it once while you can reach the machine.</div>${need("wol")}</div>
       <div class="row"><button class="btn sm" data-act="wol" ${dis(n.reachable && remoteOn(n, "wol") && n.privd)}>Set…</button></div></div>

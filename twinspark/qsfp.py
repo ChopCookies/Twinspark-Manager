@@ -247,8 +247,18 @@ def discover(host: Optional[Host] = None, *, ifaces: Optional[list[hostprobe.Ifa
     return Discovery(ports, ifaces, routes, rdma, routes_known)
 
 
-def choose_port(d: Discovery, iface: Optional[str] = None, configured: Optional[str] = None) -> Port:
-    """The port to manage: the one named, else the cabled one (preferring what controller.yaml says)."""
+def uplink(d: Discovery, port: Port) -> list[str]:
+    """Twins of ``port`` that carry the machine's default route: the port is cabled to a network, not a Spark."""
+    return [t.iface for t in port.twins if t.iface in d.default_route_ifaces]
+
+
+def choose_port(d: Discovery, iface: Optional[str] = None, configured: Optional[str] = None, *,
+                strict: bool = False) -> Port:
+    """The port to manage: the one named, else the cabled one (preferring what controller.yaml says).
+
+    A port whose twin carries the default route is cabled to the network, so it is never picked on its own.
+    ``strict`` (used when a change is planned) refuses to guess between two cabled ports.
+    """
     if not d.ports:
         raise QsfpError("no ConnectX port found (looked for enp1s0f1np1-style interfaces). Is this a DGX Spark? "
                         "Use `ip -br link` to see what the machine has.")
@@ -262,14 +272,23 @@ def choose_port(d: Discovery, iface: Optional[str] = None, configured: Optional[
     if not cabled:
         raise QsfpError("no QSFP link is up. Check that the cable sits in the SAME port on both Sparks, that the "
                         "other Spark is powered on, then try again (`ibdev2netdev` should show '(Up)').")
-    if len(cabled) == 1:
-        return cabled[0]
+    links = [p for p in cabled if not uplink(d, p)]
+    if not links:
+        names = ", ".join(n for p in cabled for n in uplink(d, p))
+        raise QsfpError(f"the only QSFP port with a link carries this machine's default route ({names}): it is "
+                        f"cabled to your network, not to the other Spark. Cable the Sparks together on the other "
+                        f"port, or name the port with --iface")
+    if len(links) == 1:
+        return links[0]
     if configured:
-        pick = next((p for p in cabled if configured in p.names()), None)
+        pick = next((p for p in links if configured in p.names()), None)
         if pick:
             return pick
-    with_addr = [p for p in cabled if any(t.ipv4 for t in p.twins)]
-    pool = with_addr or cabled
+    if strict:
+        raise QsfpError(f"{len(links)} QSFP ports have a link ({', '.join(p.primary.iface for p in links)}). "
+                        f"Say which one is the cable to the other Spark: --iface NAME")
+    with_addr = [p for p in links if any(t.ipv4 for t in p.twins)]
+    pool = with_addr or links
     return sorted(pool, key=lambda p: p.key, reverse=True)[0]       # f1np1 = the right-hand port, like the guides
 
 
@@ -509,7 +528,7 @@ def plan_for_node(d: Discovery, node_id: Optional[str] = None, *, iface: Optiona
     ``192.168.100.0/24``.
     """
     host = host or Host()
-    port = choose_port(d, iface, configured)
+    port = choose_port(d, iface, configured, strict=True)
     owned = owned_ifaces(host)
     foreign = next((t for t in port.twins if t.ipv4 and t.iface not in owned), None)
     state = managed_layout(host)
@@ -541,8 +560,11 @@ def ssh_client_ip(env: dict[str, str]) -> Optional[str]:
     return parts[0] if len(parts) == 4 else None
 
 
+TERMINAL_PORT = 9444          # tsm-termd: the GUI's Remote terminal (on node B it arrives over the link)
+
+
 def ssh_clients(host: Host) -> list[str]:
-    """Addresses of everybody connected to this machine's sshd — this session included.
+    """Addresses of everybody with a shell on this machine: sshd and the Remote terminal, this session included.
 
     ``SSH_CONNECTION`` is lost across ``sudo``, so the live connection table is read as well.
     """
@@ -550,7 +572,8 @@ def ssh_clients(host: Host) -> list[str]:
     ip = ssh_client_ip(host.env)
     if ip:
         found.append(ip)
-    rc, out = host.run2(["ss", "-Hnt", "state", "established", "sport", "=", ":22"], 5)
+    rc, out = host.run2(["ss", "-Hnt", "state", "established",
+                         "(", "sport", "=", ":22", "or", "sport", "=", f":{TERMINAL_PORT}", ")"], 5)
     if rc == 0:
         for line in out.splitlines():
             cols = line.split()
@@ -569,7 +592,7 @@ def _session_problems(host: Host, d: Discovery, names: list[str]) -> list[str]:
     on_route = sorted(set(names) & set(d.default_route_ifaces))
     if on_route:
         problems.append(f"{', '.join(on_route)} carries this machine's default route — it is the management "
-                        f"network, not the QSFP link; changing it could cut you off")
+                        f"network, not the link to the other Spark; changing it could cut you off")
     if host.sandbox:
         return problems
     if not d.routes_known:
@@ -589,8 +612,8 @@ def _session_problems(host: Host, d: Discovery, names: list[str]) -> list[str]:
                 problems.append(f"cannot tell which interface the SSH session from {client} arrives through")
                 continue
         if dev in names:
-            problems.append(f"an SSH session ({client}) arrives through {dev}; changing it could drop you. "
-                            f"Run this from the management network, or from the Remote terminal there")
+            problems.append(f"a remote session ({client}) arrives through {dev}; changing it could drop you. "
+                            f"Run this over the management network (SSH to its address on that network)")
     return problems
 
 
@@ -600,7 +623,9 @@ def preflight(host: Host, d: Discovery, plan: Plan, *, need_netplan: bool = True
     names = [e.iface for e in plan.entries]
     present = {i.name for i in d.ifaces}
     problems = [f"interface {n} does not exist on this machine" for n in names if n not in present]
-    problems += _session_problems(host, d, names)
+    # the whole port: a twin that carries the uplink or a session means the port is not the Spark-to-Spark link
+    port = next((p for p in d.ports if p.key == plan.port), None)
+    problems += _session_problems(host, d, sorted(set(names) | set(port.names() if port else [])))
     mine = host.managed_file
     if mine.exists() and not is_ours(mine):
         problems.append(f"{mine} exists and was not written by TwinSpark; not touching it")
@@ -869,11 +894,21 @@ def revert(host: Host, *, temporary: bool = False, plan: Optional[Plan] = None) 
     if temporary:
         todo: dict[str, dict[str, Any]] = {k: {"cidrs": list(v["cidrs"]), "mtu": v["mtu"]}
                                            for k, v in _temp_state(host).items()}
+        # the permanent layout is never "temporary": its addresses go with `revert` (no --temporary)
+        permanent = (set(_file_state(host.managed_file.read_text()))
+                     if host.managed_file.exists() and is_ours(host.managed_file) else set())
+        skipped = sorted({e.iface for e in (plan.entries if plan else [])} & permanent)
         for e in (plan.entries if plan else []):
+            if e.iface in permanent:
+                continue
             rec = todo.setdefault(e.iface, {"cidrs": [], "mtu": None})
             if e.cidr not in rec["cidrs"]:
                 rec["cidrs"].append(e.cidr)
         if not todo:
+            if skipped:
+                raise QsfpError(f"{', '.join(skipped)} {'is' if len(skipped) == 1 else 'are'} configured by "
+                                f"TwinSpark's netplan file, not temporarily; `sudo tsm qsfp revert` (without "
+                                f"--temporary) undoes that")
             raise QsfpError("no temporary addresses are recorded (a reboot removes them anyway); to remove a "
                             "particular layout, say which with --node A|B")
         if not host.sandbox:

@@ -29,8 +29,12 @@ def _profile(ctrl: Controller, name: str) -> Profile:
 
 
 def _revision(ctrl: Controller, name: str, ref: str) -> ProfileRevision:
-    rev = _profile(ctrl, name).get_revision(ref)
+    p = _profile(ctrl, name)
+    rev = p.get_revision(ref)
     if not rev:
+        if not p.revisions:
+            raise HTTPException(404, f"'{name}' has no pinned revision yet: pin it first (`tsm pin {name}`), "
+                                     f"or look at the unpinned draft (`tsm plan {name} --draft`)")
         raise HTTPException(404, "revision not found")
     return rev
 
