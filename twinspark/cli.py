@@ -1203,7 +1203,21 @@ def build_parser() -> argparse.ArgumentParser:
     cli_qsfp.add_parsers(sub, cmd)
     from . import demo
     demo.add_parsers(sub, cmd)
+    sub.add_parser("first-night").set_defaults(fn=cmd_first_night)      # no help=: not in `tsm --help`
     return p
+
+
+FIRST_NIGHT = ("The two Sparks spent their first night together.\n"
+               "Nothing happened: node B was still in dry-run.\n"
+               "(fixed in 0.5.1: `tsm link` now checks that both are live first)")
+
+
+def cmd_first_night(args, api) -> None:
+    """Easter egg. The 0.5.1 field test found a link test between a live node A and a dry-run node B."""
+    print(FIRST_NIGHT)
+
+
+cmd_first_night.local = True
 
 
 def main(argv=None) -> int:

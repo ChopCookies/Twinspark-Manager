@@ -497,3 +497,20 @@ test("a failed start being cleaned up has no Cancel, and an excerpt stays when n
   assert.doesNotMatch(shown, /Log excerpt/);
   assert.match(shown, /Startup evidence/);
 });
+
+test("first-night easter egg: the Konami code on the dashboard, never while typing", () => {
+  const c = client();
+  c.context.location = { hash: "#/dashboard" };
+  c.run("var shown = []; toast = (m, k) => shown.push([m, k]);");
+  const keys = ["ArrowUp", "ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown", "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight", "B", "a"];
+  const press = (target) => keys.forEach(key => c.context.firstNight({ key, target }));
+  press({ tagName: "INPUT" });
+  assert.equal(c.run("shown.length"), 0);
+  press({ tagName: "BODY" });
+  assert.equal(c.run("shown.length"), 1);
+  assert.match(c.run("shown[0][0]"), /^The two Sparks spent their first night together\.\nNothing happened: node B was still in dry-run\./);
+  assert.equal(c.run("shown[0][1]"), "egg");
+  c.context.location = { hash: "#/jobs" };
+  press({ tagName: "BODY" });
+  assert.equal(c.run("shown.length"), 1);
+});

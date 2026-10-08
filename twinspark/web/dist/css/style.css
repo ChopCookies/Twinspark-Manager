@@ -261,6 +261,7 @@ ul.plain li{margin:3px 0}
 .toast{background:rgba(17,26,51,.96);border:1px solid var(--stroke-2);color:var(--ink);padding:11px 16px;border-radius:12px;
   font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.5);animation:fade .2s;overflow-wrap:anywhere}
 .toast.bad{border-color:rgba(248,113,113,.55)}
+.toast.egg{white-space:pre-line}
 .toast.good{border-color:rgba(74,222,128,.45)}
 
 /* ---- misc ---- */

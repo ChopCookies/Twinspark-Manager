@@ -128,7 +128,7 @@ function toast(msg, kind = "") {
   const el = document.createElement("div");
   el.className = "toast " + kind; el.textContent = msg;
   $("#toasts").appendChild(el);
-  setTimeout(() => el.remove(), kind === "bad" ? 7000 : 3800);
+  setTimeout(() => el.remove(), kind === "bad" ? 7000 : kind === "egg" ? 10000 : 3800);
 }
 function fail(e) { console.error(e); toast(e.message || String(e), "bad"); }
 
@@ -1833,6 +1833,21 @@ async function viewLogs() {
 
 /* ============================== start ============================== */
 window.addEventListener("hashchange", () => { if (S.unlocked) route(); });
+
+/* Easter egg (same as `tsm first-night`): ↑↑↓↓←→←→BA on the dashboard. The 0.5.1 field test ran a link test
+   between a live node A and a node B that was still in dry-run. */
+const FIRST_NIGHT = "The two Sparks spent their first night together.\nNothing happened: node B was still in dry-run.\n(fixed in 0.5.1: link tests now check that both are live first)";
+const KONAMI = ["ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown", "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight", "b", "a"];
+let konami = 0;
+function firstNight(e) {
+  const t = e.target;
+  if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;   // typing, not playing
+  if (((location.hash || "#/").slice(1).split("/")[1] || "dashboard") !== "dashboard") { konami = 0; return; }
+  const k = typeof e.key === "string" && e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  konami = k === KONAMI[konami] ? konami + 1 : k === "ArrowUp" ? (konami === 2 ? 2 : 1) : 0;
+  if (konami === KONAMI.length) { konami = 0; toast(FIRST_NIGHT, "egg"); }
+}
+document.addEventListener("keydown", firstNight);
 document.addEventListener("DOMContentLoaded", () => {
   $("#gate-form").addEventListener("submit", (e) => { e.preventDefault(); const k = $("#gate-key").value.trim(); if (k) unlock(k); });
   $("#logout").addEventListener("click", () => lock());

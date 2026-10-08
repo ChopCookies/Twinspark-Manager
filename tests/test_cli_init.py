@@ -59,3 +59,10 @@ def test_show_with_a_lost_master_key_creates_no_new_one(tmp_path):
     with pytest.raises(SystemExit, match="missing or empty"):
         run("--secrets-dir", sec, "init", "--show")
     assert not (sec / ".master.key").exists()
+
+
+def test_first_night_is_hidden_and_needs_no_controller(capsys):
+    from twinspark import cli
+    assert "first-night" not in cli.build_parser().format_help()
+    assert cli.main(["first-night"]) == 0                       # no API, no key: runs anywhere
+    assert "node B was still in dry-run" in capsys.readouterr().out
