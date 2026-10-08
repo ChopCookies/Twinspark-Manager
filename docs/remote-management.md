@@ -56,6 +56,43 @@ Only the JSON value `true` counts — `"yes"` or `1` do not.
 
 `sudo tsm setup --remote terminal,reboot` (or `--remote all`) does the same during installation.
 
+## Before you close the desktop: a way back in
+
+Going headless (`tsm headless headless-safe` for the next boot, `headless-max` to stop the desktop now)
+is only safe once you can reach both nodes without their screens. `tsm headless status` and the
+**Headless** tab of the Diagnostics page show, per node, the facts that decide that, each on its own:
+
+- the desktop: running or not, and the default boot target (`graphical` or `multi-user`);
+- SSH: `ssh.service` / `ssh.socket` running, and whether it starts at boot;
+- Tailscale: installed, `tailscaled` running and starting at boot, the node's tailnet address, and on
+  node A whether the manager port is forwarded (`unknown` when `tailscale serve status` needs root);
+- the remote paths that result (`ssh`, `tailscale`, or none).
+
+`headless-max` stops the display manager **even without `--now`**, so the CLI and the GUI ask before it
+(the CLI lists each node's remote paths first and warns about a node without one; `-y` skips the
+question), and the controller refuses it — like `--now` — while a model is being activated.
+
+### Reaching the GUI over Tailscale
+
+The controller listens on `127.0.0.1:8443`. To open it from your laptop without an SSH tunnel, forward
+that port on the tailnet only, on node A:
+
+```bash
+tsm remote tailscale-serve            # state + the exact command; changes nothing
+sudo tsm remote tailscale-serve --apply    # = sudo tailscale serve --bg --tcp=8443 tcp://127.0.0.1:8443
+sudo tsm remote tailscale-serve --remove   # undo
+```
+
+`--bg` stores the forward in `tailscaled`'s state, so it survives reboots. Plain TCP forwarding needs no
+HTTPS certificates on the tailnet. `--apply` then fetches `/api/v1/health` through the node's tailnet
+address. That proves the forward works, but only from the node itself: open
+`http://<node A's tailnet IP>:8443/` (`https://` with a TLS listener) from another tailnet device before
+you close the desktop. The management key is still required for everything. `--apply` refuses a
+controller set to `management_auth: none`, because through the forward any tailnet device could send
+`Host: localhost`, and `tsm doctor` fails if that setting appears later while the forward exists.
+Tailscale SSH may ask for an extra identity check depending on your tailnet policy, so do not count on
+it for unattended access.
+
 ## The terminal
 
 Open **Remote → Terminal → Open terminal** (phones get an extra key row for Esc, Tab, Ctrl-C/D/L and

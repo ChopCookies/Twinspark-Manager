@@ -77,6 +77,14 @@ ruff check .
 node --test tests/*.test.cjs                                         # GUI logic, no browser
 ```
 
+`tests/test_browser_live_refresh.py` drives the real GUI in Chromium against an in-process demo cluster. It
+checks that the 5-second dashboard refresh patches the page in place instead of rebuilding it: no fade, and
+focus and selection are kept. It needs `pip install playwright` and a Chromium (`playwright install
+chromium`, or point `TSM_TEST_CHROMIUM` at one), and is skipped otherwise.
+
+The suite must pass as root and as an ordinary user, on a machine without `efibootmgr`, `fwupd`,
+`tailscale` or `netplan`. Fake every host tool a test touches; never let a test see the real one.
+
 `tests/test_hardening_api.py`, `_controller.py` and `_agent.py` hold the regression tests for every bug
 found while exercising the stack on loopback (auth, input handling, secrets, mods, watchdog,
 maintenance). When you fix a bug, add its test next to those. Pinning needs Hugging Face, so the

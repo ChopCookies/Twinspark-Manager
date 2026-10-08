@@ -28,6 +28,7 @@ from .state_machine import StageFailed
 from .store import Store
 
 log = logging.getLogger("twinspark.controller")
+EVIDENCE_TIMEOUT_S = 150      # saving startup logs never holds up the cleanup longer than this
 
 
 class DuplicateProfileError(ValueError):
@@ -405,6 +406,9 @@ class Controller:
             raise ValueError("job not found")
         if job.state not in (JobState.RUNNING, JobState.PENDING):
             return {"cancelled": False, "note": f"job is {job.state.value}"}
+        if any(s.status == "failed" for s in job.steps):
+            return {"cancelled": False, "note": "the start already failed: its logs are being saved and the "
+                                                "partial containers removed, which cannot be cancelled"}
         self._cancel.add(job_id)
         self._audit("user", "job.cancel", f"job/{job_id}", {})
         return {"cancelled": True, "note": "cancellation requested — activations stop before the "
@@ -419,6 +423,9 @@ class Controller:
     def _persist(self, job: Job) -> None:
         # the revision object rides along in payload for the handlers; never persist it
         rev = job.payload.pop("_revision", None)
+        if job.state in (JobState.FAILED, JobState.CANCELLED):
+            from .phases import settle
+            settle(job, job.error)
         try:
             self.store.save_job(job)
         finally:
@@ -470,6 +477,20 @@ class Controller:
                         self.gateway.cancel_drain(a)
                     job.rollback = "failed before stopping the old model; it keeps serving"
                 else:
+                    # Clients stop following a job once it is FAILED, so it stays RUNNING until the logs are
+                    # saved, the partial containers are gone and the rollback is decided.
+                    job.state = JobState.RUNNING
+                    job.rollback = "saving the startup logs of every rank, then stopping the partial containers"
+                    self._persist(job)
+                    try:
+                        # keep the logs and state of every started container before cleanup removes them;
+                        # best effort and bounded: nothing here may keep the cleanup from running
+                        await asyncio.wait_for(self._capture_evidence(job, rev), EVIDENCE_TIMEOUT_S)
+                    except Exception as cap_exc:  # noqa: BLE001 - includes the timeout
+                        log.exception("startup evidence could not be saved")
+                        why = (f"took longer than {EVIDENCE_TIMEOUT_S} s" if isinstance(cap_exc, asyncio.TimeoutError)
+                               else f"{type(cap_exc).__name__}: {cap_exc}")
+                        job.payload.setdefault("evidence_error", f"startup logs not saved: {why}"[:300])
                     await self._stop_everything(coord.drained)
                     self.store.kv_set("active", None)
                     if (self.config.auto_rollback and previous and not job.payload.get("rollback_of")
@@ -479,6 +500,7 @@ class Controller:
                                         f"{previous['profile']} {previous.get('label', '')}")
                     else:
                         job.rollback = "stopped partial containers; nothing to restore"
+                    job.state = JobState.FAILED
         except Exception as exc:  # noqa: BLE001 - bug in the controller itself
             log.exception("activation crashed")
             job.state, job.error = JobState.FAILED, f"internal error: {exc}"
@@ -495,6 +517,86 @@ class Controller:
                 await self.activate(*rollback_target, _rollback_of=job.job_id)
             except Exception:  # noqa: BLE001
                 log.exception("automatic rollback could not start")
+
+    def _redactor(self):
+        from ..remote.bundle import Redactor
+        from ..security import SECRET_SLOTS, SecretsVault
+        values = []
+        try:
+            vault = SecretsVault(self.config.secrets_dir)
+            for slot in SECRET_SLOTS:
+                try:
+                    if v := vault.get(slot):
+                        values.append(v)
+                except Exception:  # noqa: BLE001 - an unreadable slot is not added
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        return Redactor(values)
+
+    async def _capture_evidence(self, job: Job, rev: ProfileRevision) -> None:
+        """Save each started container's state and log (both ranks) before the containers are removed."""
+        from . import evidence as ev
+        from .state_machine import guidance_for
+        seen, started = set(), []
+        for item in job.payload.get("started_containers") or []:
+            key = (item.get("node"), item.get("name"))
+            if key not in seen and item.get("node") in self.agents:
+                seen.add(key)
+                started.append(item)
+        if not started:
+            return
+        root = ev.evidence_dir(self.config.db_path)
+        redact = self._redactor()
+
+        async def one(item: dict) -> dict[str, Any]:
+            node, name = item["node"], item["name"]
+            rec: dict[str, Any] = {"node": node, "name": name}
+            try:
+                raw = await self.agents[node].call("container_evidence", name=name, timeout=120)
+            except Exception as exc:  # noqa: BLE001 - evidence is best effort, never blocks cleanup
+                rec["error"] = str(exc)[:300]
+                return rec
+            kernel = raw.get("kernel") or {}
+            rec.update({k: raw.get(k) for k in ("status", "exit_code", "oom_killed", "started_at",
+                                                "finished_at", "role")})
+            rec.update(memory=raw.get("memory"), kernel_gpu_mem_errors=kernel.get("count"),
+                       kernel_count_at_least=bool(kernel.get("at_least")),
+                       kernel_note=kernel.get("note"), log_truncated=bool(raw.get("log_truncated")))
+
+            def digest() -> dict[str, Any]:
+                # megabytes of text: redact, summarise and write it off the event loop
+                log = redact(raw.get("log") or "")
+                out: dict[str, Any] = {"kernel_samples": [redact(str(x)) for x in kernel.get("samples") or []]}
+                out["log_truncated"] = rec["log_truncated"] or len(log) >= ev.MAX_LOG_CHARS
+                out.update(ev.error_summary(log))
+                try:
+                    out["file"], out["bytes"] = ev.save(root, job.job_id, node, name, log)
+                except (OSError, ValueError) as exc:
+                    out["save_error"] = str(exc)[:200]
+                return out
+
+            rec.update(await asyncio.to_thread(digest))
+            return rec
+
+        records = list(await asyncio.gather(*(one(i) for i in started)))
+        job.payload["startup_evidence"] = {
+            "containers": records, "profile": rev.profile_name, "revision_id": rev.revision_id,
+            "images": list(dict.fromkeys(p.identity.image_ref for p in rev.parts() if p.identity)),
+            "captured_at": time.time(),
+            "limits": {"max_log_chars": ev.MAX_LOG_CHARS, "kept_jobs": ev.KEEP_JOBS}}
+        failed = next((st for st in reversed(job.steps) if st.status == "failed"), None)
+        text = ev.excerpt(records)
+        if failed is not None and text:
+            failed.log_excerpt = text
+        note = ev.gpu_memory_note(records)
+        job.guidance = list(dict.fromkeys(([note] if note else []) + guidance_for(
+            (job.error or "") + " " + text) + (job.guidance or [])))
+        self._persist(job)
+        try:
+            await asyncio.to_thread(ev.prune, root)
+        except OSError:
+            log.exception("could not prune old startup evidence")
 
     async def _stop_everything(self, aliases: list[str],
                                failed_nodes: Optional[list[str]] = None) -> list[str]:
@@ -550,7 +652,11 @@ class Controller:
     async def on_startup(self) -> Optional[Job]:
         for j in self.store.list_jobs(limit=50):
             if j.state in (JobState.RUNNING, JobState.PENDING):
-                j.state, j.error = JobState.FAILED, "interrupted by controller restart"
+                j.state = JobState.FAILED
+                j.error = (f"{j.error} (cleanup interrupted by controller restart)" if j.error
+                           else "interrupted by controller restart")
+                from .phases import settle
+                settle(j, "interrupted by controller restart")
                 self.store.save_job(j)
         await self.refresh_hardware()
         if self.maintenance.blocking():

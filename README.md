@@ -4,7 +4,7 @@ One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA
 (GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
 and keep the machines headless.
 
-> **Status: alpha (0.5.0).** The control path is covered by automated tests (about 900). Real Docker
+> **Status: alpha (0.5.1).** The control path is covered by automated tests (about 1,000). Real Docker
 > activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
 > and two-node PP2) on 2026-09-28, at the code of that day — see the
 > [validation note](docs/notes/small-model-validation-2026-09-28.md). Large models, other topologies
@@ -188,8 +188,11 @@ tsm status                     # active model, routes, memory, live serving metr
 tsm doctor                     # full health check with a fix for every finding
 tsm models ls                  # model files on both nodes;  tsm models rm org/repo
 tsm logs                       # container logs of the active deployment on both nodes
-tsm headless headless-max --now    # stop the desktop session, free its memory
-tsm link --mode rdma           # QSFP / NCCL link test
+tsm job <id>                   # what a job did; a failed start lists the saved logs of every rank
+tsm job <id> --log FILE        # print one of those saved startup logs
+tsm headless status            # desktop, boot target and how you can reach each node remotely
+tsm headless headless-max      # stop the desktop session now, free its memory (asks first; -y skips)
+tsm link --mode rdma           # QSFP / NCCL link test (both nodes must be live, not dry-run)
 tsm rdma --apply               # write discovered RoCE devices into controller.yaml
 tsm qsfp status                # QSFP link on THIS node: both twins, addresses, MTU, RoCE (docs/qsfp-link.md)
 tsm stop                       # drain and stop the active model
@@ -226,6 +229,7 @@ tsm remote bundle B            # one redacted tar.gz for a bug report
 sudo tsm remote enable terminal      # on a node: switch on a recorded shell (off by default)
 tsm remote terminal B          # open it (or use the Remote page)
 sudo tsm node doctor           # on a node, with or without the controller
+tsm remote tailscale-serve     # on node A: reach the GUI from your tailnet (shows the command; --apply saves it)
 ```
 
 Power control, Wake-on-LAN, smart plugs and network boot are covered in
@@ -241,11 +245,12 @@ switch it on, on that node.
 | Node B "unreachable" on Get started | `journalctl -u twinspark-agent` on B. `401` = token mismatch: re-run `sudo tsm join-code` on A and `sudo tsm setup --join …` on B. Otherwise check B's QSFP address (`ip -br addr`) |
 | NCCL tops out near 100 Gb/s | only one QSFP interface has an address: `tsm qsfp status`, then `sudo tsm qsfp apply` (see [docs/qsfp-link.md](docs/qsfp-link.md)) |
 | `rdma_hcas is empty` / NCCL falls back to TCP | `sudo tsm rdma --apply && sudo systemctl restart twinspark-controller` |
+| `tsm-privd … is only open to the 'twinspark' group` | setup added you to the group; log out and back in (or `newgrp twinspark`) |
 | `permission denied … docker.sock` | the service user needs the docker group: `sudo usermod -aG docker <user>` and restart the agent |
 | `port 8000 / 8100 already in use` | a hand-started vLLM is running: `tsm foreign ls` / `tsm foreign stop`, or let setup pick other ports |
 | Weight sync fails | `tsm doctor` shows the SSH check; node B must accept node A's sync key (setup installs it from the join code) |
 | `sudo: a terminal is required` over Tailscale SSH | start the session with `ssh -t`, or use `tmux`; setup itself only needs one `sudo` |
-| Activation fails and the old model comes back | by design — read the job (`tsm job <id>`), then `tsm logs` |
+| Activation fails and the old model comes back | by design — `tsm job <id>` shows the first error from each rank and the saved logs (`tsm job <id> --log FILE`); the containers themselves are gone |
 | A node stopped answering | `tsm remote reach B` says which case it is; the checklist is in [docs/remote-management.md](docs/remote-management.md) |
 
 ## Updating and removing

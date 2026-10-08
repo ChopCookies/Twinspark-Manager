@@ -382,3 +382,118 @@ test("remote tab and route are registered, and look-alike paths do not match", (
   assert.equal(c.run("ROUTES.some(([re]) => re.test('/remote/B') && re.test('/remote'))"), true);
   assert.equal(c.run("ROUTES.some(([re]) => re.test('/remote/B/../x'))"), false);
 });
+
+test("link results say simulated, show failures as unavailable and escape errors", () => {
+  const c = client();
+  const sim = c.run(`linkResultHtml(${JSON.stringify({ mode: "tcp", simulated: true, streams: 4, duration_s: 5, initiator: { bandwidth_gbps: 41.7, dry_run: true } })})`);
+  assert.match(sim, /Simulated\./);
+  assert.match(sim, /4 TCP stream\(s\)/);
+  const failed = c.run(`linkResultHtml(${JSON.stringify({ mode: "rdma", simulated: false, duration_s: 5, hcas: { A: ["rocep1s0f1", "roceP2p1s0f1"] },
+    errors: ["ib_write_bw on roceP2p1s0f1 exited with code 1: <bad>"],
+    initiator: { bandwidth_gbps: null, measured_gbps: 111.6, per_hca: [{ hca: "rocep1s0f1", gbps: 111.6 }, { hca: "roceP2p1s0f1", gbps: null }] } })})`);
+  assert.doesNotMatch(failed, /Simulated/);
+  assert.match(failed, /<div class="k">Bandwidth<\/div><div class="v">unavailable/);
+  assert.match(failed, /<div class="k">roceP2p1s0f1<\/div><div class="v">unavailable/);
+  assert.doesNotMatch(failed, /<bad>/);
+  assert.match(failed, /&lt;bad&gt;/);
+  assert.match(c.run(`linkResultHtml({initiator:{error:"connection refused <x>"}})`), /Link test failed\..*&lt;x&gt;/);
+});
+
+test("startup evidence shows both ranks, the first error and a download per log", () => {
+  const c = client();
+  const html = c.run(`evidenceHtml(${JSON.stringify({ profile: "glm", revision_id: "r1", images: ["img@sha256:1"], limits: { max_log_chars: 2000000, kept_jobs: 20 },
+    containers: [
+      { node: "A", name: "tsm-glm-a", status: "exited", exit_code: 1, memory: { mem_available_gib: 3.2, mem_total_gib: 121.6, page_cache_gib: 1, swap_used_gib: 0 },
+        kernel_gpu_mem_errors: 129, first_error: "torch.OutOfMemoryError: <oom>", final_error: "RuntimeError: Engine core initialization failed", file: "A-tsm-glm-a.log", bytes: 4096 },
+      { node: "B", name: "tsm-glm-b", error: "agent unreachable" }] })})`);
+  assert.match(html, /Node A · <span class="mono">tsm-glm-a/);
+  assert.match(html, /exited, exit code 1/);
+  assert.match(html, /129 out-of-memory message/);
+  assert.match(html, /data-act="evidence-log" data-file="A-tsm-glm-a.log"/);
+  assert.match(html, /&lt;oom&gt;/);
+  assert.match(html, /no evidence: agent unreachable/);
+  assert.match(html, /exit code 1 does not rule out a GPU memory failure/);
+  assert.equal(c.run("evidenceHtml(null)"), "");
+});
+
+test("work items name image, weights, drafter, copy and verify separately", () => {
+  const c = client();
+  const html = c.run(`phasesHtml(${JSON.stringify([
+    { key: "image:x:A", kind: "image", label: "image ghcr.io/x@sha256:1 on node A", state: "reused", detail: "already on the node" },
+    { key: "drafter:d@b:A", kind: "drafter", label: "drafter incoai/d@bbbb on node A", state: "running", detail: "downloading", progress: 0.4, ref: "incoai/d@" + "b".repeat(40) },
+    { key: "copy:d@b:A>B", kind: "copy", label: "copy drafter node A → node B over QSFP", state: "failed", detail: "<rsync>" }])})`);
+  assert.match(html, /data-key="phase:image:x:A"/);
+  assert.match(html, />reused</);
+  assert.match(html, /width:40%/);
+  assert.match(html, /&lt;rsync&gt;/);
+  assert.equal(c.run("phasesHtml([])"), "");
+});
+
+test("cache cells keep complete, external and verified apart", () => {
+  const c = client();
+  assert.match(c.run(`cacheCell({complete:true, managed:false, verified:false})`), /external cache — reused as is, no new download/);
+  assert.match(c.run(`cacheCell({complete:true, managed:true, verified:true})`), /checksum verified/);
+  assert.match(c.run(`cacheCell({complete:true, managed:true, verified:false})`), /checksums not verified/);
+  assert.match(c.run(`cacheCell({complete:false})`), /partial/);
+});
+
+test("a recipe without an image asks for one; one with a hint or pin does not", () => {
+  const c = client();
+  assert.equal(c.run(`needsImage({image_hint:null, identity:null})`), true);
+  assert.equal(c.run(`needsImage({image_hint:"ghcr.io/x:y", identity:null})`), false);
+  assert.equal(c.run(`needsImage({image_hint:null, identity:{image:"x"}})`), false);
+  const html = c.run(`imageFieldsHtml({image_hint:null, identity:null, source:{url:"https://github.com/getrefined/x"}, secondary:{image_hint:null, identity:null}})`);
+  assert.match(html, /names no vLLM image/);
+  assert.match(html, /id="imp-image-a"/);
+  assert.match(html, /id="imp-image-b"/);
+  assert.match(html, /github.com\/getrefined\/x/);
+  assert.equal(c.run(`imageFieldsHtml({image_hint:"x"})`), "");
+});
+
+test("remote access summary matches the CLI wording", () => {
+  const c = client();
+  const s = c.run(`accessSummary({ssh:{running:true, starts_at_boot:false}, tailscale:{installed:true, running:true, ip:"100.64.0.7", serve:{manager_forwarded:false}}, default_target:"multi-user.target"})`);
+  assert.equal(s, "SSH running, NOT enabled at boot; Tailscale up 100.64.0.7 · manager NOT forwarded (tsm remote tailscale-serve); boots into multi-user.target");
+});
+
+test("live views carry their key and keyed rows", () => {
+  const c = client();
+  const job = c.run(`jobHtml(${JSON.stringify({ job_id: "act-0123456789", kind: "activation", state: "running", created_at: 0, steps: [{ stage: "validating", status: "ok" }], payload: { profile: "glm" } })})`);
+  assert.match(job, /data-live="job:act-0123456789"/);
+  assert.match(job, /data-key="stage:validating"/);
+  assert.match(job, /data-key="stage:loading"/);
+});
+
+test("recipe links are http(s) only and the boot setting of tailscaled is shown", () => {
+  const c = client();
+  assert.equal(c.run(`webUrl("javascript:alert(1)")`), "");
+  assert.equal(c.run(`webUrl(" data:text/html,x")`), "");
+  assert.equal(c.run(`webUrl("https://github.com/x/y")`), "https://github.com/x/y");
+  const html = c.run(`imageFieldsHtml({name:"q", source:{url:"javascript:alert(1)"}})`);
+  assert.match(html, /names no vLLM image/);
+  assert.doesNotMatch(html, /javascript:/);
+  assert.match(c.run(`imageFieldsHtml({name:"q", source:{url:"https://example.org/r"}})`), /href="https:\/\/example\.org\/r"/);
+  const s = c.run(`accessSummary({ssh:{}, tailscale:{installed:true, running:true, ip:"100.64.0.7", service:{enabled:"disabled"}}})`);
+  assert.match(s, /Tailscale up 100\.64\.0\.7, NOT enabled at boot/);
+});
+
+test("a failed start being cleaned up has no Cancel, and an excerpt stays when no rank had an error", () => {
+  const c = client();
+  const base = { job_id: "act-0123456789", kind: "activation", created_at: 0, payload: { profile: "glm" } };
+  const cleaning = c.run(`jobHtml(${JSON.stringify({ ...base, state: "running", error: "loading: boom",
+    rollback: "saving the startup logs of every rank, then stopping the partial containers",
+    steps: [{ stage: "loading", status: "failed", log_excerpt: "tail of the log" }] })})`);
+  assert.doesNotMatch(cleaning, /data-act="cancel"/);
+  assert.match(cleaning, /saving the startup logs of every rank/);
+  const running = c.run(`jobHtml(${JSON.stringify({ ...base, state: "running", steps: [{ stage: "loading", status: "running" }] })})`);
+  assert.match(running, /data-act="cancel"/);
+  const unreachable = c.run(`jobHtml(${JSON.stringify({ ...base, state: "failed", error: "loading: boom",
+    steps: [{ stage: "loading", status: "failed", log_excerpt: "tail of the log" }],
+    payload: { profile: "glm", startup_evidence: { containers: [{ node: "B", name: "tsm-b", error: "agent unreachable" }] } } })})`);
+  assert.match(unreachable, /Log excerpt/);
+  const shown = c.run(`jobHtml(${JSON.stringify({ ...base, state: "failed", error: "loading: boom",
+    steps: [{ stage: "loading", status: "failed", log_excerpt: "tail of the log" }],
+    payload: { profile: "glm", startup_evidence: { containers: [{ node: "B", name: "tsm-b", first_error: "OOM" }] } } })})`);
+  assert.doesNotMatch(shown, /Log excerpt/);
+  assert.match(shown, /Startup evidence/);
+});

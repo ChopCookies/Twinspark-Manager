@@ -147,6 +147,26 @@ class Session:
                 "bytes_out": self.bytes_out, "recorded": self.recorder is not None}
 
 
+def session_members(sid: int, proc: str = "/proc") -> list[int]:
+    """PIDs whose session id is ``sid`` (the shell the PTY started is its session leader)."""
+    out = []
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit() or int(name) == sid:
+            continue
+        try:
+            with open(f"{proc}/{name}/stat") as fh:
+                fields = fh.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if len(fields) > 3 and fields[3] == str(sid) and fields[0] != "Z":
+            out.append(int(name))
+    return out
+
+
 class TerminalManager:
     def __init__(self, policy: PolicySource, record_dir: str | Path, shell: Optional[str] = None,
                  node_id: str = "?"):
@@ -308,6 +328,11 @@ class TerminalManager:
                     await asyncio.sleep(0.05)
                 if sess.proc.poll() is not None:
                     break
+        # Background jobs of a job-control shell (or of a shell that does not pass SIGHUP on, like dash) run
+        # in their own process groups but in the session the PTY created: end those as well.
+        for pid in session_members(sess.proc.pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
         sess.exit_code = sess.proc.poll()
         with contextlib.suppress(OSError):
             os.close(sess.master)

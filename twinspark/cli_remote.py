@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import getpass
@@ -191,6 +192,74 @@ def cmd_remote_plug_token(args) -> None:
     except PermissionError:
         sys.exit(f"cannot write the vault in {args.secrets_dir}: run with sudo, or as the TwinSpark user")
     print("stored as the vault slot 'plug_token' (encrypted). Use it in controller.yaml as ${secret:plug_token}.")
+
+
+def cmd_remote_tailscale_serve(args) -> None:
+    """Forward the management port on the tailnet (node A), persistently, and check that it answers."""
+    import yaml
+
+    from .remote import tailscale
+    port = args.port
+    lay = Layout(Path(args.root))
+    doc: Any = None
+    if lay.controller_yaml.exists():
+        try:
+            doc = yaml.safe_load(lay.controller_yaml.read_text())
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            # the management_auth check below needs this file: never forward on a guess
+            sys.exit(f"{lay.controller_yaml} is not readable ({type(exc).__name__}) — fix it, or run with sudo")
+        if not isinstance(doc, dict):
+            sys.exit(f"{lay.controller_yaml} is not a YAML mapping — fix it first")
+    elif port is None:
+        sys.exit(f"{lay.controller_yaml} not found — run this on node A (the controller), or pass --port")
+    doc = doc or {}
+    listener = doc.get("listener") if isinstance(doc.get("listener"), dict) else {}
+    if port is None:
+        try:
+            port = int(listener.get("port") or 8443)
+        except (ValueError, TypeError):
+            sys.exit(f"{lay.controller_yaml}: listener.port is not a number — pass --port")
+    scheme = "https" if listener.get("tls_cert") else "http"
+    if args.apply and str(doc.get("management_auth", "apikey")).lower() == "none":
+        # without a key the API only checks that Host names localhost — a tailnet peer can send that
+        sys.exit("management_auth is 'none' in controller.yaml: a forward would give every tailnet device the "
+                 "management API without a key. Set management_auth: apikey (and restart the controller) first")
+    st = tailscale.state(port)
+    if not st["installed"]:
+        sys.exit(st["note"])
+    print(f"tailscale: {'up' if st['running'] else 'NOT running'}"
+          + (f", this node is {st['ip']}" if st["ip"] else "")
+          + ("" if st["forwarded"] is None else f"; manager port {port} "
+             + ("already forwarded" if st["forwarded"] else "not forwarded")))
+    if st.get("note"):
+        print(f"  note: {st['note'].strip()}")
+    cmds = tailscale.commands(port)
+    if not (args.apply or args.remove):
+        print("\nTo reach the GUI from your other tailnet devices (tailnet only, survives reboots; the "
+              "management key is still required):")
+        print("  sudo " + " ".join(cmds["apply"]) + "      (or: sudo tsm remote tailscale-serve --apply)")
+        print("Undo it with: sudo tsm remote tailscale-serve --remove")
+        if st["ip"]:
+            print(f"Then open {scheme}://{st['ip']}:{port}/ from a device on your tailnet.")
+        return
+    if os.geteuid() != 0:
+        sys.exit("saving a serve forward needs root: sudo tsm remote tailscale-serve " +
+                 ("--apply" if args.apply else "--remove"))
+    ok, out = (tailscale.apply if args.apply else tailscale.remove)(port)
+    if not ok:
+        sys.exit(f"tailscale serve failed: {out[:400]}")
+    if args.remove:
+        print(f"removed the forward of port {port}")
+        return
+    print(f"forwarding tailnet port {port} to 127.0.0.1:{port} (persistent)")
+    if not st["ip"]:
+        print("! this node has no tailnet IPv4 address yet — `tailscale up` first, then check again")
+        return
+    good, detail = tailscale.verify(st["ip"], port, scheme=scheme)
+    print(("  ✓ " if good else "  ! ") + detail + (" — checked from this machine; open it from another "
+                                                   "tailnet device before you close the desktop" if good else ""))
+    if not good:
+        sys.exit(1)
 
 
 # ---- tsm remote … (through the controller) ----------------------------------------------------
@@ -707,6 +776,8 @@ def cmd_remote(args, api) -> None:
         return cmd_remote_policy(args)
     if sub == "plug-token":
         return cmd_remote_plug_token(args)
+    if sub == "tailscale-serve":
+        return cmd_remote_tailscale_serve(args)
     {"status": cmd_remote_status, "reach": cmd_remote_reach, "logs": cmd_remote_logs,
      "bundle": cmd_remote_bundle, "recordings": cmd_remote_recordings, "power": cmd_remote_power,
      "reboot": cmd_remote_power, "poweroff": cmd_remote_power, "cancel": cmd_remote_cancel,
@@ -767,9 +838,14 @@ def add_parsers(sub, cmd) -> None:
     p.add_argument("--root", default="/")
     p = r("plug-token", "store the smart-plug token in the vault (controller node)", node=False)
     p.add_argument("--from-file")
+    p = r("tailscale-serve", "reach the GUI over Tailscale: show, --apply or --remove a persistent tailnet-only "
+          "forward of the management port (node A, as root)", node=False)
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--remove", action="store_true")
+    p.add_argument("--port", type=int, help="management port (default: listener.port in controller.yaml)")
+    p.add_argument("--root", default="/", help=argparse.SUPPRESS)
     cmd_remote.local = False
 
-    import argparse
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--root", default="/", help=argparse.SUPPRESS)
     common.add_argument("--config", help="agent.yaml (default /etc/twinspark/agent.yaml)")

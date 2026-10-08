@@ -190,7 +190,7 @@ async def stage(ctrl: "Controller", ref: str, nodes: Optional[list[str]] = None,
             job.guidance = ["check disk space and SSH between the nodes (`tsm doctor`)"] \
                 if "ssh" in str(exc).lower() or "space" in str(exc).lower() else []
         finally:
-            ctrl.store.save_job(job)
+            ctrl._persist(job)                  # like every job: an ended job leaves no item "in progress"
             ctrl._staging.pop(key, None)
             ctrl._cancel.discard(job.job_id)
             if not fut.done():

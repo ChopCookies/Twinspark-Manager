@@ -14,7 +14,13 @@ if TYPE_CHECKING:
 
 async def run_link_test(ctrl: "Controller", mode: str = "tcp", duration_s: float = 5.0,
                         port: int = 29511, streams: int = 4) -> dict[str, Any]:
-    """Responder on B, initiator on A, over the QSFP IPs."""
+    """Responder on B, initiator on A, over the QSFP IPs.
+
+    Both agents must run in the same mode: a dry-run responder opens no socket, so a live initiator
+    would only measure "connection refused" (and a dry-run initiator would invent numbers).
+    """
+    import time
+
     a, b = ctrl.agents.get("A"), ctrl.agents.get("B")
     if not a or not b:
         raise ValueError("link test needs both node A and node B configured")
@@ -24,24 +30,65 @@ async def run_link_test(ctrl: "Controller", mode: str = "tcp", duration_s: float
     peer_ip = ep_b.qsfp_ip
     if not peer_ip:
         raise ValueError("nodes.B.qsfp_ip is not configured")
+    modes = {}
+    for n, agent in (("A", a), ("B", b)):
+        try:
+            modes[n] = (await agent.call("hardware_facts", timeout=15)).get("runtime_mode")
+        except AgentActionError as exc:
+            raise ValueError(f"node {n} is not reachable: {exc.detail}") from exc
+    if len(set(modes.values())) > 1:
+        dry = [n for n, m in modes.items() if m == "dry-run"]
+        raise ValueError(f"node {', '.join(dry)} runs in dry-run while the other node runs real containers: a "
+                         f"simulated side opens no socket, so the test cannot measure the link. Run "
+                         f"`sudo tsm go-live` on node {', '.join(dry)} (or keep both in dry-run to see a simulation)")
+    simulated = all(m == "dry-run" for m in modes.values())
     common = dict(mode=mode, port=port, duration_s=duration_s, streams=streams)
     resp = await b.call("link_test", role="responder", bind=peer_ip if mode == "tcp" else None,
                         hcas=ep_b.rdma_hcas, gid_index=ep_b.ib_gid_index, **common)
+
+    async def cancel_responder() -> None:
+        try:
+            await b.call("task_cancel", task_id=resp["task_id"], timeout=10)
+        except AgentActionError:
+            pass
+
     await asyncio.sleep(1.0 if mode == "rdma" else 0.5)
-    init = await a.call("link_test", role="initiator", peer_ip=peer_ip,
-                        hcas=ep_a.rdma_hcas, gid_index=ep_a.ib_gid_index, **common)
+    try:
+        init = await a.call("link_test", role="initiator", peer_ip=peer_ip,
+                            hcas=ep_a.rdma_hcas, gid_index=ep_a.ib_gid_index, **common)
+    except BaseException:
+        await cancel_responder()                       # nothing will connect; do not leave it listening
+        raise
     timeout = duration_s + 90
+    init_t: dict[str, Any] = {}
     try:
         init_t = await a.wait_task(init["task_id"], timeout=timeout, poll=0.5)
-    finally:
-        try:
-            resp_t = await b.wait_task(resp["task_id"], timeout=timeout if mode == "rdma" else 30,
-                                       poll=0.5)
-        except AgentActionError as exc:
-            resp_t = {"result": {"error": exc.detail}}
-    ctrl._audit("user", "link.test", "system", {"mode": mode, "duration_s": duration_s})
-    return {"mode": mode, "nodes": {"initiator": "A", "responder": "B"},
-            "initiator": init_t.get("result") or {}, "responder": resp_t.get("result") or {}}
+    except AgentActionError as exc:
+        init_t = {"result": {"error": exc.detail}}
+        await cancel_responder()
+    try:
+        resp_t = await b.wait_task(resp["task_id"], timeout=timeout if mode == "rdma" else 30, poll=0.5)
+    except AgentActionError as exc:
+        resp_t = {"result": {"error": exc.detail}}
+    init_r, resp_r = init_t.get("result") or {}, resp_t.get("result") or {}
+    errors = [e for e in ([init_r.get("error")] + list(init_r.get("errors") or [])) if e]
+    if resp_r.get("error"):
+        errors.append(f"responder on node B: {resp_r['error']}")
+    out = {"mode": mode, "nodes": {"initiator": "A", "responder": "B"}, "simulated": simulated,
+           "runtime_modes": modes, "duration_s": duration_s,
+           "streams": streams if mode == "tcp" else None,
+           "hcas": {"A": list(ep_a.rdma_hcas), "B": list(ep_b.rdma_hcas)} if mode == "rdma" else None,
+           "initiator": init_r, "responder": resp_r,
+           "ok": init_r.get("bandwidth_gbps") is not None and not init_r.get("error"),
+           "errors": errors}
+    ctrl.store.kv_set(f"linktest:{mode}", {
+        "at": time.time(), "ok": out["ok"], "simulated": simulated, "bandwidth_gbps": init_r.get("bandwidth_gbps"),
+        "measured_gbps": init_r.get("measured_gbps"), "per_hca": [
+            {k: r.get(k) for k in ("hca", "gbps", "error")} for r in init_r.get("per_hca") or []],
+        "streams": out["streams"], "duration_s": duration_s, "errors": errors[:5]})
+    ctrl._audit("user", "link.test", "system", {"mode": mode, "duration_s": duration_s, "ok": out["ok"],
+                                                "simulated": simulated})
+    return out
 
 
 async def rdma_report(ctrl: "Controller") -> dict[str, Any]:
@@ -110,7 +157,9 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
         sw = f.get("swappiness")
         if sw is not None and sw > 10:
             _check(res, "swappiness", n, "warn", f"vm.swappiness={sw}",
-                   "community GB10 recipes run with vm.swappiness=0 (unified memory)")
+                   f"GB10 recipes run with vm.swappiness=0 (unified memory; keep swap on). On node {n}, "
+                   "persistently: echo 'vm.swappiness = 0' | sudo tee /etc/sysctl.d/90-twinspark-swappiness.conf "
+                   "&& sudo sysctl --system")
         pc = f.get("page_cache_gib") or 0
         if pc > 20:
             _check(res, "page cache", n, "info", f"{pc:.0f} GiB page cache",
@@ -123,6 +172,27 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
         if not f.get("infiniband_dev") and f.get("runtime_mode") == "docker":
             _check(res, "rdma device", n, "warn", "/dev/infiniband missing",
                    "RoCE is unavailable to containers; TP2 would fall back to TCP")
+    me = ctrl.config.node.node_id
+    if ctrl.config.management_auth == "none" and me in facts:
+        # without a key only the Host header is checked; a tailnet forward makes that a header anyone can send
+        try:
+            acc = (await ctrl.agents[me].call("headless_status", timeout=30,
+                                              manager_port=ctrl.config.listener.port)).get("access") or {}
+        except AgentActionError:
+            acc = {}
+        ts = acc.get("tailscale") or {}
+        forwarded = (ts.get("serve") or {}).get("manager_forwarded")
+        fix = ("`sudo tsm remote tailscale-serve --remove`, or set management_auth: apikey in controller.yaml "
+               "and restart the controller")
+        if forwarded:
+            _check(res, "management auth", me, "fail",
+                   f"management_auth is 'none' and port {ctrl.config.listener.port} is forwarded on the tailnet: "
+                   "every tailnet device can use the management API without a key", fix)
+        elif forwarded is None and ts.get("running"):
+            _check(res, "management auth", me, "warn",
+                   "management_auth is 'none' and Tailscale is up, but whether the manager port is forwarded "
+                   "could not be read (`tailscale serve status` needs root). A forward would expose the API "
+                   "without a key", "check with `sudo tailscale serve status`; if it is forwarded: " + fix)
     if len(facts) == 2:
         dv = {n: f.get("driver_version") for n, f in facts.items()}
         if all(dv.values()):
@@ -183,6 +253,13 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
 async def headless_apply(ctrl: "Controller", mode: str, now: bool = False) -> dict[str, Any]:
     if mode not in ("desktop", "headless-safe", "headless-max"):
         raise ValueError("mode must be desktop, headless-safe or headless-max")
+    from ..headless import acts_now
+    from .controller import BusyError
+    if acts_now(mode, now) and (ctrl.busy() or ctrl.maintenance.blocking()):
+        # headless-max stops the display manager even without --now: that frees (or, for desktop,
+        # takes) gigabytes of unified memory in the middle of a model start
+        raise BusyError(f"{mode}{' --now' if now else ''} starts or stops the desktop immediately; an "
+                        f"activation or maintenance run is in progress — wait for it to finish")
     results = {}
     for n, a in ctrl.agents.items():
         try:
@@ -198,8 +275,10 @@ async def headless_apply(ctrl: "Controller", mode: str, now: bool = False) -> di
 async def headless_status(ctrl: "Controller") -> dict[str, Any]:
     out = {}
     for n, a in ctrl.agents.items():
+        # the agent on the controller's machine also checks that the manager port is forwarded
+        extra = {"manager_port": ctrl.config.listener.port} if n == ctrl.config.node.node_id else {}
         try:
-            out[n] = await a.call("headless_status", timeout=20)
+            out[n] = await a.call("headless_status", timeout=30, **extra)
         except AgentActionError as exc:
             out[n] = {"error": exc.detail}
     return {"mode": ctrl.store.kv_get("headless_mode"), "nodes": out}

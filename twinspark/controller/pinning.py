@@ -78,10 +78,47 @@ async def _registry_image(ctrl: "Controller", ref: str, nodes: list[str]) -> dic
     return {"image": name, "digest": digest, "source": "registry", "versions": versions}
 
 
+def missing_image(draft: ProfileDraft, image: Optional[str] = None, local_image: Optional[str] = None,
+                  part: str = "", profile: Optional[str] = None) -> Optional[str]:
+    """Why ``draft`` cannot be pinned without an image choice, or None when it has one.
+
+    Checked before any Hub or registry lookup, so a recipe without ``image_hint`` fails at once with
+    something to do instead of after minutes of preparation. TwinSpark never picks an installed image
+    on its own: a vLLM build that lacks the recipe's model support or patches fails much later.
+    ``part`` is "node B: " for the second model of a split profile (named ``profile``).
+    """
+    if image or local_image or draft.image_hint or draft.identity is not None:
+        return None
+    src = (draft.source or {}).get("url") if isinstance(draft.source, dict) else None
+    where = f" — the recipe's source names the image its author used: {src}" if src else ""
+    flag = "--image-b" if part.startswith("node B") else "--image"
+    nodes = "node B" if part.startswith("node B") else "both nodes" if not part else "node A"
+    return (f"{part}no vLLM image chosen: this recipe does not name one. Pick a compatible image (a registry "
+            f"reference, or a local tag that exists on {nodes}) in the Pin dialog or with "
+            f"`tsm pin {profile or draft.name} {flag} <ref>`{where}")
+
+
+def recipe_digest_note(draft: ProfileDraft, img: dict[str, Any]) -> Optional[str]:
+    """Compare a registry pin with the image digest the recipe's author documented, if it names one."""
+    want = (draft.source or {}).get("image_digest") if isinstance(draft.source, dict) else None
+    hint = draft.image_hint or ""
+    if not want or img.get("source") != "registry" or not hint:
+        return None
+    hint_name = split_image_ref(hint)[0]
+    if img.get("image") != hint_name:
+        return None                                   # a different image was chosen on purpose
+    if img.get("digest") == want:
+        return f"image digest matches the one the recipe was written for ({want[:19]}…)"
+    return (f"WARNING: {hint} now resolves to {str(img.get('digest'))[:19]}…, not the digest the recipe was "
+            f"written for ({want[:19]}…). To use the author's build: pin with --image {hint_name}@{want}")
+
+
 async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
                      image=None, local_image=None, nodes=None) -> tuple[ProfileDraft, dict, list[str]]:
     repo = draft.simple.model
     notes: list[str] = []
+    if problem := missing_image(draft, image, local_image):
+        raise PinError(problem)
     # ---- model -----------------------------------------------------------------
     token = ctrl.hf_token
     if model_ref:
@@ -146,6 +183,8 @@ async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
     if img.get("simulated"):
         notes.append(f"the image ID of local image {img['image']!r} is SIMULATED (the nodes are in dry-run, nothing "
                      f"looked at Docker): fine for planning, but pin again after `tsm go-live` before activating")
+    if note := recipe_digest_note(draft, img):
+        notes.append(note)
     versions = img.get("versions") or {}
     # ---- extra models ------------------------------------------------------------
     extras = []
@@ -190,6 +229,12 @@ async def pin_profile(ctrl: "Controller", name: str, model_ref: Optional[str] = 
     if draft is None:
         raise PinError(f"profile {name} has no draft to pin")
     original = draft.model_dump(mode="json")
+    sec = secondary or {}
+    problems = [missing_image(draft, image, local_image, "node A: " if draft.secondary else "", name)]
+    if draft.secondary:
+        problems.append(missing_image(draft.secondary, sec.get("image"), sec.get("local_image"), "node B: ", name))
+    if any(problems):
+        raise PinError("; ".join(x for x in problems if x))
     if cancel_check():
         raise PinError("cancelled by user")
     progress(f"Resolving model and image for {'node A' if draft.secondary else draft.simple.topology.value}")

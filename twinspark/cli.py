@@ -310,6 +310,10 @@ def cmd_fit(args, api: Api):
 def cmd_pin(args, api: Api):
     body = {"model_ref": args.model_ref, "image": args.image, "local_image": args.local_image,
             "note": args.note}
+    second = {k: v for k, v in {"model_ref": args.model_ref_b, "image": args.image_b,
+                                "local_image": args.local_image_b}.items() if v}
+    if second:
+        body["secondary"] = second                   # split profiles: node B's own model / image choice
     res = api("POST", f"/api/v1/profiles/{args.profile}/pin",
               json={k: v for k, v in body.items() if v}, timeout=300)
     if _out(api, res):
@@ -431,7 +435,35 @@ def _report(job: dict) -> None:
     excerpt = next((s.get("log_excerpt") for s in reversed(job["steps"]) if s.get("log_excerpt")), None)
     if excerpt:
         print("\n--- log excerpt ---\n" + excerpt)
+    _print_evidence(job)
     sys.exit(1)
+
+
+def _print_evidence(job: dict) -> None:
+    payload = job.get("payload") or {}
+    if payload.get("evidence_error"):
+        print(f"\n! {payload['evidence_error']}")
+    ev = payload.get("startup_evidence") or {}
+    if not ev.get("containers"):
+        return
+    from .controller.evidence import describe_exit
+    print(f"\n--- startup evidence ({ev.get('profile')} {ev.get('revision_id')}; "
+          f"image {', '.join(ev.get('images') or []) or '?'}) ---")
+    for c in ev["containers"]:
+        mem = c.get("memory") or {}
+        bits = [describe_exit(c)]
+        if mem.get("mem_available_gib") is not None:
+            bits.append(f"{mem['mem_available_gib']:.1f} of {mem.get('mem_total_gib', 0):.1f} GiB available "
+                        f"after the failure")
+        if c.get("kernel_gpu_mem_errors"):
+            bits.append(f"{'at least ' if c.get('kernel_count_at_least') else ''}{c['kernel_gpu_mem_errors']} "
+                        f"NVIDIA out-of-memory kernel message(s)")
+        elif c.get("kernel_note"):
+            bits.append(f"kernel log: {c['kernel_note']}")
+        print(f"  node {c['node']} {c['name']}: " + "; ".join(bits))
+        if c.get("file"):
+            print(f"    full log: tsm job {job['job_id']} --log {c['file']}   ({c.get('bytes', 0):,} bytes"
+                  + (", end of a longer log" if c.get("log_truncated") else "") + ")")
 
 
 def cmd_activate(args, api: Api):
@@ -487,6 +519,9 @@ def cmd_jobs(args, api: Api):
 
 
 def cmd_job(args, api: Api):
+    if args.log:
+        print(api("GET", f"/api/v1/jobs/{args.job}/evidence/{args.log}"), end="")
+        return
     job = api("GET", f"/api/v1/jobs/{args.job}")
     if _out(api, job):
         return
@@ -605,11 +640,13 @@ def cmd_models(args, api: Api):
                 for n in nodes:
                     x = r["nodes"].get(n)
                     cells.append("-" if not x else ("✓" if x["complete"] else "partial") +
-                                 ("+v" if x.get("verified") else ""))
+                                 ("+v" if x.get("verified") else "") + ("" if x.get("managed") else " ext"))
                 use = ("ACTIVE " if r["active"] else "") + ", ".join(r["profiles"])
                 rows.append([m["repo"], r["revision"][:10], _gib(r["size_bytes"]), *cells,
                              ",".join(r["refs"]), use])
         _table(rows, ["MODEL", "REVISION", "SIZE", *[f"NODE {n}" for n in nodes], "REFS", "USED BY"])
+        print("✓ complete · +v checksums verified by TwinSpark · ext = external cache (downloaded outside "
+              "TwinSpark): complete files are reused, never downloaded again")
         for n in nodes:
             d = inv["nodes"][n]
             if d.get("error"):
@@ -684,7 +721,66 @@ def _install_mod(api: Api, name: str, b64: str, nodes: Optional[str]) -> None:
         print(f"  WARNING: {name} is not identical on every node")
 
 
+_FILE_PATCH_RUN = """#!/usr/bin/env bash
+# TwinSpark mod {name}: replaces one file inside the vLLM image before vLLM starts.
+# Made with `tsm mods file-patch`. target: {target}   sha256: {digest}
+set -euo pipefail
+target={q_target}
+if [ ! -f "$target" ]; then
+  echo "[mod {name}] $target does not exist in this image - is this the image the patch was made for?" >&2
+  exit 1
+fi
+install -m 0644 ./{q_file} "$target"
+if command -v sha256sum >/dev/null 2>&1; then
+  got="$(sha256sum "$target" | cut -d' ' -f1)"
+  if [ "$got" != "{digest}" ]; then
+    echo "[mod {name}] $target has sha256 $got after the copy, expected {digest}" >&2
+    exit 1
+  fi
+fi
+echo "[mod {name}] replaced $target (sha256 {short})"
+"""
+
+
+def file_patch_mod(name: str, source: Path, target: str, out: Path) -> Path:
+    """Write a mod directory that copies ``source`` over ``target`` inside the container."""
+    import hashlib
+    import shlex
+
+    from .agent.mods import MOD_RE
+    if not MOD_RE.match(name):
+        sys.exit(f"invalid mod name {name!r}: letters, digits, . _ - (max 64)")
+    if not target.startswith("/") or ".." in target.split("/") or "\n" in target:
+        sys.exit("--target must be an absolute path inside the container, without '..'")
+    if not source.is_file():
+        sys.exit(f"{source} is not a file")
+    if source.name == "run.sh" or source.name.startswith("."):
+        sys.exit(f"rename {source.name} first: the mod's own script is called run.sh")
+    data = source.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    d = out / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / source.name).write_bytes(data)
+    run = d / "run.sh"
+    run.write_text(_FILE_PATCH_RUN.format(name=name, target=target, digest=digest, short=digest[:12],
+                                          q_target=shlex.quote(target), q_file=shlex.quote(source.name)))
+    run.chmod(0o755)
+    return d
+
+
 def cmd_mods(args, api: Api):
+    if args.action == "file-patch":
+        if not (args.path and args.file and args.target):
+            sys.exit("usage: tsm mods file-patch NAME --file LOCAL_FILE --target /path/in/the/image [--out DIR]")
+        if args.out:
+            d = file_patch_mod(args.path, Path(args.file).expanduser(), args.target, Path(args.out).expanduser())
+            print(f"wrote {d} — review it, then: tsm mods install {d}")
+            return
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = file_patch_mod(args.path, Path(args.file).expanduser(), args.target, Path(tmp))
+            _install_mod(api, args.path, _pack_dir(d), args.nodes)
+        return
     if args.action == "ls":
         data = api("GET", "/api/v1/mods")
         if _out(api, data):
@@ -798,16 +894,28 @@ def cmd_link(args, api: Api):
     ini = res["initiator"]
     if ini.get("error"):
         sys.exit(f"link test failed: {ini['error']}")
-    if ini.get("dry_run"):
-        print("DRY-RUN link test (simulated numbers — real values need runtime_mode: docker)")
+    if res.get("simulated") or ini.get("dry_run"):
+        print("SIMULATED link test — both nodes are in dry-run, no packet crossed the link "
+              "(real values need `sudo tsm go-live` on both nodes)")
+    what = (f"{res.get('streams')} TCP stream(s)" if args.mode == "tcp" else
+            "RDMA (ib_write_bw) on " + (", ".join((res.get("hcas") or {}).get("A") or []) or "no device"))
+    print(f"{what}, {res.get('duration_s', args.duration):g} s, node A → node B")
     for h in ini.get("per_hca") or []:
-        print(f"  {h['hca']:14} {h.get('gbps') if h.get('gbps') is not None else '-'} Gb/s"
-              + ("" if not h.get("rc") else f"  (rc {h['rc']}: {(h.get('tail') or '').strip()[-200:]})"))
-    print(f"bandwidth : {ini.get('bandwidth_gbps', '-')} Gb/s")
+        print(f"  {h['hca']:14} " + (f"{h['gbps']} Gb/s" if h.get("gbps") is not None
+                                     else f"unavailable — {h.get('error') or 'no reading'}"))
+    bw = ini.get("bandwidth_gbps")
+    if bw is None and ini.get("measured_gbps") is not None:
+        print(f"bandwidth : unavailable (devices with a reading: {ini['measured_gbps']} Gb/s)")
+    else:
+        print(f"bandwidth : {bw if bw is not None else 'unavailable'}" + (" Gb/s" if bw is not None else ""))
     if ini.get("rtt_us_median") is not None:
         print(f"rtt       : {ini['rtt_us_median']} µs median, {ini.get('rtt_us_p99', '-')} µs p99")
     for n in ([ini["note"]] if ini.get("note") else []) + (ini.get("notes") or []):
         print(f"note      : {n}")
+    for e in res.get("errors") or []:
+        print(f"error     : {e}")
+    if not res.get("ok", bw is not None):
+        sys.exit(1)
 
 
 def cmd_metrics(args, api: Api):
@@ -844,7 +952,33 @@ def cmd_headless(args, api: Api):
                      else "no desktop")
             print(f"  {n}: {state}, default target {d.get('default_target')}, "
                   f"privd {'ok' if v['privd_available'] else 'MISSING'}")
+            acc = v.get("access") or {}
+            if acc and not acc.get("dry_run"):
+                from .remote.access import summary
+                print(f"     remote access: {summary(acc)}")
         return
+    from .headless import acts_now
+    if acts_now(args.mode, args.now) and not args.yes:
+        st = api("GET", "/api/v1/system/headless")
+        print(f"{args.mode}{' --now' if args.now else ''} {'starts' if args.mode == 'desktop' else 'closes'} "
+              f"the desktop session on every node NOW (unsaved work in it is lost).")
+        from .remote.access import summary
+        no_way_in = []
+        for n, v in sorted(st.get("nodes", {}).items()):
+            acc = v.get("access") or {}
+            if acc and not acc.get("dry_run"):
+                print(f"  {n}: {summary(acc)}")
+                if args.mode != "desktop" and not acc.get("remote_paths"):
+                    no_way_in.append(n)
+        if no_way_in:
+            print(f"  WARNING: no SSH-at-boot or Tailscale path found on {', '.join(no_way_in)} — check you can "
+                  f"reach it without its screen first (tsm remote tailscale-serve, systemctl enable ssh).")
+        try:
+            answer = input("Continue? [y/N] ")
+        except EOFError:
+            sys.exit("\nno terminal to ask on — nothing was changed. Pass -y to confirm without asking.")
+        if answer.strip().lower() not in ("y", "yes"):
+            sys.exit("cancelled — nothing was changed.")
     r = api("POST", "/api/v1/system/headless", json={"mode": args.mode, "now": args.now}, timeout=300)
     if _out(api, r):
         return
@@ -960,6 +1094,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model-ref", help="branch, 40-char sha or org/repo@ref (default: keep / main)")
     s.add_argument("--image", help="registry image (pinned to its multi-arch digest) or local tag")
     s.add_argument("--local-image", help="force a local image tag/ID (must be identical on both nodes)")
+    s.add_argument("--model-ref-b", help="split profiles: node B's model ref")
+    s.add_argument("--image-b", help="split profiles: node B's image (registry ref or local tag)")
+    s.add_argument("--local-image-b", help="split profiles: force a local image tag/ID on node B")
     s.add_argument("--note")
     s = cmd("edit", cmd_edit, "edit a profile's draft as JSON in $EDITOR")
     s.add_argument("profile")
@@ -996,6 +1133,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = cmd("job", cmd_job, "follow / show one job")
     s.add_argument("job")
     s.add_argument("--no-wait", action="store_true")
+    s.add_argument("--log", metavar="FILE", help="print a container log saved when the job failed "
+                   "(file names are listed under 'startup evidence')")
     s = cmd("logs", cmd_logs, "container logs (default: the active deployment on both nodes)")
     s.add_argument("node", nargs="?", choices=["A", "B"])
     s.add_argument("container", nargs="?")
@@ -1021,11 +1160,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-wait", action="store_true")
 
     s = cmd("mods", cmd_mods, "vLLM patch mods (eugr format: a directory with run.sh)")
-    s.add_argument("action", choices=["ls", "install", "import-eugr", "rm"])
+    s.add_argument("action", choices=["ls", "install", "import-eugr", "file-patch", "rm"])
     s.add_argument("path", nargs="?", help="mod dir/zip/tar, spark-vllm-docker checkout, or mod name")
     s.add_argument("--name")
     s.add_argument("--only", help="import-eugr: comma-separated mod names")
     s.add_argument("--nodes")
+    s.add_argument("--file", help="file-patch: the replacement file on this machine")
+    s.add_argument("--target", help="file-patch: the absolute path it replaces inside the vLLM image")
+    s.add_argument("--out", help="file-patch: only write the mod directory here (review, then `tsm mods install`)")
 
     cmd("doctor", cmd_doctor, "check everything a fast, stable dual-Spark setup needs")
     s = cmd("rdma", cmd_rdma, "discover RoCE devices / GID index and compare with controller.yaml")
@@ -1042,7 +1184,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-w", "--watch", type=float, nargs="?", const=5.0, help="repeat every N seconds")
     s = cmd("headless", cmd_headless, "desktop/headless mode on both nodes (via tsm-privd)")
     s.add_argument("mode", choices=["status", "desktop", "headless-safe", "headless-max"])
-    s.add_argument("--now", action="store_true", help="also stop/start the display manager right away")
+    s.add_argument("--now", action="store_true", help="also stop/start the display manager right away "
+                   "(headless-max always stops it now; headless-safe without --now only changes the next boot)")
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask before closing or starting a desktop")
     s = cmd("foreign", cmd_foreign, "vLLM containers started outside TwinSpark")
     s.add_argument("action", choices=["ls", "stop"])
     s.add_argument("node", nargs="?", choices=["A", "B"])

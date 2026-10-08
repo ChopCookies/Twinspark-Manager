@@ -24,8 +24,18 @@ ITEM_LIMIT = 256 * 1024
 BUNDLE_LIMIT = 8 * 1024 * 1024
 DEADLINE_S = 75.0
 
-_KEYED = re.compile(r"(?im)\b([\w.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|authorization|credential)[\w.-]*"
-                    r"\s*[\"']?\s*[:=]\s*[\"']?)(?!\[REDACTED\])([^\s\"',;]+)")
+# "token" but not "tokens"/"tokenizer" (max_num_batched_tokens=8192 is a setting, not a secret).
+_SECRET_WORD = r"(?:token(?![a-z])|secret|passw(?:or)?d|api[_-]?key|authorization|credential)"
+# A match starts AT the keyword: the rest of the name before it ("HF_" in HF_TOKEN) stays as it is, so there
+# is no prefix to backtrack over. The rest after it is bounded and possessive (what follows a name is never
+# [\w.-], so giving characters back cannot help). Together this keeps hostile input ("a.a.a.…") linear.
+_NAME = _SECRET_WORD + r"[\w.-]{0,64}+"
+# a list value (vLLM prints api_key=['k1', 'k2']): the whole list goes
+_KEYED_LIST = re.compile(r"(?i)(" + _NAME + r"\s*[\"']?\s*[:=]\s*\[)(?!\s*[\"']?\[?REDACTED)([^\]\n]{1,512})(\])")
+_KEYED = re.compile(r"(?i)(" + _NAME + r"\s*[\"']?\s*[:=]\s*\[?\s*[\"']?)(?!\[?REDACTED\])([^\s\"',;\[\]]+)")
+# command-line flags: --api-key VALUE, --hf-token=VALUE
+_FLAG = re.compile(r"(?i)(--[\w-]{0,64}" + _SECRET_WORD + r"[\w-]{0,64}(?:[ \t]+|=)[\"']?)"
+                   r"(?!\[?REDACTED\])(?!-)([^\s\"',;\[\]]+)")
 _BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
 _TOKENS = re.compile(r"\b(hf_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|nvapi-[A-Za-z0-9_-]{20,}"
                      r"|tsm1\.[A-Za-z0-9_=-]{20,})")
@@ -40,7 +50,9 @@ class Redactor:
             text = text.replace(v, "[REDACTED]")
         text = _BEARER.sub(r"\1 [REDACTED]", text)
         text = _TOKENS.sub("[REDACTED]", text)
-        return _KEYED.sub(r"\1[REDACTED]", text)
+        text = _KEYED_LIST.sub(r"\1[REDACTED]\3", text)
+        text = _KEYED.sub(r"\1[REDACTED]", text)
+        return _FLAG.sub(r"\1[REDACTED]", text)
 
 
 # name in the archive -> command (list) or file (str path); everything is best effort

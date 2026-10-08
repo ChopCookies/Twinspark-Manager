@@ -13,6 +13,7 @@ import socket
 import sys
 import tarfile
 import time
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,7 +36,7 @@ def run_cli(*argv) -> int:
 
 
 @pytest.fixture(autouse=True)
-def nothing_real_runs(monkeypatch):
+def nothing_real_runs(monkeypatch, tmp_path_factory):
     """Every system command is recorded, none is executed."""
     calls: list[list[str]] = []
     table: dict[str, tuple[int, str, str]] = {}
@@ -51,6 +52,12 @@ def nothing_real_runs(monkeypatch):
         raise HTTPException(409, "remote management is off in this test; sudo tsm remote enable reboot")
 
     monkeypatch.setattr(privops, "RUN", fake)
+    # the test host's own tools and processes must not leak in: efibootmgr installed, fwupd running …
+    tools = {"systemd-run", "journalctl"}
+    monkeypatch.setattr(privops, "shutil", types.SimpleNamespace(
+        which=lambda name, path=None: f"/usr/bin/{name}" if name in tools else None))
+    empty_proc = tmp_path_factory.mktemp("proc")
+    monkeypatch.setattr(privops, "PROC", empty_proc)
     monkeypatch.setattr(cli_remote, "_real_run", refuse)
     monkeypatch.setattr(PrivClient, "available", lambda self: False)
     monkeypatch.setattr(PrivClient, "call", disabled_privilege)
@@ -58,7 +65,7 @@ def nothing_real_runs(monkeypatch):
     if not hasattr(os, "getuid"):
         # A Linux service username in the scratch demo, not the Windows login name.
         monkeypatch.setattr(getpass, "getuser", lambda: "tester")
-    fake.calls, fake.table = calls, table
+    fake.calls, fake.table, fake.tools = calls, table, tools
     return fake
 
 

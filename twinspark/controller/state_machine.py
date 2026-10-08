@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable, Optional
 
-from ..schemas.enums import ActivationStage
+from ..schemas.enums import ActivationStage, JobState
 from ..schemas.job import Job, JobStep
 
 # vLLM's /health only turns 200 after weights are loaded AND CUDA graphs are
@@ -71,6 +71,9 @@ class ActivationStateMachine:
             except Exception as exc:  # noqa: BLE001
                 self.job.fail_step(step, str(exc), excerpt=getattr(exc, "excerpt", None))
                 self.job.guidance = guidance_for(str(exc) + " " + (step.log_excerpt or ""))
+                if STAGE_ORDER.index(stage) >= STAGE_ORDER.index(DESTRUCTIVE_FROM):
+                    # the caller still saves logs, cleans up and rolls back; clients stop following at FAILED
+                    self.job.state = JobState.RUNNING
                 self.persist(self.job)
                 raise StageFailed(stage, exc) from exc
             self.job.finish_step(step, message or step.message)
@@ -97,8 +100,10 @@ FAILURE_ADVICE: dict[str, str] = {
     "trust_remote_code": "this model needs trust_remote_code — review and enable it explicitly",
     "no space": "free disk space (`tsm models ls` / `tsm models rm`) or move hf_cache_dir",
     "disk space": "free disk space (`tsm models ls` / `tsm models rm`) or move hf_cache_dir",
-    "mod(s) not installed": "install the recipe's mods on both nodes: `tsm mods install <dir>`",
-    "mod ": "install the recipe's mods on both nodes: `tsm mods install <dir>`",
+    "mod(s) not installed": "install the recipe's mods on both nodes (`tsm mods ls` lists what is missing; the "
+                            "recipe's Needs list says where each comes from): `tsm mods install <dir>`, or "
+                            "`tsm mods file-patch` for a one-file patch",
+    "mod ": "install the recipe's mods on both nodes: `tsm mods install <dir>`, or `tsm mods file-patch`",
     "unrecognized arguments": "a flag is not supported by the pinned image — check the recipe "
                               "against the image, or pin the image the recipe was written for",
     "no module named": "the image lacks a component the recipe expects — use the recipe's image "

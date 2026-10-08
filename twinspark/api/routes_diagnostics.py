@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from ..controller import onboarding
 from ..controller.agent_client import AgentActionError
-from ..controller.controller import Controller
+from ..controller.controller import BusyError, Controller
 from ..metrics import combine_snapshots, scrape_metrics
 from ..resolver import resolve_hf_revision, resolve_image_digest, spec_from_resolved
 from .deps import controller_dep, require_auth
@@ -119,10 +119,10 @@ async def headless_status(ctrl: Controller = Depends(controller_dep)):
 
 @router.post("/headless")
 async def headless_apply(req: HeadlessApply, ctrl: Controller = Depends(controller_dep)):
-    if req.now and ctrl.busy():
-        raise HTTPException(409, "an activation is running")
     try:
         return await ctrl.headless_apply(req.mode, now=req.now)
+    except BusyError as e:
+        raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(422, str(e))
 

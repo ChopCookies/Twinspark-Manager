@@ -52,8 +52,10 @@ def read_logs(source: str, lines: int = 200, since_s: Optional[int] = None, grep
     else:
         note = "journal not readable by this user (add the user to the 'adm' group or run with sudo)"
     out_lines = clean(text).splitlines()
+    scanned = len(out_lines)
     if grep:
         needle = grep.lower()
         out_lines = [ln for ln in out_lines if needle in ln.lower()]
     out_lines = out_lines[-lines:]
-    return {"source": source, "lines": out_lines, "count": len(out_lines), "via": via, "note": note}
+    return {"source": source, "lines": out_lines, "count": len(out_lines), "via": via, "note": note,
+            "scanned": scanned, "window_full": scanned >= fetch}

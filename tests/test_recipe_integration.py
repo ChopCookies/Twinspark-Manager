@@ -102,7 +102,8 @@ async def test_cancel_during_pinning_does_not_commit_or_prepare(cluster, monkeyp
         return pinned, {}, []
 
     monkeypatch.setattr(pinning, "_pin_draft", fake_pin)
-    job = await integrate(c, request(d))
+    image = "ghcr.io/example/vllm:sm121"
+    job = await integrate(c, request(d, pins={"image": image, "secondary": {"image": image}}))
     await entered.wait()
     c.cancel_job(job.job_id)
     release.set()
@@ -176,7 +177,8 @@ async def test_second_model_pin_failure_is_atomic_and_retryable(cluster, monkeyp
         return part.model_copy(deep=True), {}, []
 
     monkeypatch.setattr(pinning, "_pin_draft", fake_pin)
-    req = request(d, pins={"secondary": {"model_ref": "release", "local_image": "coder-local"}})
+    req = request(d, pins={"image": "ghcr.io/example/vllm:sm121",
+                           "secondary": {"model_ref": "release", "local_image": "coder-local"}})
     job = await cluster.wait_job((await integrate(c, req)).job_id)
     assert job.state.value == "failed"
     assert not c.get_profile("duo").revisions
@@ -203,3 +205,38 @@ async def test_integration_api_auth_validation_and_retry(cluster):
                                  json={"request_id": "retry-done-001"})).status_code == 422
         req["request_id"] = "bad / id"
         assert (await client.post("/api/v1/cookbook/integrate", json=req)).status_code == 422
+
+
+async def test_a_recipe_without_an_image_is_refused_before_anything_starts(cluster, monkeypatch):
+    """Like qwen3.8-flash-next-nvfp4-tp2 (image_hint null): ask for the image, do not fail minutes later."""
+    from twinspark.controller import pinning
+    c = cluster.controller
+    d = split_draft()
+    d.identity = d.secondary.identity = None
+    d.image_hint = d.secondary.image_hint = None
+    d.source = {"url": "https://github.com/example/recipe"}
+    hub = []
+    monkeypatch.setattr(pinning, "resolve_hf_revision", lambda *a, **k: hub.append(a) or {})
+    with pytest.raises(ValueError, match="node A: no vLLM image chosen.*github.com/example/recipe.*node B"):
+        await integrate(c, request(d))
+    assert c.get_profile("duo") is None and not c.store.list_jobs() and not c.busy()
+    with pytest.raises(ValueError, match="node B: no vLLM image chosen"):        # A chosen, B still missing
+        await integrate(c, request(d, pins={"image": "ghcr.io/example/vllm:sm121"}))
+    c.create_profile(d)
+    with pytest.raises(pinning.PinError, match=r"tsm pin duo --image <ref>.*node B: .*tsm pin duo --image-b <ref>"):
+        await c.pin_profile("duo")
+    assert hub == []                                                         # failed before any Hub lookup
+
+
+def test_tsm_pin_passes_node_b_choices_as_secondary():
+    from twinspark import cli
+    sent = {}
+
+    def api(method, path, json=None, timeout=None):
+        sent.update(path=path, body=json)
+        raise SystemExit(0)
+    api.as_json = False
+    args = cli.build_parser().parse_args(["pin", "duo", "--image", "a/img:1", "--image-b", "b/img:2"])
+    with pytest.raises(SystemExit):
+        cli.cmd_pin(args, api)
+    assert sent["body"] == {"image": "a/img:1", "secondary": {"image": "b/img:2"}}

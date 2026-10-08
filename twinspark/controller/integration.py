@@ -71,6 +71,17 @@ async def integrate(ctrl, req: IntegrationRequest, *, resume_revision=None, retr
     missing = required - ctrl.agents.keys()
     if missing:
         raise ValueError(f"nodes not configured: {', '.join(sorted(missing))}")
+    if resume_revision is None:                 # a retry reuses pins that already name an image
+        from .pinning import missing_image
+        sec = pins.get("secondary") or {}
+        problems = [x for x in (
+            missing_image(req.draft, pins.get("image"), pins.get("local_image"),
+                          "node A: " if req.draft.secondary else ""),
+            missing_image(req.draft.secondary, sec.get("image"), sec.get("local_image"), "node B: ",
+                          req.draft.name)
+            if req.draft.secondary else None) if x]
+        if problems:
+            raise ValueError("; ".join(problems))
     profile = ctrl.get_profile(req.draft.name)
     if req.existing:
         if not profile:

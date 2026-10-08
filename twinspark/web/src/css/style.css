@@ -384,3 +384,8 @@ input[type="search"]::-webkit-search-cancel-button{cursor:pointer}
 .recipe-changes th { width:33%; }
 .recipe-changes th:first-child { width:34%; }
 .recipe-changes td { white-space:normal; overflow-wrap:anywhere; vertical-align:top; }
+
+/* Startup evidence of a failed launch: one block per container. */
+.evidence { border-top:1px solid var(--stroke); padding:14px 0 4px; display:flex; flex-direction:column; gap:10px; }
+.evidence:first-of-type { border-top:0; padding-top:4px; }
+.evidence .section-title { margin:6px 0 0; }

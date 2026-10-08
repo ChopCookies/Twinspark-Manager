@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -96,8 +97,10 @@ class FakeNode:
                     (port / "gid_attrs" / "ndevs" / str(i)).write_text(name + "\n")
 
     def host(self, *, real: bool = False, euid: int = 0, env: Optional[dict[str, str]] = None) -> qsfp.Host:
+        # backups must belong to whoever owns the scratch files: root in CI, the login user on a Spark
+        owner = os.getuid() if hasattr(os, "getuid") else 0
         return qsfp.Host(root=self.root, sysfs=self.sysfs, env=env or {}, euid=euid,
-                         sleep=lambda s: None, force_real=real)
+                         sleep=lambda s: None, force_real=real, owner_uid=owner)
 
     # ---- files ------------------------------------------------------------------------------
     def netplan_dir(self) -> Path:

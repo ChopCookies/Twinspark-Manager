@@ -212,10 +212,27 @@ class ActivationCoordinator:
                     if len(hashes) > 1:
                         raise RuntimeError(f"mod {m} differs between nodes — reinstall it with "
                                            f"`tsm mods install` so both run identical patches")
-        step.message = "pulling image if needed"
-        self.persist(job)
+        from .phases import phase
+        seen_images = set()
         for c in self.plan.containers:
-            await self.agent(c.node).call("image_ensure", image_ref=c.image_ref, timeout=3600)
+            if (c.node, c.image_ref) in seen_images:
+                continue
+            seen_images.add((c.node, c.image_ref))
+            key = f"image:{c.image_ref}:{c.node}"
+            label = f"image {c.image_ref} on node {c.node}"
+            step.message = f"node {c.node}: checking the image (pulled only if missing)"
+            phase(job, key, kind="image", node=c.node, ref=c.image_ref, label=label,
+                  detail="checking; pulled from the registry only if missing")
+            self.persist(job)
+            try:
+                res = await self.agent(c.node).call("image_ensure", image_ref=c.image_ref, timeout=3600)
+            except AgentActionError as exc:
+                phase(job, key, kind="image", label=label, state="failed", detail=exc.detail[:300])
+                raise
+            pulled = bool((res or {}).get("pulled"))
+            phase(job, key, kind="image", label=label, state="done" if pulled else "reused",
+                  detail="pulled from the registry" if pulled else "already on the node")
+        self.persist(job)
         if rev.identity.image_source == "local" and len(nodes) > 1 and not rev.draft.secondary:
             ids = {n: (await self.agent(n).call("image_inspect", ref=rev.identity.image_ref)).get("id")
                    for n in nodes}
@@ -256,11 +273,13 @@ class ActivationCoordinator:
                     step.message = f"waiting for the running stage job of {repo}@{sha[:8]}"
                     self.persist(job)
                     await pending
+            main_repos = {part.identity.model_repo for part in rev.parts()}
             try:
                 msgs.append(await stager.ensure(job, step, repo, sha, nodes,
                                                 include=include,
                                                 download_node=self.config.download_node,
-                                                cancel_check=self.cancel_check))
+                                                cancel_check=self.cancel_check,
+                                                kind="checkpoint" if repo in main_repos else "drafter"))
             except (StageError, AgentActionError) as exc:
                 raise RuntimeError(str(exc)) from exc
         return "; ".join(msgs)
@@ -357,12 +376,13 @@ class ActivationCoordinator:
         for i, wave in enumerate(self.plan.start_order):
             for name in wave:
                 spec = by_name[name]
+                # recorded before the call: a start that timed out may still have created the container,
+                # and its log is evidence too (a container that never came up is reported as gone)
+                job.payload.setdefault("started_containers", []).append({"node": spec.node, "name": name})
+                self.persist(job)
                 await self.agent(spec.node).call("container_start",
                                                  spec=spec.model_dump(mode="json"), timeout=180)
                 started.append(name)
-                job.payload.setdefault("started_containers", []).append(
-                    {"node": spec.node, "name": name})
-                self.persist(job)
             delay = self.plan.wave_delays_s[i] if i < len(self.plan.wave_delays_s) else 0.0
             if delay and not self.dry_run and i < len(self.plan.start_order) - 1:
                 step.message = f"started {', '.join(wave)}; waiting {delay:.0f}s before the next wave"

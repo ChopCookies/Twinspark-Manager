@@ -23,8 +23,10 @@ CHUNK = 1024 * 1024
 
 
 # ---- TCP -------------------------------------------------------------------------------
-async def tcp_responder(host: str, port: int, lifetime: float) -> dict[str, Any]:
+async def tcp_responder(host: str, port: int, lifetime: float, expect_streams: int = 0) -> dict[str, Any]:
+    """Serve until ``expect_streams`` bulk streams have finished (or ``lifetime`` runs out)."""
     received: list[int] = []
+    done = asyncio.Event()
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -39,6 +41,8 @@ async def tcp_responder(host: str, port: int, lifetime: float) -> dict[str, Any]
                 received.append(n)
                 writer.write(struct.pack("!Q", n))
                 await writer.drain()
+                if expect_streams and len(received) >= expect_streams:
+                    done.set()
             elif mode == b"P":
                 while True:
                     b = await reader.read(1)
@@ -53,12 +57,16 @@ async def tcp_responder(host: str, port: int, lifetime: float) -> dict[str, Any]
 
     server = await asyncio.start_server(handle, host, port, reuse_address=True)
     try:
-        await asyncio.sleep(lifetime)
+        try:
+            await asyncio.wait_for(done.wait(), lifetime)
+        except asyncio.TimeoutError:
+            pass
     finally:
         server.close()
         await server.wait_closed()
     return {"role": "responder", "mode": "tcp", "bind": f"{host}:{port}",
-            "bytes_received": sum(received), "streams": len(received)}
+            "bytes_received": sum(received), "streams": len(received),
+            "complete": bool(expect_streams) and len(received) >= expect_streams}
 
 
 async def _rtt(peer: str, port: int, samples: int = 200) -> dict[str, float]:
@@ -150,31 +158,49 @@ async def rdma_run(hcas: list[str], gid: Optional[int], base_port: int, duration
             proc.kill()
             raise RuntimeError(f"ib_write_bw on {hca} timed out") from None
         text = out.decode(errors="replace")
-        return {"hca": hca, "port": base_port + i, "rc": proc.returncode,
-                "gbps": parse_ib_write_bw(text), "tail": text[-800:]}
+        gbps = parse_ib_write_bw(text)
+        row: dict[str, Any] = {"hca": hca, "port": base_port + i, "rc": proc.returncode, "gbps": gbps,
+                               "tail": text[-800:]}
+        if proc.returncode != 0 or gbps is None:
+            # unavailable, not zero: a failed or unreadable run is no measurement
+            row["gbps"] = None
+            last = [ln.strip() for ln in text.splitlines() if ln.strip()][-3:]
+            row["error"] = (f"ib_write_bw on {hca} exited with code {proc.returncode}" if proc.returncode
+                            else f"no bandwidth reading from ib_write_bw on {hca}") + (
+                                ": " + " | ".join(last) if last else "")
+        return row
 
     rows = await asyncio.gather(*(one(i, h) for i, h in enumerate(hcas)))
-    agg = sum(r["gbps"] or 0 for r in rows)
-    out: dict[str, Any] = {"mode": "rdma", "role": "initiator" if peer else "responder",
-                           "per_hca": rows, "bandwidth_gbps": round(agg, 2)}
+    ok = [r for r in rows if r["gbps"] is not None]
+    out: dict[str, Any] = {"mode": "rdma", "role": "initiator" if peer else "responder", "per_hca": rows,
+                           "hcas": list(hcas), "gid_index": gid, "duration_s": duration,
+                           # the aggregate only exists when every device produced a reading
+                           "bandwidth_gbps": round(sum(r["gbps"] for r in ok), 2) if len(ok) == len(rows) else None,
+                           "measured_gbps": round(sum(r["gbps"] for r in ok), 2) if ok else None,
+                           "errors": [r["error"] for r in rows if r.get("error")]}
     if peer:
         notes = []
         if any(r["gbps"] is not None and r["gbps"] < 25 for r in rows):
             notes.append("a device reports < 25 Gb/s — this is the known CX-7 firmware "
                          "throttle; update NIC firmware and fully power-drain both Sparks")
         if len(rows) == 1 and (rows[0]["gbps"] or 0) > 80:
-            notes.append("one PCIe half measured; add the second RoCE device to reach ~200 Gb/s")
+            notes.append(f"one PCIe half measured ({rows[0]['hca']}): a working link, limited to that half. "
+                         f"Both halves (~200 Gb/s for NCCL) need the second interface on its own subnet — "
+                         f"`tsm qsfp plan` on each node — and its RoCE device in rdma_hcas")
+        if out["bandwidth_gbps"] is None and ok:
+            notes.append("partial result: the total covers only the devices that produced a reading")
         out["notes"] = notes
     return out
 
 
-def simulated(mode: str, role: str, streams: int = 4) -> dict[str, Any]:
+def simulated(mode: str, role: str, streams: int = 4, duration: float = 5.0) -> dict[str, Any]:
     if role == "responder":
         return {"role": "responder", "mode": mode, "dry_run": True}
     if mode == "rdma":
         return {"role": "initiator", "mode": "rdma", "dry_run": True, "bandwidth_gbps": 188.4,
                 "per_hca": [{"hca": "rocep1s0f1", "gbps": 94.3}, {"hca": "roceP2p1s0f1", "gbps": 94.1}],
-                "note": "simulated dry-run values"}
-    return {"role": "initiator", "mode": "tcp", "dry_run": True, "streams": streams,
+                "hcas": ["rocep1s0f1", "roceP2p1s0f1"], "duration_s": duration, "errors": [],
+                "note": "simulated dry-run values — no packet crossed the link"}
+    return {"role": "initiator", "mode": "tcp", "dry_run": True, "streams": streams, "duration_s": duration,
             "bandwidth_gbps": 41.7, "rtt_us_median": 38.0, "rtt_us_p99": 61.0,
-            "bytes_transferred": int(26e9), "note": "simulated dry-run values"}
+            "bytes_transferred": int(26e9), "note": "simulated dry-run values — no packet crossed the link"}

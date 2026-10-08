@@ -27,7 +27,16 @@ def list_jobs(limit: int = 30, kind: str | None = None, ctrl: Controller = Depen
     jobs = ctrl.store.list_jobs(limit=min(max(limit, 1), 200) * (3 if kind else 1))
     if kind:
         jobs = [j for j in jobs if j.kind == kind][:limit]
-    return jobs
+    return [_brief(j) for j in jobs]
+
+
+def _brief(job: Job) -> Job:
+    """The list is polled every few seconds: startup evidence (tens of KB per failed job) stays on /jobs/{id}."""
+    ev = job.payload.get("startup_evidence")
+    if not isinstance(ev, dict) or not ev.get("containers"):
+        return job
+    return job.model_copy(update={"payload": {**job.payload, "startup_evidence": {
+        "containers": len(ev["containers"]), "detail": f"/api/v1/jobs/{job.job_id}"}}})
 
 
 @router.get("/jobs/{job_id}", response_model=Job)
@@ -36,6 +45,26 @@ def get_job(job_id: str, ctrl: Controller = Depends(controller_dep)):
     if not job:
         raise HTTPException(404, "job not found")
     return job
+
+
+@router.get("/jobs/{job_id}/evidence/{fname}")
+def job_evidence_file(job_id: str, fname: str, ctrl: Controller = Depends(controller_dep)):
+    """A saved container log of a failed activation (redacted when it was saved)."""
+    from fastapi.responses import FileResponse
+
+    from ..controller import evidence
+
+    job = ctrl.store.load_job(job_id)
+    ev = (job.payload.get("startup_evidence") if job else None) or {}
+    ranks = (ev.get("containers") or []) if isinstance(ev, dict) else []
+    files = {c.get("file") for c in ranks if isinstance(c, dict)}
+    if not job or fname not in files:
+        raise HTTPException(404, "no saved log with that name for this job")
+    try:
+        path = evidence.open_file(evidence.evidence_dir(ctrl.config.db_path), job_id, fname)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(404, "the saved log was removed (only the newest failed jobs keep theirs)")
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-{fname}")
 
 
 @router.post("/jobs/{job_id}/cancel")

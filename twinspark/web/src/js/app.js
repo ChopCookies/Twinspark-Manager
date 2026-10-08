@@ -58,6 +58,15 @@ async function api(method, path, body) {
   }
   return data;
 }
+/** A plain-text resource (saved logs) with the same key and error handling as api(). */
+async function apiText(path) {
+  let r;
+  try { r = await fetch(path, { headers: S.key ? { "x-api-key": S.key } : {} }); }
+  catch (e) { throw new ApiError("controller not reachable", 0); }
+  if (r.status === 401) { lock(S.key ? "Session key rejected — unlock again." : ""); throw new ApiError("invalid management key", 401); }
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new ApiError((d && d.detail) || "HTTP " + r.status, r.status); }
+  return r.text();
+}
 const GET = (p) => api("GET", p);
 const POST = (p, b) => api("POST", p, b === undefined ? {} : b);
 const PUT = (p, b) => api("PUT", p, b);
@@ -67,6 +76,8 @@ const enc = encodeURIComponent;
 
 /* ============================== formatting ============================== */
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+/** A recipe-supplied link, only when it is http(s): never javascript: or data: from an imported file. */
+function webUrl(u) { return typeof u === "string" && /^https?:\/\//i.test(u) ? u : ""; }
 function gib(v, d = 1) { return v == null || isNaN(v) ? "—" : Number(v).toFixed(d) + " GiB"; }
 function bytes(n) { if (n == null) return "—"; const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0, v = n; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return v.toFixed(i >= 3 ? 1 : 0) + " " + u[i]; }
 function num(n, d = 0) { return n == null || n === "" || isNaN(n) ? "—" : Number(n).toLocaleString(undefined, { maximumFractionDigits: d }); }
@@ -316,6 +327,72 @@ async function route() {
 function go(hash) { if (location.hash === hash) route(); else location.hash = hash; }
 /** render into #main only if the user has not navigated away meanwhile */
 function render(g, html) { if (current(g)) $("#main").innerHTML = html; return current(g); }
+
+/* ---- live views -------------------------------------------------------------------------------
+   Polled views patch the page in place instead of replacing #main: replacing it restarted the view's
+   fade-in on every refresh, dropped keyboard focus and reset a chosen profile. Unchanged nodes stay,
+   text and attributes are updated, rows with a data-key keep their identity, a <select> keeps the
+   option the user picked while it still exists, and an element whose action is in flight is left alone. */
+function morphAttrs(a, b) {
+  for (const { name } of [...a.attributes]) if (!b.hasAttribute(name)) a.removeAttribute(name);
+  for (const { name, value } of [...b.attributes]) if (a.getAttribute(name) !== value) a.setAttribute(name, value);
+}
+function sameNode(a, b) {
+  return a.nodeType === b.nodeType && (a.nodeType !== 1 || (a.tagName === b.tagName &&
+    (a.getAttribute("data-key") || "") === (b.getAttribute("data-key") || "")));
+}
+function morphEl(a, b) {
+  if (a.dataset && a.dataset.pending) return;               // e.g. a Stop button showing its spinner
+  const keep = a.tagName === "SELECT" ? a.value : null;
+  morphAttrs(a, b);
+  if (a.tagName === "TEXTAREA") return;                     // never overwrite text being typed
+  morphChildren(a, b);
+  if (keep !== null && [...a.options].some(o => o.value === keep)) a.value = keep;
+}
+function morphChildren(parent, src) {
+  const keyed = new Map();
+  for (const n of parent.childNodes) if (n.nodeType === 1 && n.hasAttribute("data-key")) keyed.set(n.getAttribute("data-key"), n);
+  let i = 0;
+  for (const nb of [...src.childNodes]) {
+    let cur = parent.childNodes[i] || null;
+    const key = nb.nodeType === 1 ? nb.getAttribute("data-key") : null;
+    if (key && keyed.has(key)) {
+      const match = keyed.get(key); keyed.delete(key);
+      if (match !== cur) { parent.insertBefore(match, cur); cur = match; }
+    }
+    if (cur && sameNode(cur, nb)) {
+      if (cur.nodeType === 1) morphEl(cur, nb); else if (cur.nodeValue !== nb.nodeValue) cur.nodeValue = nb.nodeValue;
+    } else parent.insertBefore(nb, cur);
+    i++;
+  }
+  while (parent.childNodes.length > i) parent.removeChild(parent.lastChild);
+}
+/** Like render(), but patches a view already showing under the same live key (see above). */
+function renderLive(g, html, key) {
+  if (!current(g)) return false;
+  const main = $("#main"), cur = main.firstElementChild;
+  if (cur && cur.dataset.live === key && main.children.length === 1) {
+    const t = document.createElement("template"); t.innerHTML = html.trim();
+    const next = t.content.firstElementChild;
+    if (next && t.content.childNodes.length === 1 && next.tagName === cur.tagName) { morphEl(cur, next); return true; }
+  }
+  main.innerHTML = html;
+  return true;
+}
+/** Call fn every ms after the previous call has finished (polls never overlap). Stops on navigation or when fn
+    returns false; a failed poll keeps the last good view and tries again. */
+function poll(fn, ms) {
+  const g = S.gen;
+  const tick = async () => {
+    if (!current(g)) return;
+    let again = true;
+    try { again = (await fn()) !== false; } catch (e) { /* transient: keep what is shown */ }
+    if (again && current(g)) S.timers.push(setTimeout(tick, ms));
+  };
+  S.timers.push(setTimeout(tick, ms));
+}
+/** A ticket for one load: a slower, older request must not overwrite what a newer one already showed. */
+function newest() { const n = (S.seq = (S.seq || 0) + 1); return () => n === S.seq; }
 /** event delegation on #main: handlers keyed by data-act */
 function onAct(handlers) {
   const main = $("#main");
@@ -363,14 +440,16 @@ function bindLibrary(id, rows, card, matches, noItems) {
 async function viewDashboard() {
   const g = S.gen;
   const draw = async () => {
+    const fresh = newest();
     const [st, series, profs] = await Promise.all([
       GET("/api/v1/status"), GET("/api/v1/system/metrics/series").catch(() => ({})),
       GET("/api/v1/profiles?summary=true").catch(() => []),
     ]);
     let job = null;
     if (st.current_job) job = await GET("/api/v1/jobs/" + enc(st.current_job)).catch(() => null);
+    if (!fresh()) return;
     if (!profs.length && !st.active && !S.startSeen) { S.startSeen = true; go("#/start"); return; }
-    render(g, dashboardHtml(st, series, profs, job));
+    renderLive(g, dashboardHtml(st, series, profs, job), "dashboard");
   };
   onAct({
     activate: async (el) => {
@@ -378,14 +457,19 @@ async function viewDashboard() {
       const job = await busy(el, () => POST(`/api/v1/profiles/${enc(name)}/activate`));
       toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
     },
-    stop: async (el) => {
-      if (!await confirmBox("Stop the model?", "Requests are drained first, then the containers on both nodes stop. The gateway answers 503 until something is activated again.", { label: "Stop", danger: true })) return;
-      await busy(el, () => POST("/api/v1/stop")); toast("stopped", "good"); draw();
-    },
+    stop: async (el) => { if (await stopFlow(el)) draw().catch(() => { }); },
     cancel: async (el) => { const r = await POST(`/api/v1/jobs/${enc(el.dataset.id)}/cancel`); toast(r.note); },
   });
   await draw();
-  every(() => draw().catch(() => { }), 5000);
+  poll(draw, 5000);
+}
+/** Drain and stop the active model (dashboard, profile list and profile page share this). */
+async function stopFlow(el) {
+  if (!await confirmBox("Stop the model?", "Requests are drained first, then the containers on both nodes stop. The gateway answers 503 until something is activated again.", { label: "Stop", danger: true })) return false;
+  const job = await busy(el, () => POST("/api/v1/stop"));
+  if (job && job.state === "failed") { toast("stop failed: " + (job.error || "see the job"), "bad"); return false; }
+  toast("stopped", "good");
+  return true;
 }
 
 function dashboardHtml(st, series, profs, job) {
@@ -395,7 +479,7 @@ function dashboardHtml(st, series, profs, job) {
   const inc = (st.watchdog || {}).last_incident;
   const routes = st.routes || [];
   const down = routes.find(r => r.down_reason);
-  let html = `<div class="view"><div class="view-head"><div><h1>Dashboard</h1><p>Both Sparks at a glance — refreshes every 5 s.</p></div>
+  let html = `<div class="view" data-live="dashboard"><div class="view-head"><div><h1>Dashboard</h1><p>Both Sparks at a glance — refreshes every 5 s.</p></div>
     <div class="row">
       <select id="qs-profile" style="width:auto;min-width:220px">${pinned.length ? pinned.map(p => `<option value="${esc(p.name)}" ${p.active ? "selected" : ""}>${esc(p.name)}${p.active ? " (active)" : ""}</option>`).join("") : `<option value="">no pinned profiles</option>`}</select>
       <button class="btn primary" data-act="activate" ${pinned.length && !st.busy ? "" : "disabled"}>${icon("play")}Switch</button>
@@ -448,7 +532,7 @@ function dashboardHtml(st, series, profs, job) {
   // routes
   html += `<div class="card"><div class="card-head"><h2>Gateway routes</h2><span class="small muted">OpenAI-compatible endpoint · port 8000 by default</span></div>`;
   html += routes.length ? `<div class="table-wrap"><table><thead><tr><th>Model name</th><th>Status</th><th>Serves</th><th class="num">In flight</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Max len</th></tr></thead><tbody>
-    ${routes.map(r => `<tr><td class="mono">${esc(r.alias)}</td><td>${tag(r.status, r.status === "serving" ? "good" : r.status === "down" ? "bad" : "warn")}${r.down_reason ? `<div class="sub">${esc(r.down_reason)}</div>` : ""}</td>
+    ${routes.map(r => `<tr data-key="route:${esc(r.alias)}"><td class="mono">${esc(r.alias)}</td><td>${tag(r.status, r.status === "serving" ? "good" : r.status === "down" ? "bad" : "warn")}${r.down_reason ? `<div class="sub">${esc(r.down_reason)}</div>` : ""}</td>
       <td>${esc(r.model || "—")}</td><td class="num">${num(r.inflight)}</td><td class="num">${num(r.requests)}</td>
       <td class="num">${num(r.errors)}${r.last_error ? `<div class="sub">${esc(r.last_error)}</div>` : ""}</td><td class="num">${num(r.max_model_len)}</td></tr>`).join("")}
     </tbody></table></div>` : empty("No routes", "The gateway returns 404 until a model is activated.");
@@ -574,7 +658,7 @@ function jobBanner(job) {
   const p = Math.round((step.progress || 0) * 100);
   return `<div class="card accent"><div class="row between"><div><b>${esc(job.kind === "stage" ? "Staging" : job.kind === "recovery" ? "Recovering" : "Switching to")} ${esc(job.payload.profile || job.payload.repo || "")}</b>
       <span class="muted"> · ${esc(step.stage || "starting")} · ${esc(dur(job.created_at))}</span></div>
-      <div class="row"><a class="btn sm" href="#/jobs/${enc(job.job_id)}">Details</a><button class="btn sm danger" data-act="cancel" data-id="${esc(job.job_id)}">Cancel</button></div></div>
+      <div class="row"><a class="btn sm" href="#/jobs/${enc(job.job_id)}">Details</a>${cleaningUp(job) ? "" : `<button class="btn sm danger" data-act="cancel" data-id="${esc(job.job_id)}">Cancel</button>`}</div></div>
     <div class="small" style="margin-top:6px;color:var(--ink-2)">${esc(step.message || "")}</div>
     <div class="progress-line ${p ? "" : "indeterminate"}"><i style="width:${p}%"></i></div></div>`;
 }
@@ -591,7 +675,7 @@ async function viewProfiles() {
         ${p.description ? `<div class="d">${esc(p.description)}</div>` : ""}
         ${(p.warnings || []).filter(w => !w.startsWith("not pinned")).map(w => `<div class="d" style="color:var(--warn)">⚠ ${esc(w)}</div>`).join("")}
       </div><div class="actions">
-        ${p.pinned ? `<button class="btn sm primary" data-act="activate" data-name="${esc(p.name)}" ${p.active || st.busy ? "disabled" : ""}>${icon("play")}Switch</button>` : ""}
+        ${p.active ? `<button class="btn sm danger" data-act="stop" ${st.busy ? "disabled" : ""}>${icon("stop")}Stop</button>` : p.pinned ? `<button class="btn sm primary" data-act="activate" data-name="${esc(p.name)}" ${st.busy ? "disabled" : ""}>${icon("play")}Switch</button>` : ""}
         <button class="btn sm ${p.pinned ? "" : "primary"}" data-act="pin" data-name="${esc(p.name)}">${icon("pin")}${p.pinned ? "Re-pin" : "Pin"}</button>
         <a class="btn sm" href="#/profiles/${enc(p.name)}/plan">Plan</a>
       </div></div>`;
@@ -606,6 +690,7 @@ async function viewProfiles() {
     empty("Your first experiment starts with a recipe", "Open the Cookbook to import a configuration, then adjust it here."));
   onAct({
     split: () => splitFlow(rows),
+    stop: async (el) => { if (await stopFlow(el)) route(); },
     activate: (el) => activateFlow(el.dataset.name, "latest", el),
     pin: (el) => pinFlow(el.dataset.name).then(ok => ok && route()),
     new: async () => {
@@ -653,7 +738,9 @@ async function automateRecipe(name, btn) {
   const job = await busy(btn, async () => {
     const p = await GET(`/api/v1/profiles/${enc(name)}`);
     if (!current(g)) return null;
-    return POST('/api/v1/cookbook/integrate', {draft:p.draft, existing:true, request_id:recipeRequestId()});
+    const pins = await askMissingImages(p.draft);
+    if (pins === null) return null;
+    return POST('/api/v1/cookbook/integrate', {draft:p.draft, existing:true, pins, request_id:recipeRequestId()});
   });
   if (job && current(g)) { toast("pinning and preparing recipe…"); go("#/jobs/" + enc(job.job_id)); }
 }
@@ -665,16 +752,61 @@ async function checkRecipeUpdate(name, btn) {
   if (update.status === 'changed') await importDraft({...update.preview, update});
   else toast(update.message || 'Recipe source is up to date', update.status === 'error' ? 'bad' : 'good');
 }
+/* ---- images: a recipe without image_hint needs the person to choose one before anything starts ---- */
+const needsImage = (d) => !!d && !d.image_hint && !d.identity;
+const IMAGE_HELP = "A registry reference is pinned to its multi-arch digest; a local tag is pinned to its image ID, which must be identical on both nodes. TwinSpark never picks an installed image on its own: a vLLM build without this model's support or patches fails much later.";
+function imageFieldsHtml(d) {
+  const parts = [["a", d, d.secondary ? "Container image for node A" : "Container image"], ...(d.secondary ? [["b", d.secondary, "Container image for node B"]] : [])].filter(([, x]) => needsImage(x));
+  if (!parts.length) return "";
+  const src = webUrl(d.source?.url);
+  return `<div class="callout warn"><div><b>This recipe names no vLLM image.</b> Choose a compatible one before preparing${src ? ` — its source lists the image its author used: <a href="${esc(src)}" target="_blank" rel="noopener noreferrer">${esc(src)}</a>` : ""}. Import only does not need it.</div></div>
+    ${parts.map(([k, , label]) => `<label class="field"><span>${esc(label)}</span><input id="imp-image-${k}" placeholder="ghcr.io/org/image:tag or a local tag"/><span class="help">${esc(IMAGE_HELP)}</span></label>`).join("")}`;
+}
+/** pins for /cookbook/integrate from the review dialog's image fields; null (and a message) when one is missing */
+function imagePins(root, d) {
+  const pins = {};
+  for (const [k, x] of [["a", d], ["b", d.secondary]]) {
+    if (!needsImage(x)) continue;
+    const input = $(`#imp-image-${k}`, root), v = (input?.value || "").trim();
+    if (!v) { input?.setCustomValidity("Choose an image first, or use Import only"); input?.reportValidity(); input?.addEventListener("input", () => input.setCustomValidity(""), { once: true }); return null; }
+    if (k === "a") pins.image = v; else pins.secondary = { image: v };
+  }
+  return pins;
+}
+/** Ask for the images a draft lacks; {} when nothing is missing, null when the person cancels. */
+async function askMissingImages(d) {
+  const missing = [["image", d, d.secondary ? "Container image for node A" : "Container image"], ...(d.secondary ? [["image_b", d.secondary, "Container image for node B"]] : [])].filter(([, x]) => needsImage(x));
+  if (!missing.length) return {};
+  const src = webUrl(d.source?.url);
+  const v = await formBox("Choose the vLLM image", missing.map(([id, , label]) => ({ id, label, value: "", placeholder: "ghcr.io/org/image:tag or a local tag", help: IMAGE_HELP })),
+    { label: "Pin & prepare", intro: `<div class="small">This recipe names no image${src ? `; its source lists the one its author used: <a href="${esc(src)}" target="_blank" rel="noopener noreferrer">${esc(src)}</a>` : ""}.</div>`,
+      validate: async (values) => { for (const [id] of missing) if (!(values[id] || "").trim()) throw new Error("Enter an image (registry reference or local tag)."); return values; } });
+  if (!v) return null;
+  const pins = {};
+  if (v.image) pins.image = v.image.trim();
+  if (v.image_b) pins.secondary = { image: v.image_b.trim() };
+  return pins;
+}
 async function pinFlow(name) {
   const p = await GET(`/api/v1/profiles/${enc(name)}`);
   const d = p.draft || {}; const id = d.identity;
-  const v = await formBox(`Pin ${name}`, [
+  const mustA = needsImage(d), mustB = d.secondary && needsImage(d.secondary);
+  const fields = [
     { id: "model_ref", label: "Model revision", value: "", placeholder: id ? `keep ${sha(id.model_revision, 12)} (or: main / a 40-char sha)` : "main (or a branch / 40-char sha)", help: `Resolved against the Hub for ${d.simple?.model || "the model"} — the exact commit gets recorded.` },
-    { id: "image", label: "Container image", value: "", placeholder: d.image_hint || (id ? `keep ${id.image}` : "ghcr.io/org/image:tag or local tag"), help: "Registry refs are pinned to their multi-arch digest; a local tag (eugr build) is pinned to its image ID, which must match on both nodes." },
-    { id: "note", label: "Note (optional)", value: "" },
-  ], { label: "Pin", intro: `<div class="small muted">Pinning turns the working draft into an immutable revision you can switch to. Extra models (drafters) are pinned too.${d.secondary ? " Both models are pinned together. These overrides apply to A; B uses the image and revision in its settings." : ""}</div>` });
+    { id: "image", label: mustA ? "Container image (required: the recipe names none)" : d.secondary ? "Container image for node A" : "Container image", value: "", placeholder: d.image_hint || (id ? `keep ${id.image}` : "ghcr.io/org/image:tag or local tag"), help: IMAGE_HELP },
+  ];
+  if (mustB) fields.push({ id: "image_b", label: "Container image for node B (required: the recipe names none)", value: "", placeholder: "ghcr.io/org/image:tag or local tag", help: IMAGE_HELP });
+  fields.push({ id: "note", label: "Note (optional)", value: "" });
+  const v = await formBox(`Pin ${name}`, fields, { label: "Pin",
+    intro: `<div class="small muted">Pinning turns the working draft into an immutable revision you can switch to. Extra models (drafters) are pinned too.${d.secondary ? " Both models are pinned together." : ""}</div>`,
+    validate: async (values) => {
+      if (mustA && !(values.image || "").trim()) throw new Error("This recipe names no image: enter one (registry reference or local tag).");
+      if (mustB && !(values.image_b || "").trim()) throw new Error("Enter the image for node B.");
+      return values;
+    } });
   if (!v) return false;
-  const body = {}; if (v.model_ref) body.model_ref = v.model_ref; if (v.image) body.image = v.image; if (v.note) body.note = v.note;
+  const body = {}; if (v.model_ref) body.model_ref = v.model_ref; if (v.image) body.image = v.image.trim(); if (v.note) body.note = v.note;
+  if (v.image_b) body.secondary = { image: v.image_b.trim() };
   toast("pinning — resolving commit and image…");
   const r = await POST(`/api/v1/profiles/${enc(name)}/pin`, body);
   await modal({
@@ -695,7 +827,7 @@ async function viewProfile(name, tab) {
   const head = `<div class="view-head"><div><div class="crumbs"><a href="#/profiles">Profiles</a> /</div>
       <h1>${esc(name)} ${isActive ? tag("active", "good") : last ? tag("pinned " + last.label, "info") : tag("draft", "warn")} ${d ? verifTag(d.verification) : ""}</h1><p>${esc(p.description || d?.description || "")}</p></div>
     <div class="row">
-      ${last ? `<button class="btn primary" data-act="activate" ${isActive || st.busy ? "disabled" : ""}>${icon("play")}Switch to latest</button>` : ""}
+      ${isActive ? `<button class="btn danger" data-act="stop" ${st.busy ? "disabled" : ""}>${icon("stop")}Stop</button>` : last ? `<button class="btn primary" data-act="activate" ${st.busy ? "disabled" : ""}>${icon("play")}Switch to latest</button>` : ""}
       <button class="btn" data-act="prepare" ${st.busy ? "disabled" : ""}>${last && !hasEdits ? "Prepare recipe" : "Pin &amp; prepare"}</button>
       <button class="btn ${last ? "" : "primary"}" data-act="pin">${icon("pin")}${last ? "Re-pin" : "Pin"}</button>
       <button class="btn" data-act="duplicate">Duplicate</button>
@@ -711,6 +843,7 @@ async function viewProfile(name, tab) {
       else await prepareFlow(name, el);
     },
     activate: (el) => activateFlow(name, "latest", el),
+    stop: async (el) => { if (await stopFlow(el)) route(); },
     pin: () => pinFlow(name).then(ok => ok && route()),
     duplicate: async () => {
       const v = await formBox("Duplicate profile", [{ id: "n", label: "New name", value: name + "-copy" }], { label: "Duplicate" });
@@ -1078,8 +1211,10 @@ const STAGE_HELP = {
 async function viewJob(id) {
   const g = S.gen;
   const draw = async () => {
+    const fresh = newest();
     const job = await GET(`/api/v1/jobs/${enc(id)}`);
-    if (!render(g, jobHtml(job))) return false;
+    if (!fresh()) return true;
+    if (!renderLive(g, jobHtml(job), "job:" + id)) return false;
     return ["running", "pending"].includes(job.state);
   };
   onAct({
@@ -1099,12 +1234,43 @@ async function viewJob(id) {
       const job = await busy(el, () => POST(`/api/v1/cookbook/integration/${enc(id)}/retry`, {request_id:recipeRequestId()}));
       go("#/jobs/" + enc(job.job_id));
     },
+    "evidence-log": async (el) => {
+      const text = await busy(el, () => apiText(`/api/v1/jobs/${enc(id)}/evidence/${enc(el.dataset.file)}`));
+      const href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+      const a = document.createElement("a"); a.href = href; a.download = `${id}-${el.dataset.file}`; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 1000);
+    },
   });
-  if (await draw()) {
-    const t = setInterval(async () => { if (!current(g)) return clearInterval(t); try { if (!await draw()) clearInterval(t); } catch (e) { } }, 1500);
-    S.timers.push(t);
-  }
+  if (await draw()) poll(draw, 1500);
 }
+const PHASE_ICON = { image: "◫", checkpoint: "▣", drafter: "▤", verify: "✓", copy: "⇄" };
+function phasesHtml(items) {
+  if (!items || !items.length) return "";
+  const cls = { done: "good", reused: "info", failed: "bad", skipped: "muted", running: "warn" };
+  const word = { done: "done", reused: "reused", failed: "failed", skipped: "skipped", running: "in progress" };
+  return `<div class="card"><h2>Work items</h2><p class="small muted">Image pulls, main weights, drafter weights, checksum verification and copies over QSFP — each with the exact revision.</p>
+    <div class="list">${items.map(x => `<div class="item" data-key="phase:${esc(x.key)}"><div class="l"><div class="t">${esc(PHASE_ICON[x.kind] || "•")} ${esc(x.label)} ${tag(word[x.state] || x.state, cls[x.state] || "muted")}</div>
+      <div class="d">${esc(x.detail || "")}${x.ref ? ` <span class="mono faint" title="${esc(x.ref)}">${esc(x.ref.length > 90 ? x.ref.slice(0, 90) + "…" : x.ref)}</span>` : ""}</div>
+      ${x.state === "running" && x.progress != null ? `<div class="progress-line"><i style="width:${Math.round(x.progress * 100)}%"></i></div>` : ""}</div></div>`).join("")}</div></div>`;
+}
+function evidenceHtml(ev) {
+  if (!ev || !(ev.containers || []).length) return "";
+  const exitText = (c) => c.error ? `no evidence: ${c.error}` : c.status === "missing" ? "no such container (it never started, or was already removed)" :
+    [c.status, c.exit_code != null && c.status !== "running" ? `exit code ${c.exit_code}` : "", c.oom_killed ? "killed by the kernel OOM killer" : ""].filter(Boolean).join(", ");
+  return `<div class="card"><div class="card-head"><h2>Startup evidence</h2><span class="small muted">saved before cleanup removed the containers · ${esc(ev.profile || "")} ${esc(ev.revision_id || "")}</span></div>
+    <p class="small muted">Image ${(ev.images || []).map(i => `<span class="mono">${esc(i)}</span>`).join(", ") || "—"}. Logs are redacted, at most ${bytes(ev.limits?.max_log_chars)} each (the end is kept); the newest ${esc(ev.limits?.kept_jobs ?? "")} failed jobs keep theirs. An exit code 1 does not rule out a GPU memory failure — compare the kernel messages and memory below.</p>
+    ${ev.containers.map(c => { const m = c.memory || {}; return `<div class="evidence" data-key="ev:${esc(c.node)}:${esc(c.name)}">
+      <div class="row between"><b>Node ${esc(c.node)} · <span class="mono">${esc(c.name)}</span> ${c.role ? tag(c.role, "muted") : ""}</b>${c.file ? `<button class="btn sm" data-act="evidence-log" data-file="${esc(c.file)}">Download log (${bytes(c.bytes)}${c.log_truncated ? ", end of a longer log" : ""})</button>` : ""}</div>
+      <div class="kv"><b>State</b><span>${esc(exitText(c))}</span>
+        <b>Memory after the failure</b><span>${m.mem_available_gib != null ? `${gib(m.mem_available_gib)} available of ${gib(m.mem_total_gib)} · page cache ${gib(m.page_cache_gib)} · swap used ${gib(m.swap_used_gib)}` : "—"}</span>
+        <b>NVIDIA kernel messages</b><span>${c.kernel_gpu_mem_errors ? `<span style="color:var(--bad)">${c.kernel_count_at_least ? "at least " : ""}${num(c.kernel_gpu_mem_errors)} out-of-memory message(s) since the container started</span>${c.kernel_note ? `<div class="sub">${esc(c.kernel_note)}</div>` : ""}` : c.kernel_gpu_mem_errors === 0 ? `no out-of-memory messages${c.kernel_note ? `<div class="sub">${esc(c.kernel_note)}</div>` : ""}` : esc(c.kernel_note || "not read")}</span></div>
+      ${c.first_error ? `<div class="section-title">First error</div>${codeBlock(c.first_error, "log")}` : ""}
+      ${c.final_error ? `<details><summary>Final error</summary>${codeBlock(c.final_error, "log")}</details>` : ""}
+      ${(c.kernel_samples || []).length ? `<details><summary>Kernel messages (samples)</summary>${codeBlock(c.kernel_samples.join("\n"), "log")}</details>` : ""}
+    </div>`; }).join("")}</div>`;
+}
+/** A failed start stays "running" while its logs are saved and its containers removed: nothing to cancel then. */
+function cleaningUp(job) { return ["running", "pending"].includes(job.state) && (job.steps || []).some(s => s.status === "failed"); }
 function jobHtml(job) {
   const running = ["running", "pending"].includes(job.state);
   const activation = ["activation", "rollback", "recovery"].includes(job.kind);
@@ -1115,10 +1281,12 @@ function jobHtml(job) {
   const stages = activation ? STAGES : preparation ? [...(job.kind === "integration" ? ["pinning"] : []), ...STAGES.slice(0, 4)] : (job.steps || []).map(s => s.stage);
   const pl = job.payload || {};
   const title = activation ? `${job.kind === "activation" ? "Switch to" : job.kind === "rollback" ? "Roll back to" : "Recover"} ${pl.profile || ""} ${pl.label || ""}` : preparation ? `Prepare ${pl.profile || ""} ${pl.revision || ""}` : compatibility ? `Check connection ${pl.alias || ""}` : evaluation ? `Evaluation report ${pl.alias || ""}` : job.kind === "stage" ? `Stage ${pl.repo || ""}@${sha(pl.revision, 8)}` : job.kind;
-  let h = `<div class="view"><div class="view-head"><div><div class="crumbs"><a href="#/jobs">Jobs</a> / <span class="mono">${esc(job.job_id)}</span></div>
+  let h = `<div class="view" data-live="job:${esc(job.job_id)}"><div class="view-head"><div><div class="crumbs"><a href="#/jobs">Jobs</a> / <span class="mono">${esc(job.job_id)}</span></div>
     <h1>${esc(title)} ${tag(job.state, { completed: "good", failed: "bad", running: "info", cancelled: "muted" }[job.state] || "muted")}</h1><p>started ${esc(when(job.created_at))} · ${esc(dur(job.created_at, running ? null : job.updated_at))}</p></div>
-    <div class="row">${running ? `<button class="btn danger" data-act="cancel">Cancel</button>` : ""}${activation ? `<button class="btn" data-act="logs">Container logs</button>` : ""}${compatibility || evaluation ? '<a class="btn" href="#/integrations">Integrations</a>' : ""}${pl.profile ? `<a class="btn" href="#/profiles/${enc(pl.profile)}">Profile</a>` : ""}</div></div>`;
-  if (job.state === "failed") {
+    <div class="row">${running && !cleaningUp(job) ? `<button class="btn danger" data-act="cancel">Cancel</button>` : ""}${activation ? `<button class="btn" data-act="logs">Container logs</button>` : ""}${compatibility || evaluation ? '<a class="btn" href="#/integrations">Integrations</a>' : ""}${pl.profile ? `<a class="btn" href="#/profiles/${enc(pl.profile)}">Profile</a>` : ""}</div></div>`;
+  if (cleaningUp(job)) {
+    h += `<div class="callout warn"><div><b>${esc(job.error || "failed")}</b><div style="margin-top:6px"><span class="spin"></span> ${esc(job.rollback || "cleaning up")}</div></div></div>`;
+  } else if (job.state === "failed") {
     h += `<div class="callout bad"><div><b>${esc(job.error || "failed")}</b>${(job.guidance || []).length ? `<ul>${job.guidance.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}${job.rollback ? `<div style="margin-top:6px"><b>Rollback:</b> ${esc(job.rollback)}</div>` : ""}</div></div>`;
   } else if (job.state === "completed" && activation) {
     h += `<div class="callout good"><div><b>Serving.</b> ${pl.kv && pl.kv.kv_cache_tokens ? `KV pool ${num(pl.kv.kv_cache_tokens)} tokens. ` : ""}${pl.max_model_len ? `max_model_len ${num(pl.max_model_len)}.` : ""}</div></div>`;
@@ -1133,17 +1301,23 @@ function jobHtml(job) {
     const s = done[st];
     const cls = s ? s.status : "pending";
     const p = s && s.status === "running" ? Math.round((s.progress || 0) * 100) : 0;
-    h += `<div class="step ${esc(cls)}"><div class="ic">${cls === "ok" ? "✓" : cls === "failed" ? "✕" : ""}</div>
+    h += `<div class="step ${esc(cls)}" data-key="stage:${esc(st)}"><div class="ic">${cls === "ok" ? "✓" : cls === "failed" ? "✕" : ""}</div>
       <div class="name">${esc(st)}</div>
       <div class="msg">${s ? esc(s.message || "") : `<span class="faint">${esc(STAGE_HELP[st] || "")}</span>`}${s && s.status === "running" ? `<div class="progress-line ${p ? "" : "indeterminate"}"><i style="width:${p}%"></i></div>` : ""}</div>
       <div class="dur">${s ? esc(dur(s.started_at, s.finished_at)) : ""}</div></div>`;
   }
   if (!compatibility) h += `</div></div>`;
+  h += phasesHtml(pl.phases);
+  if (pl.evidence_error) h += `<div class="callout warn"><div>${esc(pl.evidence_error)}</div></div>`;
+  h += evidenceHtml(pl.startup_evidence);
   const excerpt = (job.steps || []).map(s => s.log_excerpt).filter(Boolean).pop();
-  if (excerpt) h += `<div class="card"><h2>Log excerpt</h2>${codeBlock(excerpt, "log")}</div>`;
+  // the evidence card already shows each rank's errors; the step's excerpt stays when it has none (agent unreachable)
+  const evShown = ((pl.startup_evidence || {}).containers || []).some(c => c && (c.first_error || c.final_error));
+  if (excerpt && !evShown) h += `<div class="card"><h2>Log excerpt</h2>${codeBlock(excerpt, "log")}</div>`;
   if (pl.memory_estimate) {
     const m = pl.memory_estimate;
-    h += `<div class="card"><h2>Memory estimate per node</h2><div class="kv"><b>Weights</b><span>${gib(m.model_weights)}</span><b>KV cache (requested)</b><span>${gib(m.kv_cache)}</span><b>Activations + graphs</b><span>${gib(m.activations + m.cuda_graphs)}</span><b>OS + runtime reserve</b><span>${gib(m.system_usage + m.runtime + m.control_plane + m.safety_reserve)}</span><b>Node total</b><span>${gib(m.mem_total)}</span></div></div>`;
+    h += `<div class="card"><h2>Memory estimate per node</h2><div class="kv"><b>Weights</b><span>${gib(m.model_weights)}</span><b>KV cache (requested)</b><span>${gib(m.kv_cache)}</span><b>Activations + graphs</b><span>${gib(m.activations + m.cuda_graphs)}</span><b>OS + runtime reserve</b><span>${gib(m.system_usage + m.runtime + m.control_plane + m.safety_reserve)}</span><b>Node total</b><span>${gib(m.mem_total)}</span></div>
+      <p class="small muted">An estimate of what is requested, not a measurement: vLLM sizes the KV pool from what is left after loading, and the startup peak (weight loading, the first prefill of max_num_batched_tokens, CUDA graphs) can be higher than the steady state.</p></div>`;
   }
   return h + `</div>`;
 }
@@ -1152,17 +1326,19 @@ async function viewJobs() {
   const g = S.gen;
   const kind = sessionStorage.getItem("tsm_jobs_kind") || "";
   const draw = async () => {
+    const fresh = newest();
     const jobs = await GET("/api/v1/jobs" + qs({ limit: 60, kind }));
-    render(g, `<div class="view"><div class="view-head"><div><h1>Jobs</h1><p>Recipe preparation, connection checks and deployment changes — newest first.</p></div>
+    if (!fresh()) return;
+    renderLive(g, `<div class="view" data-live="jobs"><div class="view-head"><div><h1>Jobs</h1><p>Recipe preparation, connection checks and deployment changes — newest first.</p></div>
       <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "compatibility", "evaluation", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
       <div class="card">${jobs.length ? `<div class="table-wrap"><table><thead><tr><th>Job</th><th>Kind</th><th>Target</th><th>State</th><th>Stage</th><th>Started</th><th>Took</th></tr></thead><tbody>
-      ${jobs.map(j => `<tr class="clickable" data-act="open" data-id="${esc(j.job_id)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.kind)}</td><td>${esc(j.payload.alias || (j.payload.profile ? j.payload.profile + " " + (j.payload.label || "") : j.payload.repo || ""))}</td>
+      ${jobs.map(j => `<tr class="clickable" data-key="job:${esc(j.job_id)}" data-act="open" data-id="${esc(j.job_id)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.kind)}</td><td>${esc(j.payload.alias || (j.payload.profile ? j.payload.profile + " " + (j.payload.label || "") : j.payload.repo || ""))}</td>
         <td>${tag(j.state, { completed: "good", failed: "bad", running: "info" }[j.state] || "muted")}${j.error ? `<div class="sub">${esc(j.error.slice(0, 120))}</div>` : ""}</td><td>${esc(j.stage || "")}</td><td>${esc(ago(j.created_at))}</td><td>${esc(dur(j.created_at, ["running", "pending"].includes(j.state) ? null : j.updated_at))}</td></tr>`).join("")}
       </tbody></table></div>` : empty("No jobs yet")}</div></div>`);
     const sel = $("#job-kind"); if (sel) sel.onchange = () => { sessionStorage.setItem("tsm_jobs_kind", sel.value); route(); };
   };
   onAct({ open: (el) => go("#/jobs/" + enc(el.dataset.id)) });
-  await draw(); every(() => draw().catch(() => { }), 5000);
+  await draw(); poll(draw, 5000);
 }
 async function viewAudit() {
   const rows = await GET("/api/v1/audit?limit=300");
@@ -1217,7 +1393,7 @@ async function viewCookbook(tab) {
     ${Object.keys(r.measured || {}).length ? `<div class="measured">${Object.entries(r.measured).slice(0, 5).map(([k, v]) => tag(`${k.replace(/_/g, " ")}: ${v}`, "muted")).join("")}</div>` : ""}
     ${(r.requirements || []).length ? `<details><summary>Needs (${r.requirements.length})</summary><ul class="plain">${r.requirements.map(x => `<li>${esc(x)}</li>`).join("")}</ul></details>` : ""}
     ${(r.notes || []).length ? `<details><summary>Notes (${r.notes.length})</summary><ul class="plain">${r.notes.map(x => `<li>${esc(x)}</li>`).join("")}</ul></details>` : ""}
-    <div class="row end" style="margin-top:12px">${r.url ? `<a class="btn sm ghost" href="${esc(r.url)}" target="_blank" rel="noopener">Source</a>` : ""}<button class="btn sm" data-act="details" data-name="${esc(r.name)}">Details</button><button class="btn sm primary" data-act="import" data-name="${esc(r.name)}" data-suggest="${esc((r.imported_as || []).length ? r.name + "-2" : r.name)}">Import</button></div></div>`;
+    <div class="row end" style="margin-top:12px">${webUrl(r.url) ? `<a class="btn sm ghost" href="${esc(r.url)}" target="_blank" rel="noopener">Source</a>` : ""}<button class="btn sm" data-act="details" data-name="${esc(r.name)}">Details</button><button class="btn sm primary" data-act="import" data-name="${esc(r.name)}" data-suggest="${esc((r.imported_as || []).length ? r.name + "-2" : r.name)}">Import</button></div></div>`;
   if (!render(g, `<div class="view">${head}
     ${libraryToolbar("recipes", "Search model, recipe or quantization…", [["all", "All topologies"], ...[...new Set(data.recipes.map(r => r.topology).filter(Boolean))].sort().map(t => [t, t])])}
     <div class="grid cols-2" id="recipes-items"></div></div>`)) return;
@@ -1332,6 +1508,7 @@ async function importDraft(pv, suggested) {
       <label class="field"><span>Profile name</span><input id="imp-name" required maxlength="63" pattern="[a-z0-9][a-z0-9._\\-]{0,62}" value="${esc(suggested || (pv.exists ? name.slice(0, 61) + "-2" : name))}"/><span class="help">Lowercase letters, numbers, dots, underscores and hyphens.</span></label>
       <div class="callout info"><div>Import &amp; prepare automatically pins the models and image, checks both nodes, and downloads missing weights. The current deployment keeps serving. You can also import only and customize first. Required patches must already be installed.</div></div>
       ${recipeUpdateHtml(pv.update)}
+      ${imageFieldsHtml(pv.draft)}
       ${reportHtml(pv.report, pv.draft)}
       ${(pv.draft.source?.requirements || []).length ? `<div class="section-title">Requirements</div><ul class="plain">${pv.draft.source.requirements.map(r => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}
       <details><summary>All profile settings</summary>${codeBlock(JSON.stringify(pv.draft, null, 2))}</details>`,
@@ -1342,7 +1519,8 @@ async function importDraft(pv, suggested) {
       return true;
     } }, { label: "Import & prepare", value: "prepared", cls: "primary", validate: async root => {
       const draft = snapshot(root); if (!draft) return false;
-      prepared = await POST("/api/v1/cookbook/integrate", {draft, request_id:requestId});
+      const pins = imagePins(root, draft); if (pins === null) return false;
+      prepared = await POST("/api/v1/cookbook/integrate", {draft, pins, request_id:requestId});
       return true;
     } }],
   });
@@ -1352,6 +1530,14 @@ async function importDraft(pv, suggested) {
 }
 
 /* ============================== model files ============================== */
+/** One cache cell: complete or not, who put it there, and whether checksums were verified — three different facts. */
+function cacheCell(x) {
+  if (!x.complete) return tag("partial", "warn") + `<div class="sub">files missing — staging completes it</div>`;
+  const state = x.verified ? tag("✓ checksum verified", "good") : tag("✓ complete", "good");
+  const who = x.managed ? (x.verified ? "staged by TwinSpark" : "staged by TwinSpark · checksums not verified")
+    : "external cache — reused as is, no new download";
+  return `${state}<div class="sub" title="${x.managed ? "" : "Downloaded outside TwinSpark (for example by huggingface-cli or another launcher). Complete files at the pinned revision are used without downloading again; TwinSpark has no checksum record for them."}">${esc(who)}</div>`;
+}
 async function viewFiles() {
   const g = S.gen;
   const draw = async () => {
@@ -1381,7 +1567,7 @@ async function viewFiles() {
           const cells = nodes.map(n => {
             const x = r.nodes[n];
             if (!x) return `<td>${tag("missing", "muted")}</td>`;
-            return `<td>${x.complete ? (x.verified ? tag("✓ verified", "good") : tag("✓ complete", "good")) : tag("partial", "warn")}${x.managed ? "" : `<div class="sub">not staged by TwinSpark</div>`}</td>`;
+            return `<td>${cacheCell(x)}</td>`;
           }).join("");
           const onAll = nodes.every(n => r.nodes[n] && r.nodes[n].complete);
           h += `<tr><td><div class="mono">${esc(m.repo)}</div><div class="sub mono">${esc(sha(r.revision, 12))}${r.refs.length ? " · " + esc(r.refs.join(", ")) : ""}</div></td><td class="num">${bytes(r.size_bytes)}</td>${cells}
@@ -1505,6 +1691,32 @@ async function viewPlanner() {
 }
 
 /* ============================== diagnostics ============================== */
+let hlStatus = { nodes: {} };
+/** The same one-line remote-access summary as `tsm headless status`. */
+function accessSummary(a) {
+  const ssh = a.ssh || {}, ts = a.tailscale || {}, serve = ts.serve || {};
+  const bits = [ssh.running ? (ssh.starts_at_boot ? "SSH running, starts at boot" : "SSH running, NOT enabled at boot") : "SSH not running"];
+  const tsBoot = ["disabled", "masked"].includes((ts.service || {}).enabled) ? ", NOT enabled at boot" : "";
+  if (ts.installed) bits.push(`Tailscale ${ts.running ? "up " + (ts.ip || "") : "not running"}${tsBoot}${serve.manager_forwarded ? " · manager forwarded on the tailnet" : serve.manager_forwarded === false ? " · manager NOT forwarded (tsm remote tailscale-serve)" : ""}`);
+  else bits.push("Tailscale not installed");
+  if (a.default_target) bits.push("boots into " + a.default_target);
+  return bits.join("; ");
+}
+/** A link-test result: simulated or real, what was measured, and failures as "unavailable", never as 0. */
+function linkResultHtml(r) {
+  const i = r.initiator || {};
+  if (i.error) return `<div class="callout bad"><div><b>Link test failed.</b> ${esc(i.error)}</div></div>`;
+  const what = r.mode === "tcp" ? `${num(r.streams)} TCP stream(s)` : `RDMA (ib_write_bw) on ${esc(((r.hcas || {}).A || []).join(", ") || "no device")}`;
+  const unavailable = (k) => `<div class="tile"><div class="k">${esc(k)}</div><div class="v">unavailable</div></div>`;
+  let h = r.simulated ? `<div class="callout warn"><div><b>Simulated.</b> Both nodes run in dry-run: no packet crossed the link, these numbers are made up. Real values need <span class="mono">sudo tsm go-live</span> on both nodes.</div></div>` : "";
+  h += `<p class="small muted">${what} · ${num(r.duration_s, 1)} s · node A → node B</p><div class="tiles">`;
+  h += i.bandwidth_gbps != null ? tile("Bandwidth", i.bandwidth_gbps, "Gb/s", null, "", 1) : unavailable("Bandwidth");
+  if (i.rtt_us_median != null) h += tile("RTT median", i.rtt_us_median, "µs", null, "", 1);
+  if (i.rtt_us_p99 != null) h += tile("RTT p99", i.rtt_us_p99, "µs", null, "", 1);
+  h += (i.per_hca || []).map(hc => hc.gbps != null ? tile(hc.hca, hc.gbps, "Gb/s", null, "", 1) : unavailable(hc.hca)).join("") + `</div>`;
+  if ((r.errors || []).length) h += `<div class="callout bad" style="margin-top:10px"><div><ul class="plain">${r.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></div></div>`;
+  return h + [i.note, ...(i.notes || [])].filter(Boolean).map(n => `<p class="small muted">${esc(n)}</p>`).join("");
+}
 async function viewDiagnostics(tab) {
   const g = S.gen;
   const tabs = [["doctor", "Doctor"], ["network", "RDMA & link"], ["headless", "Headless"], ["foreign", "Foreign containers"]];
@@ -1538,7 +1750,7 @@ async function viewDiagnostics(tab) {
       <label class="field"><span>TCP streams</span><input id="lt-streams" value="4"/></label>
       <div class="field"><button class="btn primary" data-act="linktest">Run test</button></div></div><div id="lt-out" style="margin-top:12px"></div></div>`;
   } else if (tab === "headless") {
-    const r = await GET("/api/v1/system/headless");
+    const r = hlStatus = await GET("/api/v1/system/headless");
     body = `<div class="card"><div class="card-head"><h2>Desktop vs headless</h2><span class="small muted">desired: ${esc(r.mode || "not set")}</span></div>
       <p class="small" style="color:var(--ink-2);margin-top:0">The GNOME desktop holds a few GiB of unified memory (and GPU contexts) on each Spark. <b>headless-safe</b> boots into multi-user next time; <b>headless-max</b> also stops the display manager now. Needs <span class="mono">twinspark-privd</span> on each node.</p>
       <div class="grid cols-2">${Object.keys(r.nodes).sort().map(n => {
@@ -1546,7 +1758,8 @@ async function viewDiagnostics(tab) {
         if (v.error) return `<div class="card flat"><b>Node ${esc(n)}</b><div class="callout bad" style="margin-top:8px"><div>${esc(v.error)}</div></div></div>`;
         const d = v.desktop;
         return `<div class="card flat"><div class="row between"><b>Node ${esc(n)}</b>${d.desktop_running ? tag("desktop running", "warn") : tag("headless", "good")}</div><div class="kv" style="margin-top:10px">
-          <b>Desktop memory</b><span>${gib(d.desktop_rss_gib)}</span><b>Processes</b><span class="small">${esc((d.desktop_processes || []).join(", ") || "—")}</span><b>Boot target</b><span class="mono">${esc(d.default_target || "unknown")}</span><b>privd</b><span>${v.privd_available ? tag("ok", "good") : tag("not installed", "warn")}</span></div></div>`;
+          <b>Desktop memory</b><span>${gib(d.desktop_rss_gib)}</span><b>Processes</b><span class="small">${esc((d.desktop_processes || []).join(", ") || "—")}</span><b>Boot target</b><span class="mono">${esc(d.default_target || "unknown")}</span><b>privd</b><span>${v.privd_available ? tag("ok", "good") : tag("not installed", "warn")}</span>
+          <b>Remote access</b><span class="small">${v.access && !v.access.dry_run ? esc(accessSummary(v.access)) : "not checked (dry-run)"}</span></div></div>`;
       }).join("")}</div>
       <div class="row" style="margin-top:14px"><button class="btn" data-act="headless" data-mode="desktop">Desktop</button><button class="btn" data-act="headless" data-mode="headless-safe">Headless (next boot)</button><button class="btn primary" data-act="headless" data-mode="headless-max">Headless max (now)</button><label class="check"><input type="checkbox" id="hl-now"/> apply right away</label></div><div id="hl-out"></div></div>`;
   } else if (tab === "foreign") {
@@ -1561,15 +1774,24 @@ async function viewDiagnostics(tab) {
     rerun: () => route(),
     linktest: async (el) => {
       const body = { mode: $("#lt-mode").value, duration_s: parseFloat($("#lt-dur").value) || 5, streams: parseInt($("#lt-streams").value, 10) || 4 };
-      $("#lt-out").innerHTML = `<span class="spin"></span> running…`;
-      const r = await busy(el, () => POST("/api/v1/system/link-test", body));
-      const i = r.initiator || {};
-      $("#lt-out").innerHTML = i.error ? `<div class="callout bad"><div>${esc(i.error)}</div></div>` : `<div class="tiles">${tile("Bandwidth", i.bandwidth_gbps, "Gb/s", null, "", 1)}${i.rtt_us_median != null ? tile("RTT median", i.rtt_us_median, "µs", null, "", 1) : ""}${i.rtt_us_p99 != null ? tile("RTT p99", i.rtt_us_p99, "µs", null, "", 1) : ""}${(i.per_hca || []).map(hc => tile(hc.hca, hc.gbps, "Gb/s", null, "", 1)).join("")}</div>
-        ${i.dry_run ? `<div class="callout warn" style="margin-top:10px"><div>dry-run agents — simulated numbers</div></div>` : ""}${[i.note, ...(i.notes || [])].filter(Boolean).map(n => `<p class="small muted">${esc(n)}</p>`).join("")}`;
+      const out = $("#lt-out");
+      out.innerHTML = `<span class="spin"></span> running…`;
+      try {
+        const r = await busy(el, () => POST("/api/v1/system/link-test", body));
+        if (out.isConnected) out.innerHTML = linkResultHtml(r);
+      } catch (e) {
+        if (out.isConnected) out.innerHTML = `<div class="callout bad"><div><b>Link test not run.</b> ${esc(e.message)}</div></div>`;
+      }
     },
     headless: async (el) => {
       const mode = el.dataset.mode, now = $("#hl-now").checked || mode === "headless-max";
-      if (!await confirmBox(`Apply ${mode}${now ? " now" : ""}?`, now ? "The display manager is stopped/started immediately on both nodes — anyone using the desktop loses the session." : "Changes the default boot target on both nodes; takes effect at the next reboot.", { label: "Apply", danger: now && mode !== "desktop" })) return;
+      const access = Object.entries(hlStatus.nodes || {}).map(([n, v]) => [n, v.access || {}]);
+      const blind = access.filter(([, a]) => !a.dry_run && !(a.remote_paths || []).length).map(([n]) => n);
+      const facts = access.filter(([, a]) => !a.dry_run).map(([n, a]) => `<li>Node ${esc(n)}: ${esc(accessSummary(a))}</li>`).join("");
+      const text = now
+        ? `<p>The display manager is ${mode === "desktop" ? "started" : "stopped"} immediately on both nodes — anyone using the desktop loses the session.${mode === "headless-max" ? " headless-max always does this, with or without “apply right away”." : ""}</p>${facts ? `<p><b>Ways in without a screen</b></p><ul class="plain">${facts}</ul>` : ""}${blind.length && mode !== "desktop" ? `<div class="callout bad"><div>No SSH-at-boot or Tailscale path found on node ${esc(blind.join(", "))}. Make sure you can reach it another way first (<span class="mono">sudo tsm remote tailscale-serve --apply</span> on node A, <span class="mono">sudo systemctl enable ssh</span>).</div></div>` : ""}`
+        : "Changes the default boot target on both nodes; takes effect at the next reboot.";
+      if (!await confirmBox(`Apply ${mode}${now ? " now" : ""}?`, text, { label: "Apply", danger: now && mode !== "desktop" })) return;
       const r = await busy(el, () => POST("/api/v1/system/headless", { mode, now }));
       $("#hl-out").innerHTML = `<div class="section-title">Result</div>` + Object.entries(r.results).map(([n, x]) => `<div class="small">node ${esc(n)}: ${x.error ? `<span style="color:var(--bad)">${esc(x.error)}</span>` : x.dry_run ? "dry-run — would run " + esc(x.steps.map(s => s.op).join(", ")) : `${esc(x.effective)}, reclaimed ${gib(x.reclaimed_gib)}`}</div>`).join("");
     },

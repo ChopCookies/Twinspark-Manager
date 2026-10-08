@@ -123,6 +123,25 @@ class PrivdUnavailable(RuntimeError):
     pass
 
 
+def _permission_hint(socket_path: str) -> str:
+    """Refused by the socket's mode: usually a shell that predates being added to its group."""
+    group = "twinspark"
+    try:
+        import grp
+        group = grp.getgrgid(os.stat(socket_path).st_gid).gr_name
+    except (ImportError, KeyError, OSError):
+        pass
+    try:
+        member = os.stat(socket_path).st_gid in os.getgroups()
+    except OSError:
+        member = False
+    if member:
+        return f"tsm-privd at {socket_path} refused this user (PermissionError) — check the socket's mode"
+    return (f"tsm-privd at {socket_path} is only open to the {group!r} group, and this shell is not in it yet. "
+            f"If `tsm setup` just added you, log out and back in (or run `newgrp {group}`); otherwise use sudo "
+            f"or `sudo usermod -aG {group} $USER`")
+
+
 class PrivClient:
     """Local privileged-helper client used by the agent."""
 
@@ -153,7 +172,9 @@ class PrivClient:
                     payload += chunk
                     if len(payload) > 1 << 20:
                         raise RuntimeError("privd response too large")
-        except (FileNotFoundError, ConnectionRefusedError, PermissionError) as exc:
+        except PermissionError as exc:
+            raise PrivdUnavailable(_permission_hint(self.socket_path)) from exc
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
             raise PrivdUnavailable(
                 f"tsm-privd is not reachable at {self.socket_path} ({type(exc).__name__}) — "
                 "start it with `sudo systemctl enable --now twinspark-privd` (installed by `tsm setup`)") from exc

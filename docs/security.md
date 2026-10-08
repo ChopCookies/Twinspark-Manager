@@ -44,6 +44,18 @@ is not in `ALLOWED_AGENT_ACTIONS`, and the agent refuses anything it does not im
   limit; power actions need a typed phrase and are refused while the cluster is busy. Wake-on-LAN and
   smart-plug calls come from the config file only (an API caller cannot choose a URL or MAC), and the plug
   token lives in the vault. Details: [remote-management.md](remote-management.md).
+- **Startup evidence:** when an activation fails, the controller saves each rank's container log before it
+  removes the containers, under `evidence/<job>/` next to its database (directory 0700, files 0600). The end
+  of each log is kept: the last 50,000 lines, at most 2,000,000 characters. Only the 20 most recent failed
+  jobs are kept. Known secrets (the vault slots of the node and of the controller), token-like strings,
+  `key: value` / `--flag value` pairs whose name says token, secret, password, API key or credential are
+  redacted on the agent before the log leaves the node, and again on the controller. The logs are served
+  only to holders of the management key, and only for file names the job lists.
+- **Tailnet access** is a choice made on node A by `sudo tsm remote tailscale-serve --apply`: a TCP forward
+  of the management port to the node's tailnet address only. It is refused while `management_auth` is
+  `none`, because a forwarded client arrives from 127.0.0.1 and can name `localhost` in `Host`; `tsm doctor`
+  fails if `none` is set later while the forward exists. The management key is never relaxed for loopback
+  clients.
 - The QSFP link is changed **only by a person running `sudo tsm qsfp apply` (or `revert`) on that machine**.
   No agent action, API route or GUI button can do it, and nothing runs as part of a service. It writes one
   root-owned netplan file (0600) that it recognises by a marker line, refuses to edit anyone else's, refuses

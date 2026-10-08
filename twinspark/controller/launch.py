@@ -118,6 +118,48 @@ class ContainerSpec(BaseModel):
     mods: list[str] = Field(default_factory=list)    # for preflight / display
 
 
+VLLM_ENGINE_READY_DEFAULT_S = 600     # vLLM's VLLM_ENGINE_READY_TIMEOUT_S when an image does not change it
+
+
+def startup_limits(env: dict[str, str], health_timeout_s: int, head_delay_s: float = 0.0,
+                   documented_boot: Optional[str] = None) -> dict[str, Any]:
+    """The two clocks a slow start runs against, and which one ends it first.
+
+    vLLM gives up when its engine is not ready after ``VLLM_ENGINE_READY_TIMEOUT_S``; TwinSpark gives up
+    when ``/health`` is not 200 after ``runtime.health_timeout_s``. Big two-node models can need 15
+    minutes or more, so a recipe that documents a long boot should set the engine limit explicitly.
+    """
+    raw = (env or {}).get("VLLM_ENGINE_READY_TIMEOUT_S")
+    try:
+        engine = int(float(raw)) if raw not in (None, "") else None
+    except ValueError:
+        engine = None
+    effective_engine = engine if engine is not None else VLLM_ENGINE_READY_DEFAULT_S
+    first = "vLLM" if effective_engine < health_timeout_s else "TwinSpark"
+    out: dict[str, Any] = {
+        "engine_ready_timeout_s": engine, "engine_ready_source": "recipe env" if engine is not None
+        else f"image default (vLLM: {VLLM_ENGINE_READY_DEFAULT_S} s unless the image changes it)",
+        "health_timeout_s": health_timeout_s, "head_start_delay_s": head_delay_s, "ends_first": first,
+        "note": (f"startup limits: vLLM engine ready {effective_engine} s "
+                 f"({'VLLM_ENGINE_READY_TIMEOUT_S' if engine is not None else 'image default'}), TwinSpark "
+                 f"health wait {health_timeout_s} s (runtime.health_timeout_s) — the {first} limit ends a "
+                 f"slow start first"),
+    }
+    minutes = None
+    if documented_boot:
+        m = re.search(r"(\d+)(?:\s*-\s*(\d+))?\s*min", str(documented_boot))
+        if m:
+            minutes = int(m.group(2) or m.group(1))
+    if engine is None and minutes and minutes * 60 >= VLLM_ENGINE_READY_DEFAULT_S * 0.8:
+        out["warning"] = (f"the recipe documents a boot of {documented_boot} but sets no "
+                          f"VLLM_ENGINE_READY_TIMEOUT_S: vLLM may give up after {VLLM_ENGINE_READY_DEFAULT_S} s. "
+                          f"Set advanced.env.VLLM_ENGINE_READY_TIMEOUT_S")
+    elif minutes and minutes * 60 >= health_timeout_s * 0.8:
+        out["warning"] = (f"the recipe documents a boot of {documented_boot}, close to TwinSpark's health wait of "
+                          f"{health_timeout_s} s: raise runtime.health_timeout_s in controller.yaml")
+    return out
+
+
 class LaunchPlan(BaseModel):
     revision_id: str
     backend: DistributedBackend
@@ -134,6 +176,8 @@ class LaunchPlan(BaseModel):
     model_repo: str = ""
     model_revision: str = ""
     notes: list[str] = Field(default_factory=list)
+    # how long a start may take: vLLM's own engine-ready limit and TwinSpark's health wait
+    startup_limits: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def nodes(self) -> list[str]:
@@ -278,6 +322,14 @@ class LaunchPlanner:
             "change between releases.",
         ]
 
+        # source is free-form recipe metadata: any of it may be missing, null or of another type
+        measured = rev.draft.source.get("measured") if isinstance(rev.draft.source, dict) else None
+        boot = measured.get("boot") if isinstance(measured, dict) else None
+        limits = startup_limits(adv.env, rt.health_timeout_s, adv.head_start_delay_s,
+                                boot if isinstance(boot, (str, int, float)) else None)
+        notes.append(limits["note"])
+        if limits.get("warning"):
+            notes.append("WARNING: " + limits["warning"])
         if gpu_memory_utilization < 0.5:
             notes.append(f"WARNING: gpu_memory_utilization {gpu_memory_utilization:.2f} is very low — "
                          f"the node reports little total memory, or the reserve is too large")
@@ -422,7 +474,7 @@ class LaunchPlanner:
                                  "include": [], "nodes": rev.required_nodes()} for ref in adv.extra_models],
             gpu_memory_utilization=gpu_memory_utilization, mods=list(adv.mods),
             model_repo=rev.identity.model_repo, model_revision=rev.identity.model_revision,
-            notes=notes,
+            notes=notes, startup_limits={k: v for k, v in limits.items() if k not in ("note", "warning")},
         )
 
     # ------------------------------------------------------------------

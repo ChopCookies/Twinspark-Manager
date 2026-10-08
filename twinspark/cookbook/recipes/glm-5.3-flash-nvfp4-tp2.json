@@ -51,7 +51,7 @@
     "requirements": [
       "Weights RedHatAI/GLM-5.3-Flash-NVFP4 (184 GiB) on both nodes. The settings were measured with revision 18d55bfd; Pin with model ref 18d55bfd5a2194887738da73753975c9d3842f46 to use exactly that snapshot.",
       "Image ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 (Pin resolves the multi-arch digest; the first activation pulls it on both nodes).",
-      "The himorishige repo also bind-mounts sparse_attn_indexer_kpool_sm121.py (SM121 top-k fix). If loading fails with a sparse-MLA / top-k assert, package that file as a mod (run.sh copying it over vLLM's copy) and add it to advanced.mods."
+      "The himorishige repo also bind-mounts sparse_attn_indexer_kpool_sm121.py (SM121 top-k fix). If loading or long decodes fail with a sparse-MLA / top-k assert, install it as a mod (`tsm mods file-patch glm53-sm121-sparse-attn --file sparse_attn_indexer_kpool_sm121.py --target /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py`) and add glm53-sm121-sparse-attn to advanced.mods, as the DFlash2 recipe does."
     ],
     "notes": [
       "Use the RedHatAI checkpoint, not ModelOpt NVFP4 builds: those emit intermittent corrupted tokens in vLLM (#54150).",

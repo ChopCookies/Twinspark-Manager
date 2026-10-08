@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Callable, Optional
 
-from .agent_client import AgentClient
+from .agent_client import AgentActionError, AgentClient
 
 if TYPE_CHECKING:
     from ..schemas.config import ControllerConfig
@@ -48,7 +48,8 @@ class WeightsStager:
             self._hf_home[node] = facts.get("hf_cache_dir") or self.config.runtime.hf_cache_dir
         return self._hf_home[node]
 
-    def _progress(self, job: "Job", step: "JobStep", prefix: str) -> Callable[[dict], None]:
+    def _progress(self, job: "Job", step: "JobStep", prefix: str,
+                  item: Optional[dict] = None) -> Callable[[dict], None]:
         last = {"t": 0.0}
 
         def cb(t: dict) -> None:
@@ -56,6 +57,10 @@ class WeightsStager:
             step.message = f"{prefix}{detail}"
             if t.get("total_bytes"):
                 step.progress = min(0.99, (t.get("done_bytes") or 0) / t["total_bytes"])
+            if item is not None:
+                item["detail"] = detail
+                if t.get("total_bytes"):
+                    item["progress"] = round(min(0.99, (t.get("done_bytes") or 0) / t["total_bytes"]), 3)
             if time.monotonic() - last["t"] > 1.0:       # don't hammer SQLite
                 last["t"] = time.monotonic()
                 self.persist(job)
@@ -64,11 +69,20 @@ class WeightsStager:
     async def ensure(self, job: "Job", step: "JobStep", repo: str, rev: str, nodes: list[str],
                      include: Optional[list[str]] = None, download_node: Optional[str] = None,
                      verify: Optional[bool] = None,
-                     cancel_check: Optional[Callable[[], bool]] = None) -> str:
+                     cancel_check: Optional[Callable[[], bool]] = None, kind: str = "checkpoint") -> str:
+        from .phases import phase
         include = list(include or [])
         verify = self.config.runtime.verify_hashes if verify is None else verify
+        ref = f"{repo}@{rev}"
+        what = "drafter" if kind == "drafter" else "main weights"
         have = {n: await self.present(n, repo, rev, include) for n in nodes}
+        for n, ok in have.items():
+            if ok:
+                phase(job, f"{kind}:{ref}:{n}", kind=kind, node=n, ref=ref, state="reused",
+                      label=f"{what} {repo}@{rev[:12]} on node {n}",
+                      detail="already complete in the Hugging Face cache — reused, not downloaded")
         if all(have.values()):
+            self.persist(job)
             return f"{repo}@{rev[:8]} already on {', '.join(nodes)}"
         sources = [n for n in nodes if have[n]]
         if not sources:
@@ -80,15 +94,25 @@ class WeightsStager:
 
         async def download_on(dn: str) -> None:
             step.message = f"downloading {repo}@{rev[:8]} on node {dn}"
+            item = phase(job, f"{kind}:{ref}:{dn}", kind=kind, node=dn, ref=ref,
+                         label=f"{what} {repo}@{rev[:12]} on node {dn}", detail="downloading from the Hub")
             self.persist(job)
             task = await self.agent(dn).call("download", repo=repo, revision=rev, include=include,
                                              verify=verify)
-            await self.agent(dn).wait_task(task["task_id"], timeout=12 * 3600, poll=self.poll,
-                                           on_progress=self._progress(job, step, f"node {dn}: "),
-                                           cancel_check=cancel_check)
+            try:
+                await self.agent(dn).wait_task(task["task_id"], timeout=12 * 3600, poll=self.poll,
+                                               on_progress=self._progress(job, step, f"node {dn}: ", item),
+                                               cancel_check=cancel_check)
+            except AgentActionError as exc:
+                phase(job, item["key"], kind=kind, label=item["label"], state="failed", detail=exc.detail[:300])
+                raise
             if not await self.present(dn, repo, rev, include):
+                phase(job, item["key"], kind=kind, label=item["label"], state="failed",
+                      detail="download finished but the snapshot is incomplete")
                 raise StageError(f"download finished but the snapshot is incomplete on node {dn}")
             have[dn] = True
+            phase(job, item["key"], kind=kind, label=item["label"], state="done",
+                  detail="downloaded" + (" and checksums verified" if verify else ""))
             notes.append(f"downloaded on {dn}" + (" + verified" if verify else ""))
 
         if not sources:
@@ -106,27 +130,44 @@ class WeightsStager:
                 continue
             dst = await self.hf_home(target)
             step.message = f"copying {repo}@{rev[:8]} {src} → {target} over QSFP"
+            copy = phase(job, f"copy:{ref}:{src}>{target}", kind="copy", node=target, ref=ref,
+                         label=f"copy {what} {repo}@{rev[:12]} node {src} → node {target} over QSFP")
             self.persist(job)
             task = await self.agent(src).call(
                 "sync", repo=repo, revision=rev, include=include, target_host=ep.sync_host,
                 ssh_user=ep.ssh_user, target_hf_home=dst, streams=self.config.runtime.sync_streams)
-            await self.agent(src).wait_task(task["task_id"], timeout=6 * 3600, poll=self.poll,
-                                            on_progress=self._progress(job, step, f"{src}→{target}: "),
-                                            cancel_check=cancel_check)
+            try:
+                await self.agent(src).wait_task(task["task_id"], timeout=6 * 3600, poll=self.poll,
+                                                on_progress=self._progress(job, step, f"{src}→{target}: ", copy),
+                                                cancel_check=cancel_check)
+            except AgentActionError as exc:
+                phase(job, copy["key"], kind="copy", label=copy["label"], state="failed", detail=exc.detail[:300])
+                raise
             if not await self.present(target, repo, rev, include):
+                phase(job, copy["key"], kind="copy", label=copy["label"], state="failed",
+                      detail="copy finished but the snapshot is not complete there")
                 raise StageError(f"copy to node {target} finished but the snapshot is not complete there")
+            phase(job, copy["key"], kind="copy", label=copy["label"], state="done", detail="copied")
             if verify and not self.dry_run:
+                chk = phase(job, f"verify:{ref}:{target}", kind="verify", node=target, ref=ref,
+                            label=f"verify {what} {repo}@{rev[:12]} on node {target}", detail="checking checksums")
+                self.persist(job)
                 task = await self.agent(target).call("verify", repo=repo, revision=rev)
                 res = await self.agent(target).wait_task(
                     task["task_id"], timeout=3 * 3600, poll=self.poll,
-                    on_progress=self._progress(job, step, f"node {target}: "),
+                    on_progress=self._progress(job, step, f"node {target}: ", chk),
                     cancel_check=cancel_check)
                 result = res.get("result") or {}
                 if result.get("dry_run"):
+                    phase(job, chk["key"], kind="verify", label=chk["label"], state="skipped", detail="simulated")
                     notes.append(f"verification simulated on {target}")
                 elif result.get("verified"):
+                    phase(job, chk["key"], kind="verify", label=chk["label"], state="done",
+                          detail="checksums match")
                     notes.append(f"verified on {target}")
                 else:
+                    phase(job, chk["key"], kind="verify", label=chk["label"], state="failed",
+                          detail=result.get("note") or "no verified checksum result")
                     raise StageError(f"verification failed on node {target}: "
                                      f"{result.get('note') or 'no verified checksum result'}")
             notes.append(f"copied {src}→{target}")

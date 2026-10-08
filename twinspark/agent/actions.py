@@ -44,6 +44,8 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*\Z")
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 _NAME_RE = re.compile(r"^tsm-[a-z0-9._-]+\Z")
+EVIDENCE_LOG_CHARS = 2_000_000      # per container, end of the log kept
+EVIDENCE_LOG_LINES = 50_000         # docker logs --tail: the character limit above is the one that usually applies
 _FOREIGN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,255}\Z")
 _IMAGE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}\Z")
@@ -98,6 +100,7 @@ class AgentActions:
             "containers_stop_owned": self.containers_stop_owned,
             "container_state": self.container_state,
             "container_logs": self.container_logs,
+            "container_evidence": self.container_evidence,
             "containers_list": self.containers_list,
             "health_probe": self.health_probe,
             "foreign_list": self.foreign_list,
@@ -359,6 +362,70 @@ class AgentActions:
         tail = max(1, min(int(params.get("tail", 200)), 20000))
         return {"log": self.runtime.logs(self._name(params), tail)}
 
+    async def container_evidence(self, params: dict) -> dict:
+        """What to keep about a container before cleanup removes it: state, a bounded redacted log, the
+        node's memory right now and the NVIDIA kernel messages since the container started. Read-only."""
+        name = self._name(params)
+        st = await asyncio.to_thread(self.runtime.state, name)
+        from ..remote.bundle import Redactor
+        from ..remote.logs import clean
+        redact = Redactor(self._secret_values())
+
+        def read() -> tuple[str, bool]:
+            if st.status == "missing":
+                return "", False
+            # one character more than kept, so a cut can be told apart from a log of exactly that size;
+            # redact before cutting to size, so a secret is never split by the cut
+            raw = clean(self.runtime.logs(name, EVIDENCE_LOG_LINES, EVIDENCE_LOG_CHARS + 4096))
+            text = redact(raw)
+            return text[-EVIDENCE_LOG_CHARS:], len(text) > EVIDENCE_LOG_CHARS or raw.count("\n") >= EVIDENCE_LOG_LINES
+
+        log, truncated = await asyncio.to_thread(read)
+        return {"name": name, "node": self.config.node.node_id, "status": st.status,
+                "exit_code": st.exit_code, "oom_killed": st.oom_killed, "started_at": st.started_at,
+                "finished_at": st.finished_at, "role": st.labels.get("org.twinspark.role"),
+                "revision": st.labels.get("org.twinspark.revision"), "log": log, "log_truncated": truncated,
+                "log_lines": log.count("\n"), "memory": sysinfo.memory_snapshot(),
+                "kernel": await asyncio.to_thread(self._kernel_gpu_errors, st.started_at)}
+
+    def _secret_values(self) -> list[str]:
+        from ..security import SECRET_SLOTS
+        values = []
+        for slot in SECRET_SLOTS:
+            try:
+                v = self.vault.get(slot)
+            except Exception:  # noqa: BLE001 - an unreadable slot cannot leak through here either
+                continue
+            if v:
+                values.append(v)
+        return values
+
+    def _kernel_gpu_errors(self, started_at: Optional[str]) -> dict:
+        """NVIDIA driver memory errors in the kernel log since ``started_at`` (journal, read-only)."""
+        if self.dry_run:
+            return {"count": 0, "samples": [], "note": "dry-run: kernel log not read"}
+        since_s = 3600
+        m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)", started_at or "")
+        if m:
+            import calendar
+            import time as _time
+            t0 = calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 0, 0))
+            since_s = max(60, min(86400, int(_time.time() - t0) + 60))
+        from ..remote.logs import read_logs
+        try:
+            res = read_logs("kernel", 2000, since_s, "NVRM",
+                            priv=self.privd.call if self.privd.available() else None)
+        except Exception as exc:  # noqa: BLE001 - evidence is best effort
+            return {"count": None, "samples": [], "note": f"kernel log not readable: {exc}"[:300]}
+        hits = [ln for ln in res["lines"] if re.search(r"NV_ERR_NO_MEMORY|out of memory", ln, re.IGNORECASE)]
+        note = res.get("note")
+        if res.get("window_full"):
+            note = ((note + "; ") if note else "") + (
+                f"counted in the last {res.get('scanned')} kernel log lines since the container started; "
+                f"earlier messages may exist (journalctl -k --grep NVRM)")
+        return {"count": len(hits), "samples": (hits[:3] + hits[-2:])[:5] if len(hits) > 5 else hits,
+                "note": note, "at_least": bool(res.get("window_full"))}
+
     async def health_probe(self, params: dict) -> dict:
         """One non-blocking probe. The controller loops with its own deadline."""
         name = self._name(params)
@@ -522,14 +589,14 @@ class AgentActions:
             raise ActionError("invalid RDMA device name")
         if self.dry_run:
             async def fake(tid):
-                return linktest.simulated(mode, role, streams)
-            return self.tasks.spawn("link", fake)
+                return linktest.simulated(mode, role, streams, duration)
+            return {**self.tasks.spawn("link", fake), "dry_run": True}
 
         async def run(tid):
             if mode == "tcp":
                 if role == "responder":
                     return await linktest.tcp_responder(params.get("bind") or "0.0.0.0", port,
-                                                        duration + 20)
+                                                        duration + 20, expect_streams=streams)
                 return await linktest.tcp_initiator(peer, port, duration, streams)
             return await linktest.rdma_run(hcas, None if gid is None else int(gid), port, duration,
                                            peer if role == "initiator" else None,
@@ -561,6 +628,13 @@ class AgentActions:
 
     def headless_status(self, params: dict) -> dict:
         out = {"desktop": sysinfo.desktop_facts(), "privd_available": self.privd.available()}
+        if self.dry_run:
+            out["access"] = {"dry_run": True, "notes": ["dry-run: remote-access facts are not read"]}
+        else:
+            from ..remote.access import access_facts
+            port = params.get("manager_port")
+            out["access"] = access_facts(manager_port=int(port) if isinstance(port, int) else None,
+                                         controller=bool(port))
         if out["privd_available"] and not self.dry_run:
             try:
                 out["privd"] = self.privd.call("status")

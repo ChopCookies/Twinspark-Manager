@@ -34,6 +34,15 @@ def mode_steps(mode: HeadlessMode, now: bool) -> list[tuple[str, dict[str, Any]]
     return steps
 
 
+def acts_now(mode: HeadlessMode | str, now: bool) -> bool:
+    """Does applying ``mode`` start or stop the display manager right away (not only at next boot)?
+
+    True for ``headless-max`` even without ``--now`` (it always stops the desktop), and for every mode
+    with ``--now`` (``desktop --now`` starts it). ``headless-safe`` alone only changes the boot target.
+    """
+    return any(op == "display_manager" for op, _ in mode_steps(HeadlessMode(mode), now))
+
+
 def apply_mode(mode: HeadlessMode, client: PrivClient, now: bool = False,
                dry_run: bool = False) -> dict[str, Any]:
     before = memory_snapshot()

@@ -37,6 +37,7 @@ class ContainerStatus:
     labels: dict = field(default_factory=dict)
     started_at: Optional[str] = None
     oom_killed: bool = False
+    finished_at: Optional[str] = None
 
 
 def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -157,7 +158,8 @@ class DockerRuntime:
         state = info["State"]
         return ContainerStatus(name, state["Status"], state.get("ExitCode"),
                                info.get("Config", {}).get("Labels") or {},
-                               state.get("StartedAt"), bool(state.get("OOMKilled")))
+                               state.get("StartedAt"), bool(state.get("OOMKilled")),
+                               state.get("FinishedAt"))
 
     def stop(self, name: str, grace_s: int = 30) -> None:
         # label check again right before acting — defence in depth
@@ -180,10 +182,11 @@ class DockerRuntime:
             raise RuntimeError_(f"{name} is not a running, non-TwinSpark inference container")
         self._run([self.docker, "stop", "-t", str(grace_s), name], timeout=grace_s + 30, check=False)
 
-    def logs(self, name: str, tail: int = 200) -> str:
-        p = subprocess.run([self.docker, "logs", "--tail", str(tail), name],
-                           capture_output=True, text=True, timeout=30)
-        return (p.stdout + p.stderr)[-200000:]
+    def logs(self, name: str, tail: int = 200, max_chars: int = 200_000) -> str:
+        # stdout and stderr interleaved in one stream, in the order Docker recorded them
+        p = subprocess.run([self.docker, "logs", "--tail", str(tail), name], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, errors="replace", timeout=60)
+        return p.stdout[-max_chars:]
 
 
 class DryRunRuntime:
@@ -247,7 +250,7 @@ class DryRunRuntime:
         self.history.append([self.docker, "stop", "-t", str(grace_s), name])
         self.foreign = [c for c in self.foreign if c["name"] != name]
 
-    def logs(self, name: str, tail: int = 200) -> str:
+    def logs(self, name: str, tail: int = 200, max_chars: int = 200_000) -> str:
         if name in self.fail_start:
             return "torch.OutOfMemoryError: CUDA out of memory during cuda graph capture"
         return f"[dry-run] {name}: simulated log"

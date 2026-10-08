@@ -117,11 +117,18 @@ def save_revision(name: str, draft: ProfileDraft, ctrl: Controller = Depends(con
         raise HTTPException(422, str(e))
 
 
+class NodePinRequest(BaseModel):
+    model_ref: Optional[str] = None
+    image: Optional[str] = None
+    local_image: Optional[str] = None
+
+
 class PinRequest(BaseModel):
     model_ref: Optional[str] = None     # "main", a 40-char sha, or "org/repo@branch"
     image: Optional[str] = None         # registry ref (pinned to digest) or local tag
     local_image: Optional[str] = None   # force a local image tag / sha256 ID
     note: Optional[str] = None
+    secondary: Optional[NodePinRequest] = None    # split profiles: node B's model / image choice
 
 
 class SplitRequest(BaseModel):
@@ -146,7 +153,8 @@ def compose_split(req: SplitRequest, ctrl: Controller = Depends(controller_dep))
 async def pin(name: str, req: PinRequest, ctrl: Controller = Depends(controller_dep)):
     try:
         return await ctrl.pin_profile(name, model_ref=req.model_ref, image=req.image,
-                                      local_image=req.local_image, label_note=req.note)
+                                      local_image=req.local_image, label_note=req.note,
+                                      secondary=req.secondary.model_dump(exclude_none=True) if req.secondary else None)
     except (PinError, ValueError) as e:
         raise HTTPException(422, str(e))
 

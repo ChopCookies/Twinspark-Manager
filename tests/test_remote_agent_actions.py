@@ -233,3 +233,37 @@ async def test_power_without_the_helper_is_a_clean_error_not_a_crash(cluster):
     with pytest.raises(AgentActionError) as err:
         await cluster.controller.agents["B"].call("remote_power", action="reboot", delay_s=5)
     assert "tsm-privd" in err.value.detail or "privileged" in err.value.detail
+
+
+def test_a_shell_outside_the_privd_group_is_told_to_log_in_again(tmp_path, monkeypatch):
+    import errno
+    import os
+    import socket as socket_mod
+
+    from twinspark.agent import privd
+
+    sock = tmp_path / "privd.sock"
+    sock.write_text("")
+
+    class Refused:
+        def __init__(self, *a):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, path):
+            raise PermissionError(errno.EACCES, "Permission denied")
+    monkeypatch.setattr(socket_mod, "socket", Refused)
+    monkeypatch.setattr(os, "getgroups", lambda: [])
+    with pytest.raises(privd.PrivdUnavailable, match=r"not in it yet.*log out and back in.*newgrp"):
+        privd.PrivClient(str(sock)).call("status")
+    monkeypatch.setattr(os, "getgroups", lambda: [os.stat(sock).st_gid])
+    with pytest.raises(privd.PrivdUnavailable, match="check the socket's mode"):
+        privd.PrivClient(str(sock)).call("status")

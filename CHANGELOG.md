@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.5.1 — 2026-10-08 — findings from the first night on real Sparks
+
+The first test of 0.5.0 on two DGX Sparks found these problems:
+
+- a failed GLM DFlash2 start left no usable error;
+- a link test that mixed a live node and a dry-run node;
+- a recipe without an image that failed only after preparation had started;
+- a GUI that flashed on every refresh.
+
+This release fixes them.
+
+### P1 — startup failures you can act on
+
+- **Startup evidence is saved before cleanup.** When an activation fails, the controller first saves each
+  rank's container log, then removes the containers. Each log is redacted and capped (the end is kept: the
+  last 50,000 lines, at most 2,000,000 characters). The controller also records:
+  - the exit code, OOM-killed state and finish time;
+  - a memory reading;
+  - the number of NVIDIA driver `NV_ERR_NO_MEMORY` messages in the kernel log since the container started
+    ("at least" when the last 2,000 kernel lines were all read).
+
+  Saving this is bounded (150 s) and can never keep the cleanup and the rollback from running. The job
+  stays *running* until both are done, so `tsm activate` and the job page show the rollback line too
+  (Cancel is not offered during that cleanup). A container whose start call timed out is included.
+
+  `tsm job <id>` and the job page show the **first** real error of each rank (an engine or worker
+  exception rather than the API server's final wrapper traceback), the last one, and a download of the
+  full log (`tsm job <id> --log FILE`). When the driver reported out-of-memory errors, the job says that
+  an exit code of 1 does not rule out a GPU allocation failure. The evidence of the newest 20 failed jobs
+  is kept (files 0600).
+- **GLM-5.3-Flash DFlash2 recipe** now follows its author's DFlash2 launcher:
+  - `max-num-batched-tokens 8192` instead of 32768 (the first prefill sets the startup memory peak);
+  - `kv-cache-dtype fp8_e4m3`;
+  - `VLLM_ENGINE_READY_TIMEOUT_S=3600` for the ~15 minute boot;
+  - the launcher's FlashInfer/NCCL environment (not its NIC names or addresses);
+  - a required mod, `glm53-sm121-sparse-attn`, for the SM121 sparse-attention fix. The agent checks it
+    before every activation. Make it with the new `tsm mods file-patch` (one file replaced in the image,
+    with a check that the target file exists and that its checksum matches after the copy).
+
+  Its Needs list now covers `vm.swappiness=0` and headless nodes. Pin compares the image tag with the
+  digest the launcher was written for, and warns if the tag has moved.
+  **An existing profile keeps its old settings:** re-import the recipe (or edit the draft) and pin a new
+  revision.
+- **Both startup clocks in the plan.** `tsm plan` and the plan page show vLLM's engine-ready limit
+  (from the recipe, or the image's default of 600 s) next to TwinSpark's `runtime.health_timeout_s`,
+  and which of the two ends a slow start first. A recipe that documents a long boot but sets no
+  engine limit gets a warning.
+- **Link tests:**
+  - Both nodes must run in the same mode. A live node paired with a dry-run node is refused before
+    anything starts, with the `sudo tsm go-live` the other node needs.
+  - An all-dry-run test is labelled *simulated*.
+  - Failed or unreadable RDMA runs show as **unavailable**, with an error for each device, never as
+    0 Gb/s. A one-PCIe-half measurement is labelled as such.
+  - Results show the duration, stream count and devices.
+  - TCP responders close when the streams finish, and a responder is cancelled if the initiator
+    fails to start.
+- **Missing image asked for up front.** A recipe without an image (`image_hint: null`, such as the
+  Qwen3.8 recipe) can still be imported as a draft. Import & prepare and Pin & prepare now ask for an
+  image (one per node for split profiles; `tsm pin` has `--image-b` / `--local-image-b` /
+  `--model-ref-b` for node B). The controller rejects a missing image before it contacts Hugging Face,
+  and never picks an installed image by itself.
+- **`headless-max` is guarded like `--now`.** It always stops the desktop, so the CLI asks first (`-y`
+  skips this), the GUI asks, and the controller refuses it while a model is being activated.
+
+### P2 — clarity
+
+- **The GUI no longer flashes.** The dashboard, jobs and job pages patch the page in place instead of
+  rebuilding it. Focus, the selected profile and buttons that are still pending survive a refresh.
+  Polls run one at a time, and a slow answer can no longer overwrite a newer one. A real-Chromium
+  test covers this.
+- **Stop** is on the active profile's row and on its page, not only on the dashboard, and a failed stop
+  says so.
+- **Get started** separates four states: QSFP *configured*, link *measured* (or only simulated, or
+  failed), and whether *both PCIe halves* are in use. Using one half is valid but caps bandwidth near
+  100 Gb/s, and the page shows the reviewed `tsm qsfp plan` for the second half.
+- **Preparation progress** lists each piece of work as its own item, with the exact `repo@revision`:
+  - the image pull;
+  - the main checkpoint;
+  - the drafter;
+  - the checksum check;
+  - the QSFP copy to node B.
+
+  Each item is marked running, done, reused, failed or skipped; a job that ends leaves no item running.
+- **Cache wording:** complete weights that were downloaded outside TwinSpark show as "external cache —
+  reused as is, no new download", which is not the same as "staged by TwinSpark" or "checksum
+  verified" (`tsm models ls`: `ext`).
+- **Remote access before going headless.** `tsm headless status` and the Headless tab show, per node:
+  - SSH running and enabled at boot;
+  - Tailscale up, its address, and `tailscaled` enabled at boot;
+  - on node A, whether the manager port is forwarded;
+  - the default boot target.
+
+  The headless confirmation warns about a node with no way back in. New: `tsm remote tailscale-serve`
+  shows, saves (`--apply`) or removes a persistent tailnet-only TCP forward of the management port,
+  then checks that the health page answers through it (over https when the listener has TLS). It
+  refuses a controller set to `management_auth: none`. If that is set later, `tsm doctor` fails while the
+  forward exists, and warns when it cannot read the forward state.
+- The privileged-helper error says when a shell only lacks the new `twinspark` group (log out and back
+  in), instead of suggesting a restart.
+- Redaction (support bundles and startup logs) no longer hides settings such as
+  `max_num_batched_tokens=8192`, and now catches `--api-key VALUE` and `'api_key': ['…']`. Its patterns
+  are bounded, so a hostile log line cannot stall the controller.
+- Recipe links in the GUI are only made for `http(s)` URLs.
+- The jobs list no longer carries each failed job's startup evidence; the job page loads it.
+
+### Tests
+
+- The suite no longer depends on the host. `efibootmgr`, `fwupd`, the terminal's process cleanup and the
+  ownership of the fake QSFP backup file all behave the same as root and as an ordinary user, on
+  machines with or without those tools.
+- Closing a remote terminal now ends every process in its session, not only its process group.
+
+### Still to validate on site
+
+- One complete GLM DFlash2 boot with the corrected recipe: health, a real completion, and a controlled
+  stop.
+- The Tailscale forward, opened from another tailnet device.
+
 ## 0.5.0 — 2026-10-05 — first public release
 
 Recipe automation, agent integrations, guided setup, remote management and QSFP automation, plus a
