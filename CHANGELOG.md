@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.1 — 2026-10-08 — findings from the first night on real Sparks
+## 0.5.1 — 2026-10-08 — fixes from the first hardware test
 
 The first test of 0.5.0 on two DGX Sparks found these problems:
 
