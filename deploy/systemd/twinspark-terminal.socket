@@ -1,0 +1,11 @@
+[Unit]
+Description=TwinSpark terminal socket (starts the terminal service on demand)
+
+[Socket]
+ListenStream=127.0.0.1:9444
+# the QSFP address may come up after this unit: bind anyway
+FreeBind=true
+Accept=no
+
+[Install]
+WantedBy=sockets.target

@@ -19,7 +19,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .. import __version__
-from ..controller.launch import (
+from ..containers import (
     ALLOWED_CAPS,
     ALLOWED_DEVICES,
     CACHE_MOUNTS,

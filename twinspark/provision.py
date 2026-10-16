@@ -33,7 +33,9 @@ from .security import SecretsVault
 
 JOIN_PREFIX = "tsm1."
 UNIT_NAMES = ("twinspark-privd.service", "twinspark-agent.service", "twinspark-controller.service",
-              "twinspark-terminal.service")
+              "twinspark-terminal.service", "twinspark-terminal.socket")
+# the terminal starts on the first connection and exits after this long without a shell
+TERMINAL_IDLE_EXIT_S = 900
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}\Z")
 # one single-line OpenSSH public key; a newline would smuggle a second, unrestricted authorized_keys entry
@@ -277,8 +279,13 @@ auto_rollback: true
 """
 
 
+def agent_bind(a: Answers) -> str:
+    """The agent (and terminal) listen on loopback on node A and on the QSFP address on node B."""
+    return "127.0.0.1" if a.role in ("controller", "single") else str(a.qsfp_ip)
+
+
 def render_agent_yaml(a: Answers, lay: Layout) -> str:
-    bind = "127.0.0.1" if a.role in ("controller", "single") else a.qsfp_ip
+    bind = agent_bind(a)
     note = "      # QSFP address only — not reachable from the LAN" if a.role == "agent" else ""
     return f"""# {lay.agent_yaml} — written by `tsm setup` (TwinSpark {__version__})
 node: {{node_id: {a.node_id}, role: agent}}
@@ -381,29 +388,63 @@ WantedBy=multi-user.target
         units["twinspark-controller.service"] = controller
     if a.remote.get("terminal"):
         units["twinspark-terminal.service"] = render_terminal_unit(a, lay)
+        units["twinspark-terminal.socket"] = render_terminal_socket(a, lay)
     return units
 
 
 def render_terminal_unit(a: Answers, lay: Layout) -> str:
     """The terminal service. It is deliberately NOT sandboxed like the agent: a troubleshooting shell
     needs sudo, docker and a writable filesystem, exactly as over SSH. It is a separate unit so the
-    agent keeps its restrictions, and it only does anything while the root-owned policy allows it."""
+    agent keeps its restrictions, and it only does anything while the root-owned policy allows it.
+
+    Socket-activated (``twinspark-terminal.socket`` owns the port): it starts on the first connection
+    and exits after ``TERMINAL_IDLE_EXIT_S`` without an open shell, so an enabled terminal costs no
+    memory next to the model while nobody uses it. It has no [Install] section on purpose — enabling
+    the socket is what switches it on."""
     return f"""[Unit]
 Description=TwinSpark terminal (opt-in browser/CLI shell on this node, recorded)
-After=network-online.target twinspark-agent.service
-Wants=network-online.target
+Requires=twinspark-terminal.socket
+After=network-online.target twinspark-agent.service twinspark-terminal.socket
 
 [Service]
 User={a.service_user}
-ExecStart={lay.tsm_bin} serve termd --config {lay.agent_yaml}
+ExecStart={lay.tsm_bin} serve termd --config {lay.agent_yaml} --idle-exit {TERMINAL_IDLE_EXIT_S}
 Restart=on-failure
 RestartSec=3
 # stopping the unit ends every shell it started
 KillMode=control-group
 TasksMax=1024
+"""
+
+
+def terminal_listen_address(lay: Layout) -> str:
+    """``ListenStream=`` value: the agent's address (loopback on A, QSFP on B) and the terminal port."""
+    host, port = "127.0.0.1", 9444
+    try:
+        cfg = load_config(str(lay.agent_yaml), AgentConfig)
+        host, port = cfg.listener.bind or host, cfg.remote_mgmt.terminal_port
+    except Exception:  # noqa: BLE001 - a fresh install renders units before the config exists
+        pass
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def render_terminal_socket(a: Answers, lay: Layout) -> str:
+    if isinstance(a, Answers):
+        host = agent_bind(a)
+        listen = f"[{host}]:{a.terminal_port}" if ":" in host else f"{host}:{a.terminal_port}"
+    else:                                   # an installed node: read the address from its agent.yaml
+        listen = terminal_listen_address(lay)
+    return f"""[Unit]
+Description=TwinSpark terminal socket (starts the terminal service on demand)
+
+[Socket]
+ListenStream={listen}
+# the QSFP address may come up after this unit: bind anyway
+FreeBind=true
+Accept=no
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sockets.target
 """
 
 
@@ -419,6 +460,12 @@ def installed_terminal_unit(lay: Layout) -> str:
         raise SetupError(f"cannot tell which user runs the agent ({agent_unit} not found) — run "
                          f"`sudo tsm setup` on this node first")
     return render_terminal_unit(SimpleNamespace(service_user=m.group(1)), lay)       # type: ignore[arg-type]
+
+
+def installed_terminal_socket(lay: Layout) -> str:
+    """The terminal socket unit for a node that is already set up (address from its agent.yaml)."""
+    from types import SimpleNamespace
+    return render_terminal_socket(SimpleNamespace(), lay)                              # type: ignore[arg-type]
 
 
 # ---- editing generated files in place ----------------------------------------------------------
@@ -736,7 +783,16 @@ class Provisioner:
             return
         self.run(["systemctl", "daemon-reload"])
         failed = []
+        on_demand = {u[:-len(".socket")] + ".service" for u in unit_names if u.endswith(".socket")}
         for u in unit_names:
+            if u in on_demand:
+                # socket-activated: its socket starts it. A 0.5.x install ran it always-on, so drop that
+                # boot link and the resident process (an open shell ends, as on any restart).
+                wants = self.lay.systemd / "multi-user.target.wants" / u
+                if wants.is_symlink():
+                    wants.unlink()
+                self.run(["systemctl", "stop", u])
+                continue
             rc, out = self.run(["systemctl", "enable", "--now", u])
             if rc == 0:
                 self.run(["systemctl", "restart", u])      # pick up changed config

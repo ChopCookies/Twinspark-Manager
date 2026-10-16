@@ -29,7 +29,7 @@ from typing import Any, Optional
 import httpx
 
 from . import hostprobe
-from .provision import Layout, SetupError, _real_run, installed_terminal_unit
+from .provision import Layout, SetupError, _real_run, installed_terminal_socket, installed_terminal_unit
 from .remote import netboot, privops, termclient
 from .remote import policy as pol
 from .remote.policy import FEATURE_HELP, FEATURES
@@ -109,24 +109,31 @@ def _systemctl(*argv: str) -> tuple[int, str]:
 
 
 def _terminal_unit(lay: Layout, enable: bool) -> list[str]:
-    unit = lay.systemd / f"{UNIT}.service"
+    """Install/remove the socket-activated terminal: the socket is what is enabled; the service starts
+    on the first connection and exits when idle (provision.render_terminal_unit)."""
+    unit, sock = lay.systemd / f"{UNIT}.service", lay.systemd / f"{UNIT}.socket"
     notes: list[str] = []
     if enable:
-        if not unit.exists():
-            unit.parent.mkdir(parents=True, exist_ok=True)
-            unit.write_text(installed_terminal_unit(lay))
-            unit.chmod(0o644)
-            notes.append(f"installed {unit}")
+        for path, text in ((unit, installed_terminal_unit(lay)), (sock, installed_terminal_socket(lay))):
+            if not path.exists() or path.read_text() != text:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+                path.chmod(0o644)
+                notes.append(f"installed {path}")
+        old_link = lay.systemd / "multi-user.target.wants" / f"{UNIT}.service"
+        if old_link.is_symlink():                      # 0.5.x ran the terminal always-on
+            old_link.unlink()
         if lay.sandbox:
             notes.append("sandbox: service not started")
         else:
             _systemctl("daemon-reload")
-            rc, out = _systemctl("enable", "--now", UNIT)
-            notes.append("terminal service started" if rc == 0 else f"could not start the terminal service: {out}")
-    elif unit.exists() and not lay.sandbox:
-        rc, out = _systemctl("disable", "--now", UNIT)
-        notes.append("terminal service stopped (open shells ended)" if rc == 0 else
-                     f"could not stop the terminal service: {out}")
+            rc, out = _systemctl("enable", "--now", f"{UNIT}.socket")
+            notes.append("terminal ready (starts on the first connection)" if rc == 0 else
+                         f"could not start the terminal socket: {out}")
+    elif (unit.exists() or sock.exists()) and not lay.sandbox:
+        rc, out = _systemctl("disable", "--now", f"{UNIT}.socket", f"{UNIT}.service")
+        notes.append("terminal stopped (open shells ended)" if rc == 0 else
+                     f"could not stop the terminal: {out}")
     return notes
 
 
@@ -525,8 +532,8 @@ def cmd_node_status(args) -> None:
         return
     print(f"node {st['node']}  {st['hostname']}   kernel {st['kernel']}   up {_uptime(st['uptime_s'])}   "
           f"TwinSpark {st['version']}")
-    for u in ("twinspark-agent", "twinspark-privd", UNIT, "twinspark-controller", "docker"):
-        installed = (n.lay.systemd / f"{u}.service").exists() or u == "docker"
+    for u in ("twinspark-agent", "twinspark-privd", UNIT, f"{UNIT}.socket", "twinspark-controller", "docker"):
+        installed = (n.lay.systemd / (u if u.endswith(".socket") else f"{u}.service")).exists() or u == "docker"
         if installed:
             print(f"  {u:22} {_unit_state(u)}")
     p = st["policy"]
@@ -556,7 +563,9 @@ def node_checks(n: LocalNode) -> list[Check]:
     units = ["twinspark-agent", "twinspark-privd", "docker"]
     if lay.controller_yaml.exists():
         units.append("twinspark-controller")
-    if (lay.systemd / f"{UNIT}.service").exists():
+    if (lay.systemd / f"{UNIT}.socket").exists():
+        units.append(f"{UNIT}.socket")          # the service itself only runs while a shell is in use
+    elif (lay.systemd / f"{UNIT}.service").exists():
         units.append(UNIT)
     for u in units:
         if sandbox:

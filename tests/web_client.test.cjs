@@ -369,7 +369,7 @@ test("terminal card explains why it is unavailable and offers touch keys", () =>
   assert.match(off, /sudo tsm remote enable terminal/);
   assert.match(off, /data-act="term-open" disabled/);
   const nosvc = c.run(`remoteTerminalHtml(${JSON.stringify({ ...NODE_B, terminal_service: false })})`);
-  assert.match(nosvc, /systemctl enable --now twinspark-terminal/);
+  assert.match(nosvc, /sudo tsm remote enable terminal/);
   const on = c.run(`remoteTerminalHtml(${JSON.stringify(NODE_B)})`);
   assert.doesNotMatch(on, /data-act="term-open" disabled/);
   for (const k of ["Esc", "Tab", "Ctrl-C", "Ctrl-D"]) assert.match(on, new RegExp(`data-key="${k}"`));

@@ -213,7 +213,7 @@ async def test_ticket_explains_how_to_turn_the_terminal_on(ctl):
 
 async def test_ticket_explains_a_missing_terminal_service_and_an_unsafe_policy(ctl):
     ctl.agents["B"].answers["remote_status"] = status_answer(service=False)
-    with pytest.raises(RemoteError, match="systemctl enable --now twinspark-terminal"):
+    with pytest.raises(RemoteError, match="sudo tsm remote enable terminal"):
         await ctl.remote.issue_ticket("B")
     st = status_answer(terminal=False)
     st["policy"]["error"] = "policy file is writable by group/other"

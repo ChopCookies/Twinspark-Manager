@@ -6,7 +6,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from twinspark.controller import launch
+from twinspark import containers
 from twinspark.controller.app import create_app
 from twinspark.controller.launch import LaunchError, LaunchPlanner, Mount
 from twinspark.schemas.enums import Topology
@@ -16,8 +16,9 @@ from .conftest import draft
 
 
 def platform(monkeypatch, name):
-    # Replace only launch's reference; changing os.name globally breaks pathlib.
-    monkeypatch.setattr(launch, "os", SimpleNamespace(name=name))
+    # Replace only the mount validator's reference (twinspark/containers.py, re-exported by launch);
+    # changing os.name globally breaks pathlib.
+    monkeypatch.setattr(containers, "os", SimpleNamespace(name=name))
 
 
 @pytest.mark.parametrize("host", [r"C:\Users\spark\.cache\huggingface", "D:/cache/hf", r"C:\cache/hf+v1@main",

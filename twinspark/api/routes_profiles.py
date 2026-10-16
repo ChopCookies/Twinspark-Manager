@@ -9,7 +9,6 @@ from pydantic import BaseModel
 
 from ..controller.controller import BusyError, Controller, DuplicateProfileError
 from ..controller.launch import LaunchError
-from ..controller.pinning import PinError
 from ..schemas.job import Job
 from ..schemas.profile import ImmutableIdentity, Profile, ProfileDraft, ProfileRevision
 from .deps import controller_dep, require_auth
@@ -155,7 +154,7 @@ async def pin(name: str, req: PinRequest, ctrl: Controller = Depends(controller_
         return await ctrl.pin_profile(name, model_ref=req.model_ref, image=req.image,
                                       local_image=req.local_image, label_note=req.note,
                                       secondary=req.secondary.model_dump(exclude_none=True) if req.secondary else None)
-    except (PinError, ValueError) as e:
+    except ValueError as e:                        # PinError is a ValueError
         raise HTTPException(422, str(e))
 
 

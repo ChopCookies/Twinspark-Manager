@@ -160,7 +160,7 @@ def cmd_serve(args, api=None):
     elif args.what == "agent":
         serve.run_agent(args.config)
     elif args.what == "termd":
-        serve.run_termd(args.config)
+        serve.run_termd(args.config, idle_exit_s=getattr(args, "idle_exit", 0.0) or 0.0)
     else:
         serve.run_privd(args.socket, args.group, args.remote_policy, not args.unsafe_policy_owner)
 
@@ -1079,6 +1079,36 @@ def cmd_hardware(args, api: Api):
 
 
 # ---- argument parsing -----------------------------------------------------------------------
+def _add_serve_args(s: argparse.ArgumentParser) -> None:
+    s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
+    s.add_argument("--config", help="controller.yaml / agent.yaml")
+    s.add_argument("--socket", default="/run/twinspark/privd.sock")
+    s.add_argument("--group", default="twinspark")
+    s.add_argument("--remote-policy", help="privd: path of the remote-management policy "
+                                           "(default /etc/twinspark/remote-policy.json)")
+    s.add_argument("--unsafe-policy-owner", action="store_true",
+                   help="privd: accept a policy file not owned by root (sandbox installs and tests only)")
+    s.add_argument("--idle-exit", type=float, default=0.0, metavar="SECONDS",
+                   help="termd: exit after this long without an open terminal (socket activation starts it "
+                        "again on the next connection); 0 = never")
+
+
+def _serve_main(argv: list[str]) -> int:
+    """``tsm serve …`` without building the full CLI.
+
+    The full parser imports the controller, the cookbook and FastAPI (other commands need them). The
+    services systemd starts on every Spark — above all the agent and the root helper — must not carry
+    that: each service imports only what its role uses (see serve.py and scripts/measure_memory.py).
+    """
+    p = argparse.ArgumentParser(prog="tsm serve", description="run a service (used by systemd)")
+    _add_serve_args(p)
+    args = p.parse_args(argv)
+    if args.what in ("controller", "agent", "termd") and not args.config:
+        p.error("serve controller|agent|termd needs --config")
+    cmd_serve(args)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tsm", description="TwinSpark Manager — dual DGX Spark model switching")
     p.add_argument("--api", default=os.environ.get("TSM_API", DEFAULT_API), help="management API URL")
@@ -1101,15 +1131,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--show", action="store_true",
                    help="print the secret values; on its own it only reads and never creates anything")
 
-    s = cmd("serve", cmd_serve, "run a service (used by systemd)")
-    s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
-    s.add_argument("--config", help="controller.yaml / agent.yaml")
-    s.add_argument("--socket", default="/run/twinspark/privd.sock")
-    s.add_argument("--group", default="twinspark")
-    s.add_argument("--remote-policy", help="privd: path of the remote-management policy "
-                                           "(default /etc/twinspark/remote-policy.json)")
-    s.add_argument("--unsafe-policy-owner", action="store_true",
-                   help="privd: accept a policy file not owned by root (sandbox installs and tests only)")
+    _add_serve_args(cmd("serve", cmd_serve, "run a service (used by systemd)"))
 
     cmd("status", cmd_status, "active model, routes, memory, live serving metrics")
     cmd("profiles", cmd_profiles, "list profiles", aliases=["ls"])
@@ -1249,6 +1271,9 @@ cmd_first_night.local = True
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["serve"]:
+        return _serve_main(argv[1:])
     p = build_parser()
     args = p.parse_args(argv)
     if not getattr(args, "fn", None):

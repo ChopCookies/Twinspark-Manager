@@ -201,7 +201,7 @@ class RemoteService:
                               f"sudo tsm remote enable terminal", 409)
         if not st.get("terminal_service"):
             raise RemoteError(f"the terminal service is not running on node {node}. On that node run: "
-                              f"sudo systemctl enable --now twinspark-terminal", 409)
+                              f"sudo tsm remote enable terminal", 409)
         self._purge()
         if len(self.tickets) >= MAX_TICKETS:
             raise RemoteError("too many pending terminal tickets", 429)
