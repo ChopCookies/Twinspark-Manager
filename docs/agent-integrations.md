@@ -116,6 +116,27 @@ setup in its [provider guide](https://hermes-agent.nousresearch.com/docs/integra
 Its [configuration reference](https://hermes-agent.nousresearch.com/docs/user-guide/configuration)
 covers environment references and auxiliary-model routing.
 
+#### Hermes Agent lifecycle
+
+With the [workstation client](client.md) the export becomes a managed connection. The **Hermes
+Agent** card on Integrations works on **this computer** (the default: Hermes's memory, tools and
+browser stay off the Sparks) or on **node A** (an existing install there, driven over the same SSH
+connection; Hermes then shares node A's memory with the model). Each step shows what it will do:
+
+| Step | What happens |
+| --- | --- |
+| Detect | Finds Hermes in the documented install paths, not just `PATH`, names a broken launcher (for example a `~/.local/bin/hermes` wrapper pointing at an old install) and the working one it uses instead, and lists the profiles. Nothing is changed. |
+| State | Five separate facts: **installed**, **configured** (its files point at this endpoint and alias with the key in place), **reachable** (the endpoint answers *from where Hermes runs*), **compatible** (validation passed for this exact recipe revision) and **running** (its gateway process). |
+| Preview | The exact diff of `config.yaml` and `.env`: `model.provider: custom`, the alias, the base URL as seen from that host, `key_env: TWINSPARK_API_KEY` and the deployed context limit (from the gateway's `/v1/models`, never a wished-for value; below 64,000 tokens it is refused). Auxiliary or fallback routes that still go to a cloud provider are listed, not changed. |
+| Apply | Only the reviewed preview, only if both files are still byte-identical to what the preview read. A byte-exact, timestamped backup is taken first; writes are atomic and keep unrelated settings and secrets. Only the inference key is written; the management key is refused if pasted. |
+| Validate | Chat, streaming and a tool call through the configured address, each failure attributed to transport, key, model, parser or the app. |
+| Launch | The gateway in the background (or through its service when Hermes has one), or the exact `hermes chat` command for a terminal. A running gateway is attached to, not duplicated. |
+| Stop / Restart | Only what TwinSpark started, or through Hermes's own service. |
+| Restore / Disconnect | Restore puts any backup back (the current files are backed up first). Disconnect removes only TwinSpark's settings and, where known, puts the previous model settings back. |
+
+TwinSpark's own files for Hermes (backups and a small state file) live in `.twinspark/` in the Hermes
+profile's folder. Nothing outside the Hermes folder is written.
+
 ### lm-evaluation-harness
 
 The generated YAML selects `local-chat-completions`. Unlike the other clients,

@@ -143,12 +143,20 @@ async def test_which_run_and_processes(remote, tmp_path):
                                     str(home / "logs" / "err.log"))
     try:
         assert await host.pid_alive(pid)
-        assert "sleep 30" in (await host.process_args(pid) or "")
         for _ in range(100):
             if log.exists() and b"started" in log.read_bytes():
                 break
             await asyncio.sleep(0.05)
         assert b"started" in log.read_bytes()
+        # read the command line once the shell has exec'd: during the exec /proc/<pid>/cmdline is briefly
+        # empty and ps prints the bare name in brackets
+        args = ""
+        for _ in range(100):
+            args = await host.process_args(pid) or ""
+            if "sleep 30" in args:
+                break
+            await asyncio.sleep(0.05)
+        assert "sleep 30" in args
         assert await host.terminate(pid, 1.0)
         assert not await host.pid_alive(pid)
     finally:

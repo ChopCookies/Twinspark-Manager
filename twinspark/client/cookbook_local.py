@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 
 from ..cookbook import RecipeImportError, build_draft, import_text, list_recipes, recipe_detail
 from ..cookbook.remote import RemoteError, fetch_text, list_source
+from .app import ImportIn  # module level: FastAPI resolves the (string) annotation from here
 from .session import ClientSession
 
 
@@ -40,8 +41,6 @@ async def _create(session: ClientSession, draft) -> dict:
 
 
 def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callable[[], None]) -> None:
-    from .app import ImportIn
-
     @app.get("/api/v1/cookbook")
     async def index() -> dict:
         connected()

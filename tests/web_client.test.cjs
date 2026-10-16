@@ -43,7 +43,7 @@ function client() {
     window: { addEventListener: (name, fn) => events.set(name, fn) },
     document: { addEventListener() {}, querySelector: element },
   });
-  for (const file of ["app.js", "start.js", "remote.js"]) {
+  for (const file of ["app.js", "start.js", "remote.js", "client.js"]) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js", file), "utf8"), context, { filename: file });
   }
   return { context, element, events, storage, run: code => vm.runInContext(code, context) };

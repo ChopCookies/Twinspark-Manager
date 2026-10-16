@@ -36,7 +36,14 @@ const NAV = [
 
 /* ============================== API ============================== */
 class ApiError extends Error {
-  constructor(msg, status, detail) { super(msg); this.status = status; this.detail = detail; }
+  /** client: set when the workstation client answered for itself ("transport" | "credentials" | "session"). */
+  constructor(msg, status, detail, client = "") { super(msg); this.status = status; this.detail = detail; this.client = client; }
+}
+/** A 401: the node rejected the management key, or (client mode) this tab's client session ended. */
+function unauthorized(r) {
+  const fromClient = r.headers && r.headers.get && r.headers.get("x-twinspark-client") === "session";
+  if (fromClient) lock(CLIENT_LOCKED, true); else lock(S.key ? "Session key rejected — unlock again." : "");
+  return new ApiError(fromClient ? "client session ended" : "invalid management key", 401, null, fromClient ? "session" : "");
 }
 async function api(method, path, body) {
   const opts = { method, headers: {} };
@@ -45,7 +52,7 @@ async function api(method, path, body) {
   let r;
   try { r = await fetch(path, opts); }
   catch (e) { throw new ApiError("controller not reachable", 0); }
-  if (r.status === 401) { lock(S.key ? "Session key rejected — unlock again." : ""); throw new ApiError("invalid management key", 401); }
+  if (r.status === 401) throw unauthorized(r);
   const data = r.status === 204 ? null : await r.json().catch(() => null);
   if (!r.ok) {
     let d = data && data.detail;
@@ -54,7 +61,7 @@ async function api(method, path, body) {
     else if (Array.isArray(d)) msg = d.map(x => `${(x.loc || []).slice(1).join(".")}: ${x.msg}`).join("; ");
     else if (d && d.message) msg = d.message;
     else if (d) msg = JSON.stringify(d);
-    throw new ApiError(msg, r.status, d);
+    throw new ApiError(msg, r.status, d, (r.headers && r.headers.get && r.headers.get("x-twinspark-client")) || "");
   }
   // the last deployment this browser saw: a switch is refused if it changed meanwhile (another client)
   if (method === "GET" && path === "/api/v1/status" && data) S.seenActive = (data.active && data.active.revision_id) || null;
@@ -73,8 +80,8 @@ async function apiText(path) {
   let r;
   try { r = await fetch(path, { headers: S.key ? { "x-api-key": S.key } : {} }); }
   catch (e) { throw new ApiError("controller not reachable", 0); }
-  if (r.status === 401) { lock(S.key ? "Session key rejected — unlock again." : ""); throw new ApiError("invalid management key", 401); }
-  if (!r.ok) { const d = await r.json().catch(() => null); throw new ApiError((d && d.detail) || "HTTP " + r.status, r.status); }
+  if (r.status === 401) throw unauthorized(r);
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new ApiError((d && d.detail) || "HTTP " + r.status, r.status, null, r.headers.get("x-twinspark-client") || ""); }
   return r.text();
 }
 const GET = (p) => api("GET", p);
@@ -249,22 +256,31 @@ async function busy(btn, fn) {
 }
 
 /* ============================== shell ============================== */
-function lock(msg = "") {
+function lock(msg = "", client = false) {
   S.unlocked = false; S.gen++; clearInterval(pingTimer);
   S.key = ""; sessionStorage.removeItem("tsm_key");
   S.timers.forEach(clearInterval); S.timers = [];
   $("#shell").classList.add("hidden"); $("#gate").classList.remove("hidden");
+  if (client) {   // the workstation client: its key comes with the address it printed, not from node A
+    $("#gate-label").textContent = "Client session key";
+    $("#gate-key").placeholder = "the part after #k= in the address tsm client printed";
+    $("#gate-hint").textContent = "This page is served by the TwinSpark client on this computer.";
+  }
   $("#gate-err").textContent = msg; $("#gate-key").focus();
 }
 async function unlock(key) {
   S.key = key;
   try { await GET("/api/v1/status"); }
-  catch (e) { S.key = ""; $("#gate-err").textContent = e.status === 401 ? "Incorrect API key. Please try again." : e.message; return; }
+  catch (e) {
+    // the client accepted the key and only reports that node A is not reachable yet: unlocked
+    if (!(e.client && e.client !== "session")) { S.key = ""; $("#gate-err").textContent = e.status === 401 ? "Incorrect key. Please try again." : e.message; return; }
+  }
   sessionStorage.setItem("tsm_key", key);
   $("#gate").classList.add("hidden"); $("#shell").classList.remove("hidden");
   boot();
 }
 async function ping() {
+  if (S.client) return clientPing();
   const pill = $("#conn");
   try {
     const h = await GET("/api/v1/health");
@@ -275,8 +291,10 @@ async function ping() {
   } catch (e) { pill.innerHTML = `${dot("bad")} offline`; pill.className = "pill bad"; }
 }
 let pingTimer = null;
-function boot() {
+async function boot() {
   S.unlocked = true;
+  if (typeof clientBoot === "function") await clientBoot();
+  if (!S.unlocked) return;
   $("#nav").innerHTML = NAV.map(([id, label]) => `<a href="#/${id}" data-nav="${id}">${icon(id)}${esc(label)}</a>`).join("");
   ping(); clearInterval(pingTimer); pingTimer = setInterval(ping, 6000);
   route();
@@ -325,6 +343,7 @@ async function route() {
       try { await fn(m); }
       catch (e) {
         if (!current(g)) return;
+        if (e && e.client && typeof clientErrorHtml === "function") { main.innerHTML = clientErrorHtml(e); return; }
         const missing = e && e.status === 404;
         main.innerHTML = `<div class="view"><div class="view-head"><div><h1>${missing ? "Not found" : "Something went wrong"}</h1><p>${esc(e.message)}</p></div></div>
           <div class="row">${missing ? "" : `<button class="btn" onclick="route()">Retry</button>`}<a class="btn ${missing ? "primary" : ""}" href="#/dashboard">Dashboard</a><a class="btn" href="#/profiles">Profiles</a><a class="btn" href="#/jobs">Jobs</a></div></div>`;
@@ -1182,7 +1201,9 @@ async function viewIntegrations() {
   if (!aliases.some(a => a.alias === state.alias)) state.alias = (aliases.find(a => a.status === "serving") || aliases[0])?.alias || "";
   if (!aliases.some(a => a.alias === state.secondaryAlias) || state.secondaryAlias === state.alias) state.secondaryAlias = "";
   if (!clients.some(c => c.id === state.client)) state.client = clients[0]?.id || "";
-  if (!state.baseUrl) state.baseUrl = catalog.gateway?.suggested_base_url || "";
+  // in client mode the address apps on this computer use is the client's forward of the gateway
+  const suggestedUrl = (S.client && S.clientStatus?.endpoint?.base_url) || catalog.gateway?.suggested_base_url || "";
+  if (!state.baseUrl || state.baseUrlAuto) { state.baseUrl = suggestedUrl; state.baseUrlAuto = true; }
   if (!render(g, `<div class="view"><div class="view-head"><div><p class="eyebrow">Connect · check · experiment</p><h1>Integrations</h1><p>Connect your recipes to coding agents, harnesses and other model clients.</p></div><button class="btn" data-act="integration-refresh">Refresh connections</button></div>
     <div class="card"><div class="form"><label class="field"><span>Model connection</span><select id="integration-alias">${aliases.map(a => `<option value="${esc(a.alias)}" ${a.alias === state.alias ? "selected" : ""}>${esc(a.alias)} · ${esc(a.profile)}</option>`).join("")}</select></label><label class="field"><span>Second model (optional)</span><select id="integration-secondary"><option value="">None</option>${aliases.map(a => `<option value="${esc(a.alias)}" ${a.alias === state.secondaryAlias ? "selected" : ""}>${esc(a.alias)} · ${esc(a.profile)}</option>`).join("")}</select><span class="help">For clients that separate planning and coding, or use a smaller helper model.</span></label><label class="field"><span>Client or harness</span><select id="integration-client">${clients.map(c => `<option value="${esc(c.id)}" ${c.id === state.client ? "selected" : ""}>${esc(c.title)}</option>`).join("")}</select></label><label class="field"><span>Gateway address</span><input id="integration-url" type="url" autocomplete="off" spellcheck="false" value="${esc(state.baseUrl)}" placeholder="http://192.168.1.10:8000/v1"/><span class="help">Use the manager's address as seen from the client machine.</span></label></div>
     ${catalog.gateway?.auth_required ? '<p class="small muted">The connection files use an API key placeholder. Set your gateway key on the client machine.</p>' : ""}<p class="err hidden" id="integration-error" role="alert"></p><div class="row end integration-actions"><button class="btn" id="integration-check-button" data-act="integration-check" ${aliases.find(a => a.alias === state.alias)?.status !== "serving" ? "disabled" : ""}>Run compatibility check</button><button class="btn primary" id="integration-export-button" data-act="integration-export" ${!state.alias || !state.client ? "disabled" : ""}>Create connection files</button></div></div>
@@ -1205,7 +1226,7 @@ async function viewIntegrations() {
   const invalidate = () => { epoch++; exported = null; $("#integration-files").innerHTML = ""; $("#integration-error").classList.add("hidden"); display(); };
   const evaluationChanged = () => { evaluationEpoch++; $("#evaluation-error").classList.add("hidden"); display(); };
   $("#integration-alias").onchange = () => { $("#evaluation-revision").value = aliases.find(a => a.alias === selected().alias)?.revision_id || ""; $("#evaluation-file").value = ""; evaluationChanged(); invalidate(); };
-  $("#integration-secondary").onchange = invalidate; $("#integration-client").onchange = invalidate; $("#integration-url").oninput = invalidate;
+  $("#integration-secondary").onchange = invalidate; $("#integration-client").onchange = invalidate; $("#integration-url").oninput = () => { state.baseUrlAuto = false; invalidate(); };
   $("#evaluation-revision").oninput = evaluationChanged; $("#evaluation-file").onchange = evaluationChanged;
   const request = async (btn, fn) => {
     const token = ++epoch;
@@ -1251,6 +1272,7 @@ async function viewIntegrations() {
       finally { evaluationPending = false; if (current(g)) display(); }
     },
   });
+  if (S.client && typeof clientIntegrations === "function") clientIntegrations(g, state, aliases);
   display();
 }
 
@@ -1971,10 +1993,11 @@ function firstNight(e) {
 document.addEventListener("keydown", firstNight);
 document.addEventListener("DOMContentLoaded", () => {
   $("#gate-form").addEventListener("submit", (e) => { e.preventDefault(); const k = $("#gate-key").value.trim(); if (k) unlock(k); });
-  $("#logout").addEventListener("click", () => lock());
+  $("#logout").addEventListener("click", () => lock("", !!S.client));
   if (S.key) { $("#shell").classList.remove("hidden"); boot(); }
   else {
     // management_auth: none → no key needed
-    GET("/api/v1/status").then(() => { S.key = ""; $("#shell").classList.remove("hidden"); boot(); }).catch(() => lock());
+    GET("/api/v1/status").then(() => { S.key = ""; $("#shell").classList.remove("hidden"); boot(); })
+      .catch((e) => { if (e.status !== 401) lock(); });   // a 401 already locked, with the right message
   }
 });

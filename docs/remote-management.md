@@ -44,8 +44,8 @@ sudo tsm remote disable poweroff
 sudo tsm remote enable all --dry            # show what would change, change nothing
 ```
 
-Run it on **each** node. `enable terminal` also installs and starts `twinspark-terminal.service`;
-`disable terminal` stops and removes it (open shells end).
+Run it on **each** node. `enable terminal` also installs `twinspark-terminal.service` and enables its
+socket, `twinspark-terminal.socket`; `disable terminal` stops and removes both (open shells end).
 
 Why a file on the node and not a button in the GUI? Because the GUI talks to the controller, and the
 whole point is that a stolen or misused management key cannot talk a node into powering itself off or
@@ -110,6 +110,11 @@ How it works and what to know:
   works if that user may use it, exactly as over SSH. Docker works if that user is in the `docker` group.
 - It runs in its **own service** (`twinspark-terminal`), not inside the sandboxed agent, so a normal
   shell environment is available and a bug in the agent still cannot hand out a shell.
+- It costs nothing while unused: systemd holds the port (`twinspark-terminal.socket`) and starts the
+  service on the first connection; after 15 minutes without a session the process exits and the socket
+  waits again. `systemctl status twinspark-terminal.socket` shows it listening;
+  `twinspark-terminal.service` being inactive is normal. Installs from before 0.6 are moved to the socket
+  by `sudo tsm remote enable terminal` (or the next `sudo tsm setup`).
 - The browser never talks to the node directly. It trades the management key for a **one-time ticket**
   (valid 30 seconds, bound to one node) and the controller relays the connection. With CSRF protection
   on, the WebSocket also checks the page's `Origin`.

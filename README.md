@@ -4,7 +4,7 @@ One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA
 (GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
 and keep the machines headless.
 
-> **Status: alpha (0.5.1).** The control path is covered by automated tests (about 1,000). Real Docker
+> **Status: alpha (0.6.0).** The control path is covered by automated tests (about 1,300). Real Docker
 > activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
 > and two-node PP2) on 2026-09-28, at the code of that day — see the
 > [validation note](docs/notes/small-model-validation-2026-09-28.md). Large models, other topologies
@@ -66,9 +66,21 @@ sudo ./install.sh --join tsm1.…
 Lost the line? `sudo tsm join-code` on node A prints it again. To keep the code out of the process
 list and your shell history, use `--join -` and paste it at the prompt.
 
-**3. Open the GUI.** From your laptop: `ssh -L 8443:localhost:8443 you@node-a`, browse to
+**3. Open the GUI from your own computer.** Install the workstation client there (macOS, Windows or
+Linux, Python 3.12+) and point it at node A:
+
+```bash
+pipx install git+https://github.com/ChopCookies/Twinspark-Manager
+tsm client                                 # opens the GUI on http://127.0.0.1:18765
+```
+
+On **Connection**, add node A's address and your SSH user. The client confirms node A's host key with
+you, logs in over SSH (or Tailscale), reads the keys, and keeps the forwards up — no tunnel to type.
+See [docs/client.md](docs/client.md). The **Get started** page then checks both nodes and shows the
+next step with the exact command.
+
+Without the client it works as before: `ssh -L 8443:localhost:8443 you@node-a`, browse to
 <http://localhost:8443/> and paste the management key (`tsm init --show` prints it again).
-The **Get started** page checks both nodes and shows the next step with the exact command.
 
 **4. Run a model.**
 
@@ -87,7 +99,8 @@ vLLM image you build yourself with [eugr/spark-vllm-docker](https://github.com/e
 `tsm cookbook show` says how.
 
 Clients use `http://node-a:8000/v1`, model `default`, with the `inference_api_key`
-(`tsm init --show`).
+(`tsm init --show`). Apps on the computer that runs `tsm client` can use its forward instead; the
+Connection page shows that address and copies the key.
 
 **5. Go live.** While in dry-run, `activate` walks the whole pipeline with simulated
 containers, so you can compare `tsm plan` with the command you run by hand today. When it
@@ -117,8 +130,14 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
 
 ## What you get
 
-- **Web GUI** (served by the controller): Get started, Dashboard, System status, Updates,
-  Profiles, Cookbook, **Integrations**, Model files, Mods, Planner, Diagnostics, **Remote**, Jobs, Logs.
+- **Workstation client** (`tsm client`, new in 0.6): the GUI on your own computer, connected to node A
+  by address over SSH or Tailscale with managed forwards, host-key confirmation and a one-time key
+  install; three separate states (client connected · agents compatible · model ready). Recipe research
+  and agent-app setup run there, so the Sparks keep only lean services (≈100 MiB on node A, ≈50 MiB on
+  node B, measured on x86). [docs/client.md](docs/client.md)
+- **Web GUI** (served by the client, or by the controller as before): Get started, Dashboard, System
+  status, Updates, Profiles, Cookbook, **Integrations**, Model files, Mods, Planner, Diagnostics,
+  **Remote**, Jobs, Logs.
 - **Recipes → profiles.** Built-in researched configs and community recipes (eugr/spark-vllm-docker
   format) by URL, paste or file; immutable revisions (model commit + image digest); diff, duplicate,
   known-good tracking; *Pin & prepare* stages weights without touching the model that is serving.
@@ -128,6 +147,8 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
   LangGraph/LangChain, OpenClaw, Hermes and LM Evaluation Harness from stable model aliases.
   Use separate coding/planning models, check protocol compatibility, and record evaluation metrics
   against exact recipe revisions. Simulated checks and imported reports keep their evidence labels.
+  With the client, **Hermes** is detected, configured (previewed diff, backup, restore), validated and
+  launched on your computer or on node A.
 - **Topologies:** `single-a`, `single-b`, `replicated`, `tp2`, `pp2`, `tp-ep`, plus **split**
   profiles (a different model on each node). Native multi-node vLLM or Ray.
 - **Safe switching:** preflight → download / rsync A→B over QSFP → drain → stop → reclaim memory →
@@ -149,8 +170,8 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
 ## How it fits together
 
 ```
- your laptop ──ssh -L 8443──┐                       clients ──► :8000 (OpenAI API, needs inference key)
-                            ▼                                       │
+ your computer: tsm client ──SSH, -L 8443 / 8000──┐   clients ──► :8000 (OpenAI API, needs inference key)
+   (GUI, recipes, Hermes)                         ▼                 │
    ┌──────────────────── node A ───────────────────────┐   QSFP    ┌──────── node B ────────┐
    │ controller + gateway ─► agent A ─► docker (vLLM)  │◄═════════►│ agent B ─► docker (vLLM)│
    │ web GUI / API (:8443)    │                        │ 200 Gb/s  │   │                     │
@@ -173,13 +194,15 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
 | 8000 | A, all interfaces | OpenAI-compatible gateway (needs the inference key) |
 | 9443 | A `127.0.0.1`, B QSFP address only | agent (bearer token) |
 | 8100 | each node | internal vLLM port (must not collide with a hand-started vLLM) |
+| 9444 | same address as the agent | terminal, only when switched on (systemd socket; the process starts on demand) |
+| 18765 | your computer, `127.0.0.1` | `tsm client` GUI (per-launch session key) |
 
 | File | Purpose |
 |---|---|
 | `/etc/twinspark/controller.yaml`, `agent.yaml` | configuration (safe to edit; comments explain) |
 | `/etc/twinspark/secrets/` | encrypted vault (keys, tokens) |
 | `/var/lib/twinspark/` | state database, mods, sync key |
-| `/etc/systemd/system/twinspark-{privd,agent,controller}.service` | services |
+| `/etc/systemd/system/twinspark-{privd,agent,controller}.service` | services (plus `twinspark-terminal.{socket,service}` when the terminal is on) |
 
 ## Everyday commands
 
@@ -199,6 +222,14 @@ tsm stop                       # drain and stop the active model
 ```
 
 Everything in the GUI is the same API the CLI uses; `tsm --help` lists all commands.
+
+On your own computer:
+
+```bash
+tsm client                     # the GUI on 127.0.0.1, connected to node A by address
+tsm client add home 192.168.1.20 --user spark && tsm client connect home   # the same in a terminal
+eval "$(tsm client env home)" && tsm status   # the tsm CLI through the client's forward
+```
 
 ### The QSFP link (both interfaces, ~200 Gb/s)
 
@@ -240,7 +271,8 @@ switch it on, on that node.
 
 | Symptom | Fix |
 |---|---|
-| `cannot reach the controller` | `systemctl status twinspark-controller`; from a laptop you need the SSH tunnel (`ssh -L 8443:localhost:8443 …`) |
+| `cannot reach the controller` | `systemctl status twinspark-controller`; from a laptop use `tsm client`, or the SSH tunnel (`ssh -L 8443:localhost:8443 …`) |
+| The client says *Not connected to the Sparks* | its Connection page names the step (host key, SSH login, keys, network); see [docs/client.md](docs/client.md#troubleshooting) |
 | GUI says *invalid management key* | `tsm init --show` on node A prints it |
 | Node B "unreachable" on Get started | `journalctl -u twinspark-agent` on B. `401` = token mismatch: re-run `sudo tsm join-code` on A and `sudo tsm setup --join …` on B. Otherwise check B's QSFP address (`ip -br addr`) |
 | NCCL tops out near 100 Gb/s | only one QSFP interface has an address: `tsm qsfp status`, then `sudo tsm qsfp apply` (see [docs/qsfp-link.md](docs/qsfp-link.md)) |
@@ -261,10 +293,15 @@ sudo ./install.sh --uninstall            # stop services, remove the program; co
 sudo ./install.sh --uninstall --purge    # …and delete /etc/twinspark and /var/lib/twinspark
 ```
 
-Update both nodes (the Get started page warns when versions differ).
+Update both nodes (the Get started page and the client's **Agents compatible** state warn when versions
+differ). Coming from 0.5 with the terminal switched on, run `sudo tsm remote enable terminal` once on
+each node afterwards: it moves the terminal to its on-demand socket (until then it keeps running as
+before). Update the client with `pipx upgrade twinspark-manager` (a git install:
+`pipx install --force git+https://github.com/ChopCookies/Twinspark-Manager`).
 
 ## More documentation
 
+- [The workstation client: connect by address, local GUI, Hermes on your computer](docs/client.md)
 - [Recipe and split-model workflow](docs/recipe-workflow.md)
 - [Automatic recipe imports and source updates](docs/recipe-automation.md)
 - [Agent clients and evaluation harnesses](docs/agent-integrations.md)

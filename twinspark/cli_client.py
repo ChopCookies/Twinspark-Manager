@@ -1,7 +1,7 @@
 """``tsm client`` — the workstation client (macOS, Windows, Linux; install with pipx).
 
     tsm client                      # open the GUI in your browser (http://127.0.0.1:<port>)
-    tsm client add home 192.168.178.118 --user spark
+    tsm client add home 192.168.1.20 --user spark
     tsm client connect home         # same flow in the terminal; keeps the tunnel up until Ctrl-C
     tsm client list | remove NAME | env NAME
 

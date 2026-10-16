@@ -91,6 +91,28 @@ maintenance). When you fix a bug, add its test next to those. Pinning needs Hugg
 end-to-end activation tests (`tests/test_activation.py`) stub the resolver; real pinning and real
 containers are only exercised on site.
 
+The workstation client is tested without SSH, a Spark or Hermes:
+
+- `tests/test_client_ssh_fake.py` provides `FakeSSH`, a fake `ssh` / `ssh-keyscan` pair on `PATH` that
+  checks host keys against the client's `known_hosts`, accepts or refuses logins as configured, answers
+  remote commands from canned output (`controller.yaml`, `tsm init --show`, …) and **really forwards
+  TCP** for `-L`, so `tests/test_client_app.py` drives client app → fake ssh → the demo cluster's API and
+  gateway the way it would reach a Spark. Never let a client test reach a real `ssh`.
+- `tests/test_client_hermes.py` builds fake Hermes installs (a script launcher, a fake `HOME`) and
+  `tests/test_client_validate.py` a fake OpenAI-compatible gateway; `tests/test_client_routes_local.py`
+  runs the client's Hermes and recipe-conversion routes on top of them.
+- `tests/test_browser_client.py` opens the client GUI in Chromium (same requirements as above): the
+  `#k=` address, adding a Spark, the keys dialog, node pages through the client, disconnecting.
+- `tests/web_workstation.test.cjs` covers the GUI's client mode without a browser.
+
+To run the client against the demo by hand: `tsm demo` in one terminal, then `tsm client` with
+`TSM_CLIENT_HOME` set to a scratch directory and a **direct** connection to the demo's
+`http://127.0.0.1:<port>` (plain http is accepted for loopback addresses only).
+
+`scripts/measure_memory.py` starts the real services from a sandbox install and prints each one's
+RSS, PSS and USS; `tests/test_lean_services.py` keeps heavy imports out of the roles that do not need
+them. Check both after adding an import to the agent, the terminal or the controller's startup path.
+
 `tests/qsfp_fakes.py` is a fake Spark for the QSFP code (`tsm qsfp`, the setup step, `node doctor`): a
 `/sys` tree built from a small state table, and `ip`, `ss`, `ping` and `netplan` answered from that state —
 `netplan apply` really reads the YAML under the scratch root and turns it into addresses, and can be told to
@@ -100,7 +122,9 @@ for real in a test.
 ## On-site checklist (first contact with real hardware)
 
 1. Install with the default dry-run mode; `tsm plan …` and compare with the command you run by
-   hand today. Check every flag against the image you pin.
+   hand today. Check every flag against the image you pin. Connect the [workstation client](client.md)
+   (`tsm client`) and check the three states, then measure the services
+   (`/opt/twinspark/venv/bin/python scripts/measure_memory.py` from a checkout on each node).
 2. `tsm activate …` in dry-run: the preflight must pass on both nodes.
 3. Maintenance window: stop the hand-started vLLM, `sudo tsm go-live` on both nodes, activate a
    small `single-a` profile first, then `tp2`.

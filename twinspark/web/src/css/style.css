@@ -409,3 +409,9 @@ svg.memtl text { fill:var(--muted); font-size:6.5px; }
 svg.memtl .mark-label { text-anchor:middle; }
 svg.memtl .axis-label.end { text-anchor:end; }
 svg.memtl .min-label { fill:var(--bad); }
+
+/* Workstation client: the three connection states under the pill, and the pill as a link. */
+.client-states{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--muted);padding:0 4px}
+.client-state{display:flex;align-items:center;gap:7px}
+.pill-link{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+@media(max-width:900px){.client-states{display:none}}

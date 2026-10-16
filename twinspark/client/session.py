@@ -17,6 +17,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -108,7 +109,8 @@ class ClientSession:
             return None
         if not c.uses_ssh:
             host = c.host if ":" not in c.host else f"[{c.host}]"
-            return f"http://{host}:{c.gateway_port}/v1"
+            scheme = "https" if self.node_cfg.get("gateway_tls") else "http"
+            return f"{scheme}://{host}:{c.gateway_port}/v1"
         port = self._forward("gateway")
         scheme = "https" if self.node_cfg.get("gateway_tls") else "http"
         return f"{scheme}://127.0.0.1:{port}/v1" if port else None
@@ -215,6 +217,8 @@ class ClientSession:
             if not node.get("reachable"):
                 self._set("error", None, node.get("error") or "node A's management API did not answer")
                 return
+            if not conn.uses_ssh:
+                await self._learn_direct_gateway(conn)
             self.connections.mark_connected(conn.id)
             self._set("connected", None, None)
         except asyncio.CancelledError:
@@ -222,6 +226,18 @@ class ClientSession:
         except Exception as exc:  # noqa: BLE001 - the GUI shows it; the client keeps running
             log.exception("connecting to %s failed", conn.host)
             self._set("error", None, f"connecting failed: {type(exc).__name__}: {exc}"[:300])
+
+    async def _learn_direct_gateway(self, conn: Connection) -> None:
+        """A direct connection has no controller.yaml to read: ask node A for its gateway's port and scheme."""
+        try:
+            r = await self.node_request("GET", "/api/v1/integrations", timeout=10)
+            url = urlsplit(((r.json() or {}).get("gateway") or {}).get("suggested_base_url") or "")
+            port = url.port
+        except Exception:  # noqa: BLE001 - keep the saved port; the endpoint check will tell
+            return
+        self.node_cfg["gateway_tls"] = url.scheme == "https"
+        if port and port != conn.gateway_port:
+            self.current = self.connections.update(conn.id, gateway_port=port)
 
     def _ssh_problem(self, exc: SSHError) -> None:
         if exc.kind == "auth":

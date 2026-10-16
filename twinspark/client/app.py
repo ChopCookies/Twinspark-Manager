@@ -168,7 +168,8 @@ def create_client_app(session: ClientSession, local_key: str, *, web_dir: Option
                     return JSONResponse({"detail": "cross-site request rejected"}, status_code=403)
             if not tokens_equal(request.headers.get("x-api-key"), local_key):
                 return JSONResponse({"detail": "invalid client session key — open the address `tsm client` "
-                                               "printed (it carries the key)"}, status_code=401)
+                                               "printed (it carries the key)"}, status_code=401,
+                                    headers={"X-TwinSpark-Client": "session"})
         resp = await call_next(request)
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"

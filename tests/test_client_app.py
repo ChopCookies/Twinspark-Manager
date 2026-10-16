@@ -160,3 +160,58 @@ async def test_a_refused_login_offers_the_one_time_key_install(session, tmp_path
     ssh.trust_host_keys(session.home, "spark-a.lan", 22, [ssh.HostKey.parse(*HOSTKEY.split()[:2])])
     st = await session.connect(conn.id)
     assert st["phase"] == "needs-action" and st["need"] == "auth"
+
+
+async def test_the_terminal_socket_checks_the_browser_then_bridges_to_node_a(session):
+    """The browser terminal's WebSocket: a foreign Origin or Host is refused, no connection closes it, and a
+    connected client relays both ways to node A's socket without passing the browser's Origin on."""
+    import asyncio
+
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import WebSocketRoute
+    from websockets.asyncio.client import connect
+    from websockets.exceptions import InvalidStatus
+
+    from twinspark.client.ssh import free_local_port
+
+    seen: dict = {}
+
+    async def node_terminal(ws):
+        seen["origin"], seen["query"] = ws.headers.get("origin"), ws.url.query
+        await ws.accept()
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                return
+            await ws.send_text("echo:" + (msg.get("text") or msg.get("bytes", b"").decode()))
+
+    node = Starlette(routes=[WebSocketRoute("/api/v1/remote/terminal/ws", node_terminal)])
+    node_port, client_port = free_local_port(19100), free_local_port(19200)
+    servers = [uvicorn.Server(uvicorn.Config(a, host="127.0.0.1", port=p, log_level="warning", loop="none"))
+               for a, p in ((node, node_port), (create_client_app(session, KEY), client_port))]
+    tasks = [asyncio.create_task(s.serve()) for s in servers]
+    try:
+        while not all(s.started for s in servers):
+            await asyncio.sleep(0.05)
+        url = f"ws://127.0.0.1:{client_port}/api/v1/remote/terminal/ws?ticket=t-123"
+        own = f"http://127.0.0.1:{client_port}"
+        # refused before the handshake completes (the browser sees a socket that never opened)
+        for kw in ({"origin": "https://evil.example"},                  # another web page
+                   {"additional_headers": {"Host": "evil.example"}, "origin": own},   # DNS rebinding
+                   {"origin": own}):                                    # fine, but no Spark connected yet
+            with pytest.raises(InvalidStatus) as refused:
+                async with connect(url, **kw):
+                    pass
+            assert refused.value.response.status_code == 403
+        conn = session.connections.add(Connection(id="", name="lab", mode="direct", host="127.0.0.1",
+                                                  direct_url=f"http://127.0.0.1:{node_port}"))
+        session.current, session.phase = conn, "connected"
+        async with connect(url, origin=own) as ws:
+            await ws.send("ls")
+            assert await asyncio.wait_for(ws.recv(), 5) == "echo:ls"
+        assert seen == {"origin": None, "query": "ticket=t-123"}
+    finally:
+        for s in servers:
+            s.should_exit = True
+        await asyncio.gather(*tasks, return_exceptions=True)

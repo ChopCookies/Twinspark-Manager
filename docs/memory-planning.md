@@ -207,6 +207,42 @@ by `tsm job`. The rules are checked in this order:
 Timeline readings are added as supporting evidence whatever the cause: MemAvailable below 2 GiB, PSI
 `full` of 10 % or more, and swap-out above 1,000 pages per second.
 
+## TwinSpark's own footprint
+
+0.6 moved the work that does not need the Sparks to the [workstation client](client.md) and trimmed what
+stays: each service imports only what its role needs (the agent and the terminal are plain Starlette, the
+rarely used cookbook and integrations routes load on first use), and the terminal is socket-activated, so
+it holds no memory until someone opens a shell. Measured with `scripts/measure_memory.py` on an x86 dry-run
+sandbox (Python 3.12, unique set size per process, MiB):
+
+| Service | 0.5.1 | 0.6.0 |
+|---|---|---|
+| `tsm-agent` (each node) | 46.0 | 32.1 |
+| controller + gateway (node A) | 54.0 | 51.0 |
+| `tsm-termd` | 45.0 | 30.6 while a shell is open, **0** idle |
+| `tsm-privd` (root, each node) | 42.6 | 17.1 |
+| **node A resident** (agent, controller, privd, terminal switched on but no shell open) | ≈188 | **≈100** |
+| **node B resident** (agent, privd, terminal switched on but no shell open) | ≈134 | **≈49** |
+
+(In 0.5.1 a switched-on terminal service ran all the time; with the terminal off, subtract its 45 MiB
+from the 0.5.1 totals.)
+
+Budgets (provisional until measured on GB10): **≤ 128 MiB on node A, ≤ 80 MiB on node B** for the
+resident TwinSpark services. The planner keeps counting `twinspark-*.service` with its measured
+`memory.current` (bucket "TwinSpark services"), so whatever a Spark really uses is what the plan
+subtracts. To measure on a Spark without touching its configuration or services (a sandbox in a temp
+directory, its own ports, dry-run), from a checkout:
+
+```bash
+/opt/twinspark/venv/bin/python scripts/measure_memory.py           # prints a table
+/opt/twinspark/venv/bin/python scripts/measure_memory.py --termd   # include an open terminal; --json for raw numbers
+sudo /opt/twinspark/venv/bin/python scripts/measure_memory.py --privd   # include the root helper
+```
+
+The rest of the controller is mostly the FastAPI framework itself (its own heap is ≈7 MiB). Moving it
+to plain Starlette like the agent would save about 10 MiB more; that is left for when on-site numbers
+show it matters.
+
 ## What still needs real hardware
 
 Every formula above, and the dry-run timeline, are checked by tests, but none has been compared with

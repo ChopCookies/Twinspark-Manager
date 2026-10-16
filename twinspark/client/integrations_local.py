@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 from fastapi import FastAPI, HTTPException
 
 from .adapters import AdapterError, Endpoint, HermesAdapter, LocalHost, SSHHost, validate_endpoint
+from .app import AdapterIn, TestIn  # module level: FastAPI resolves the (string) annotations from here
 from .session import ClientSession
 from .ssh import SSHError
 
@@ -73,8 +74,6 @@ async def endpoint_for(session: ClientSession, host: str, alias: Optional[str]) 
 
 
 def add_integration_routes(app: FastAPI, session: ClientSession, connected: Callable[[], None]) -> None:
-    from .app import AdapterIn, TestIn
-
     def adapter(req: AdapterIn) -> HermesAdapter:
         host = LocalHost() if req.host == "workstation" else _ssh_host(session)
         try:

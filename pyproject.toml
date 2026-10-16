@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twinspark-manager"
-version = "0.5.1"
+version = "0.6.0"
 description = "Model manager for two NVIDIA DGX Sparks: vLLM recipes, one OpenAI-compatible endpoint, web GUI and CLI"
 readme = "README.md"
 license = "MIT"
@@ -13,11 +13,14 @@ authors = [{ name = "ChopCookies" }]
 keywords = ["vllm", "dgx-spark", "gb10", "llm", "inference", "openai-compatible", "nccl", "roce"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Environment :: Web Environment",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -37,6 +40,8 @@ dependencies = [
 
 [project.optional-dependencies]
 hf = ["huggingface_hub>=0.24"]
+# the workstation client: keys in the system keychain (macOS Keychain, Windows Credential Manager, Secret Service)
+client = ["keyring>=24"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff"]
 
 [project.urls]
