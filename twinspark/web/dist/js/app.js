@@ -56,7 +56,17 @@ async function api(method, path, body) {
     else if (d) msg = JSON.stringify(d);
     throw new ApiError(msg, r.status, d);
   }
+  // the last deployment this browser saw: a switch is refused if it changed meanwhile (another client)
+  if (method === "GET" && path === "/api/v1/status" && data) S.seenActive = (data.active && data.active.revision_id) || null;
   return data;
+}
+/** Body for an activation: an id that makes a retried request harmless, and the deployment we decided on. */
+function activationBody() {
+  const rnd = (globalThis.crypto && crypto.getRandomValues) ? Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, "0")).join("")
+    : Math.random().toString(16).slice(2, 18).padEnd(16, "0");
+  const body = { request_id: "gui-" + rnd };
+  if (S.seenActive !== undefined) body.expected_active = S.seenActive;
+  return body;
 }
 /** A plain-text resource (saved logs) with the same key and error handling as api(). */
 async function apiText(path) {
@@ -454,7 +464,7 @@ async function viewDashboard() {
   onAct({
     activate: async (el) => {
       const name = $("#qs-profile").value; if (!name) return;
-      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(name)}/activate`));
+      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(name)}/activate`, activationBody()));
       toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
     },
     stop: async (el) => { if (await stopFlow(el)) draw().catch(() => { }); },
@@ -707,7 +717,7 @@ async function viewProfiles() {
 }
 
 async function activateFlow(name, revision = "latest", btn = null) {
-  const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/activate${qs({ revision })}`));
+  const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/activate${qs({ revision })}`, activationBody()));
   toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
 }
 async function splitFlow(rows) {

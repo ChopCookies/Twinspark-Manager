@@ -599,3 +599,16 @@ test("the job page draws each node's memory timeline with stage marks and the lo
   assert.match(ok, /the new model took 106\.9 GiB/);
   assert.match(c.run("memTimelineSvg({t:[0], mem_available_gib:[1]}, {})"), /Not enough MemAvailable readings/);
 });
+
+test("an activation carries a request id and the deployment the browser saw", () => {
+  const c = client();
+  const first = c.run("activationBody()");
+  assert.match(first.request_id, /^gui-[0-9a-f]{16}$/);
+  assert.equal("expected_active" in first, false);            // nothing seen yet: no precondition
+  c.run("S.seenActive = null");
+  assert.equal(c.run("activationBody()").expected_active, null);
+  c.run("S.seenActive = 'glm-r1-abc'");
+  const b = c.run("activationBody()");
+  assert.equal(b.expected_active, "glm-r1-abc");
+  assert.notEqual(b.request_id, first.request_id);
+});

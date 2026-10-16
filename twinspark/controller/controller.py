@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from dataclasses import replace
@@ -33,6 +34,15 @@ EVIDENCE_TIMEOUT_S = 150      # saving startup logs never holds up the cleanup l
 
 class DuplicateProfileError(ValueError):
     pass
+
+
+class StaleViewError(RuntimeError):
+    """The caller decided on a deployment that is no longer the active one (two clients raced)."""
+
+
+_ANY = object()            # expected_active not given: no precondition
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,80}\Z")
+JOURNAL_KEY = "inflight_activation"
 
 
 class BusyError(RuntimeError):
@@ -216,7 +226,9 @@ class Controller:
             rev.known_good = True
             self.store.save_profile(p)
         if facts:
-            self.store.kv_set(f"observed:{revision_id}", facts)
+            # merge: other observations (e.g. the startup timeline summary) live in the same record
+            merged = {**(self.store.kv_get(f"observed:{revision_id}") or {}), **facts}
+            self.store.kv_set(f"observed:{revision_id}", merged)
 
     # ---- model specs for the memory planner ------------------------------------
     def set_model_spec(self, repo: str, spec: ModelSpec) -> None:
@@ -418,9 +430,32 @@ class Controller:
 
     # ---- activation ---------------------------------------------------------------
     async def activate(self, profile_name: str, ref: str = "latest", *,
+                       request_id: Optional[str] = None, expected_active: Any = _ANY,
                        _rollback_of: Optional[str] = None, _recovery: bool = False,
                        _maintenance: bool = False) -> Job:
-        """Validate synchronously, then run the activation in the background."""
+        """Validate synchronously, then run the activation in the background.
+
+        ``request_id`` makes the request idempotent: the same id returns the job it already started
+        (a client that lost its connection mid-request can safely send it again). ``expected_active``
+        is the revision id the caller saw as active (None = nothing active); when the deployment changed
+        since, the request is refused instead of switching on a stale view (two clients racing).
+        """
+        if request_id is not None:
+            if not isinstance(request_id, str) or not _REQUEST_ID_RE.match(request_id):
+                raise ValueError("request_id must be 8-80 characters: letters, digits and . _ : -")
+            known = self.store.kv_get(f"activation_request:{request_id}")
+            if known:
+                job = self.store.load_job(known.get("job_id", ""))
+                if job is not None:
+                    if known.get("profile") != profile_name:
+                        raise ValueError(f"request_id {request_id} was already used for another profile")
+                    return job
+        if expected_active is not _ANY:
+            now = (self.active() or {}).get("revision_id")
+            if (expected_active or None) != now:
+                raise StaleViewError(f"the deployment changed since you looked: "
+                                     f"{now or 'nothing'} is active now (you saw {expected_active or 'nothing'}) "
+                                     f"— reload and decide again")
         p = self.get_profile(profile_name)
         if p is not None and not p.revisions:
             raise ValueError(f"profile {profile_name} is not pinned yet — pin it first "
@@ -446,6 +481,13 @@ class Controller:
         await self._lock.acquire()           # taken now so a second request gets 409
         self.current_job = job.job_id
         self.busy_profile = profile_name
+        if request_id is not None:
+            self.store.kv_set(f"activation_request:{request_id}", {"job_id": job.job_id, "profile": profile_name,
+                                                                   "at": time.time()})
+        # the journal: what a controller restart in the middle of this switch has to clean up
+        self.store.kv_set(JOURNAL_KEY, {"job_id": job.job_id, "profile": profile_name,
+                                        "revision_id": rev.revision_id, "previous": self.active(),
+                                        "rollback_of": _rollback_of, "accepted_at": time.time()})
         self._spawn(self._run_activation(job, rev))
         self._audit("controller" if (_rollback_of or _recovery) else "user", "profile.activate",
                     f"profile/{profile_name}", {"revision": rev.revision_id, "job": job.job_id,
@@ -502,7 +544,7 @@ class Controller:
                 model_specs={part.identity.model_repo: self.model_spec(part.identity.model_repo)
                              for part in rev.parts()},
                 poll_interval=self.poll_interval, cancel_check=cancel_check,
-                staging_wait=self._staging_wait,
+                staging_wait=self._staging_wait, store=self.store,
             )
             job.payload["_revision"] = rev
             job.payload["mem_total_gib"] = self._mem_total()
@@ -560,6 +602,8 @@ class Controller:
             self._persist(job)
             job.payload.pop("_revision", None)
             self.store.save_job(job)
+            if (self.store.kv_get(JOURNAL_KEY) or {}).get("job_id") == job.job_id:
+                self.store.kv_set(JOURNAL_KEY, None)
             self._cancel.discard(job.job_id)
             self.current_job = None
             self.busy_profile = None
@@ -720,6 +764,8 @@ class Controller:
 
     # ---- boot / power-cut recovery (spec §36) --------------------------------------
     async def on_startup(self) -> Optional[Job]:
+        journal = self.store.kv_get(JOURNAL_KEY)
+        interrupted: Optional[Job] = None
         for j in self.store.list_jobs(limit=50):
             if j.state in (JobState.RUNNING, JobState.PENDING):
                 j.state = JobState.FAILED
@@ -728,10 +774,58 @@ class Controller:
                 from .phases import settle
                 settle(j, "interrupted by controller restart")
                 self.store.save_job(j)
+                if journal and j.job_id == journal.get("job_id"):
+                    interrupted = j
         await self.refresh_hardware()
         if self.maintenance.blocking():
             self.maintenance.ensure_running()
             return None
+        if journal:
+            return await self._recover_interrupted(journal, interrupted)
+        return await self._resume_active()
+
+    async def _recover_interrupted(self, journal: dict, job: Optional[Job]) -> Optional[Job]:
+        """The controller stopped in the middle of an accepted switch (crash, reboot, power cut).
+
+        Deterministic: if the old model had not been touched yet, nothing changed and the usual
+        start-up path (re-attach what still runs) follows. If the switch had begun stopping the old
+        model, the partial containers are stopped and — as an automatic rollback would have done — the
+        previous deployment is started again; without auto_rollback nothing is started.
+        """
+        from .state_machine import DESTRUCTIVE_FROM, STAGE_ORDER
+        self.store.kv_set(JOURNAL_KEY, None)
+        order = {st.value: i for i, st in enumerate(STAGE_ORDER)}
+        destructive = job is not None and any(order.get(st.stage, -1) >= order[DESTRUCTIVE_FROM.value]
+                                              for st in job.steps)
+        if job is None or not destructive:
+            if job is not None:
+                job.rollback = "the controller restarted before the old model was touched; it keeps serving"
+                self.store.save_job(job)
+            return await self._resume_active()
+        down = await self._wait_for_agents(self.config.startup_wait_s)
+        stopped = await self._stop_everything([])
+        self.store.kv_set("active", None)
+        previous = journal.get("previous") or None
+        target = journal.get("revision_id")
+        restore = bool(self.config.auto_rollback and previous and not journal.get("rollback_of")
+                       and previous.get("revision_id") != target)
+        job.rollback = (f"the controller restarted during the switch: stopped {len(stopped)} partial "
+                        f"container(s)" + (f" (node(s) {', '.join(down)} did not answer)" if down else "")
+                        + (f"; restoring previous {previous['profile']} {previous.get('label', '')}".rstrip()
+                           if restore else "; nothing to restore"))
+        self.store.save_job(job)
+        self._audit("controller", "deployment.recover", f"job/{job.job_id}",
+                    {"stopped": stopped, "restore": previous if restore else None})
+        if not restore or self.busy():
+            return None
+        try:
+            return await self.activate(previous["profile"], previous["revision_id"], _rollback_of=job.job_id)
+        except Exception:  # noqa: BLE001
+            log.exception("restoring %s after an interrupted switch failed", previous)
+            return None
+
+    async def _resume_active(self) -> Optional[Job]:
+        """Start-up without an interrupted switch: re-attach what still runs, autostart otherwise."""
         active = self.active()
         if not active:
             return None

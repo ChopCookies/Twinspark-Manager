@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
-from ..controller.controller import BusyError, Controller, DuplicateProfileError
+from ..controller.controller import BusyError, Controller, DuplicateProfileError, StaleViewError
 from ..controller.launch import LaunchError
 from ..schemas.job import Job
 from ..schemas.profile import ImmutableIdentity, Profile, ProfileDraft, ProfileRevision
@@ -262,11 +262,23 @@ async def prepare(name: str, revision: str = "latest", ctrl: Controller = Depend
         raise HTTPException(422, str(e))
 
 
+class ActivateRequest(BaseModel):
+    """Optional body. ``expected_active``: the revision id the caller saw as active (null = nothing)."""
+    request_id: Optional[str] = None
+    expected_active: Optional[str] = None
+
+
 @router.post("/{name}/activate", response_model=Job, status_code=202)
-async def activate(name: str, revision: str = "latest", ctrl: Controller = Depends(controller_dep)):
+async def activate(name: str, revision: str = "latest", req: Optional[ActivateRequest] = Body(default=None),
+                   ctrl: Controller = Depends(controller_dep)):
+    kw: dict = {}
+    if req is not None:
+        kw["request_id"] = req.request_id
+        if "expected_active" in req.model_fields_set:
+            kw["expected_active"] = req.expected_active
     try:
-        return await ctrl.activate(name, revision)
-    except BusyError as e:
+        return await ctrl.activate(name, revision, **kw)
+    except (BusyError, StaleViewError) as e:
         raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(404 if "not found" in str(e) else 422, str(e))

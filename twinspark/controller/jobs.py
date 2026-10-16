@@ -225,6 +225,17 @@ class ActivationCoordinator:
                     notes.append(f"{part.profile_name}: KV estimate exceeds pool by {-headroom:.1f} "
                                  "GiB/node — vLLM fits fewer parallel sequences")
                 notes.append(f"{part.profile_name}: estimated headroom {headroom:.1f} GiB/node")
+                startup = self._startup_verdicts(part, spec, util, nodes)
+                if startup:
+                    job.payload.setdefault("startup_verdicts", {})[part.profile_name] = startup
+                    for n, v in startup.items():
+                        if v.get("level") == "CRITICAL":
+                            # an estimate, not a measurement: say it before the old model is stopped
+                            warn = (f"WARNING: {part.profile_name}: estimated startup margin on node {n} is "
+                                    f"{v.get('margin_gib')} GiB (CRITICAL) — the startup peak (weights, drafter, "
+                                    f"first prefill) may not fit; see the memory plan before switching")
+                            notes.append(warn)
+                            job.payload.setdefault("startup_warnings", []).append(warn)
             else:
                 notes.append(f"{part.profile_name}: no model spec registered — memory check skipped")
             node_utils.update({n: util for n in nodes})
@@ -234,9 +245,39 @@ class ActivationCoordinator:
         except LaunchError as exc:
             raise RuntimeError(str(exc)) from exc
         job.payload["launch_plan"] = self.plan.model_dump(mode="json")
-        job.payload["warnings"] = [n for n in self.plan.notes if n.startswith("WARNING")]
+        job.payload["warnings"] = ([n for n in self.plan.notes if n.startswith("WARNING")]
+                                   + list(job.payload.get("startup_warnings") or []))
         return "plan ready (" + ", ".join(f"{n}: gpu_memory_utilization={u:.2f}"
                                           for n, u in node_utils.items()) + "); " + "; ".join(notes)
+
+    def _startup_verdicts(self, part, spec: ModelSpec, util: float, nodes: list[str]) -> dict[str, dict]:
+        """Per-node startup verdict from the drafter-aware plan (planner.plan_node), using the last
+        hardware facts the controller saw. Empty when the store is not available."""
+        if self.store is None:
+            return {}
+        from .planner import drafter_inputs
+
+        def lookup(repo: str) -> Optional[ModelSpec]:
+            d = self.store.kv_get(f"model_spec:{repo}")
+            return ModelSpec(**{k: v for k, v in d.items() if k in ModelSpec.__dataclass_fields__}) if d else None
+        s, a = part.draft.simple, part.draft.advanced
+        try:
+            drafters = drafter_inputs(a, lookup)
+            out = {}
+            for n in nodes:
+                facts = self.store.kv_get(f"hardware:{n}") or {}
+                plan = self.planner.plan_node(
+                    spec=spec, quant=s.quantization, context_length=s.planning_context(),
+                    concurrency=a.max_num_seqs or s.concurrency, topology=s.topology, node_id=n,
+                    backend="ray" if self.launch.resolve_backend(part).value == "ray" else "native",
+                    kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode, gpu_memory_utilization=util,
+                    facts=facts if isinstance(facts, dict) else {}, drafters=drafters,
+                    max_num_batched_tokens=a.max_num_batched_tokens, chunked_prefill=a.chunked_prefill)
+                out[n] = {k: plan.startup.get(k) for k in ("ok", "level", "margin_gib", "peak_gib")}
+            return out
+        except Exception:  # noqa: BLE001 - advisory only: never block a switch on the advisory model
+            log.debug("startup verdict failed", exc_info=True)
+            return {}
 
     async def _resolve(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         nodes = self.plan.nodes
