@@ -214,3 +214,20 @@ async def test_hermes_adapter_over_ssh(tmp_path):
         assert KEY not in everything_text(det, preview, result, checks, launched)
     finally:
         kill_fake_gateways(tmp_path)
+
+
+async def test_windows_command_line_comes_from_wmi(tmp_path):
+    """Windows has no /proc and no ps: Stop and Restart need the command line to tell TwinSpark's own
+    Hermes gateway from a process that reused its pid. A fake powershell stands in for WMI here."""
+    if os.name == "nt":
+        pytest.skip("the fake powershell is a POSIX script")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    shell = bindir / "powershell"
+    shell.write_text('#!/bin/sh\n'
+                     'case "$*" in *"ProcessId=4242"*) echo "C:\\\\hermes\\\\hermes.exe gateway run";; esac\n')
+    shell.chmod(0o755)
+    host = LocalHost(environ={"PATH": str(bindir), "USERPROFILE": str(tmp_path)}, home=str(tmp_path),
+                     platform="windows")
+    assert await host.process_args(4242) == "C:\\hermes\\hermes.exe gateway run"
+    assert await host.process_args(4343) is None

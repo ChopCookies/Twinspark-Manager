@@ -36,8 +36,8 @@ deployment where it is.
   exact chat command, restore any backup, disconnect. The context length comes from the deployed model;
   below Hermes's 64k minimum it is refused. Only the inference key is ever written; the management key
   is refused. [docs/agent-integrations.md](docs/agent-integrations.md#hermes-agent-lifecycle)
-- **CLI:** `tsm client add | list | remove | connect | env`; `eval "$(tsm client env NAME)"` points the
-  `tsm` CLI at the client's forward.
+- **CLI:** `tsm client add | list | remove | connect | env | ports`; `eval "$(tsm client env NAME)"` points
+  the `tsm` CLI at the client's forward.
 
 ### Lean services on the Sparks
 
@@ -45,7 +45,9 @@ deployment where it is.
   `tsm serve` no longer loads the whole CLI, shared container definitions moved to `twinspark.containers`,
   and the cookbook and integrations routes load on first use.
 - **The terminal is socket-activated** (`twinspark-terminal.socket`): it uses no memory until someone opens
-  a shell and exits after 15 idle minutes. `sudo tsm remote enable terminal` moves an existing install to it.
+  a shell and exits after 15 idle minutes. Status checks ask systemd about the socket instead of connecting
+  to it (which would start the terminal). `sudo tsm remote enable terminal` moves an existing install to it
+  (stopping the always-on 0.5 terminal first).
 - Measured on an x86 dry-run sandbox (unique set size): node A ≈188 → ≈100 MiB, node B ≈134 → ≈49 MiB with
   the terminal switched on but idle. Provisional budgets: 128 MiB on A, 80 MiB on B.
   `scripts/measure_memory.py` measures a Spark without touching its services.
@@ -77,7 +79,8 @@ deployment where it is.
   middle (crash, reboot, power cut), recovery is deterministic: before the old model was touched, nothing
   changed and it keeps serving; after that, the partial containers are stopped and — with `auto_rollback` —
   the previous deployment is started again.
-- One writer: cancel is refused while a failed start is still cleaning up.
+- One writer: while a restarted controller recovers an interrupted switch, a new switch is refused (409)
+  instead of being torn down by the recovery; cancel is refused while a failed start is still cleaning up.
 
 ### Compatibility
 

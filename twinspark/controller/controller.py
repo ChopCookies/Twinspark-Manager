@@ -793,18 +793,27 @@ class Controller:
         previous deployment is started again; without auto_rollback nothing is started.
         """
         from .state_machine import DESTRUCTIVE_FROM, STAGE_ORDER
-        self.store.kv_set(JOURNAL_KEY, None)
         order = {st.value: i for i, st in enumerate(STAGE_ORDER)}
         destructive = job is not None and any(order.get(st.stage, -1) >= order[DESTRUCTIVE_FROM.value]
                                               for st in job.steps)
         if job is None or not destructive:
+            self.store.kv_set(JOURNAL_KEY, None)
             if job is not None:
                 job.rollback = "the controller restarted before the old model was touched; it keeps serving"
                 self.store.save_job(job)
             return await self._resume_active()
-        down = await self._wait_for_agents(self.config.startup_wait_s)
-        stopped = await self._stop_everything([])
-        self.store.kv_set("active", None)
+        # the single writer: while the agents come back and the partial containers are stopped, the API is
+        # already answering, and a switch started meanwhile would be torn down here — refuse it (409)
+        async with self._lock:
+            self.current_job, self.busy_profile = job.job_id, journal.get("profile")
+            try:
+                down = await self._wait_for_agents(self.config.startup_wait_s)
+                stopped = await self._stop_everything([])
+                self.store.kv_set("active", None)
+                # cleared only now: a restart during the wait or the stop runs this recovery again
+                self.store.kv_set(JOURNAL_KEY, None)
+            finally:
+                self.current_job, self.busy_profile = None, None
         previous = journal.get("previous") or None
         target = journal.get("revision_id")
         restore = bool(self.config.auto_rollback and previous and not journal.get("rollback_of")

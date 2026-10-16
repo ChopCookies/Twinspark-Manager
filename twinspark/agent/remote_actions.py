@@ -55,6 +55,22 @@ def _tcp_open(host: str, port: int, timeout: float = 0.6) -> bool:
         return False
 
 
+def _terminal_ready(host: str, port: int) -> bool:
+    """Whether the Remote terminal would answer, without starting it.
+
+    With socket activation (0.6) systemd holds the port, and any TCP connection — a probe included —
+    starts ``twinspark-terminal.service``, which then stays for its idle time. So ask systemd first: a
+    listening socket means ready, unless the service last failed to start. Only an always-on terminal
+    (0.5 units, the demo) is probed over TCP.
+    """
+    systemctl = privops._which("systemctl")
+    rc, out, _ = privops.RUN([systemctl, "is-active", "twinspark-terminal.socket"], 4)
+    if rc == 0 and out.strip() == "active":
+        rc, out, _ = privops.RUN([systemctl, "is-failed", "twinspark-terminal.service"], 4)
+        return not (rc == 0 and out.strip() == "failed")
+    return _tcp_open(host, port)
+
+
 def build(actions: "AgentActions") -> dict[str, Callable[[dict], Any]]:
     cfg = actions.config
     rm = cfg.remote_mgmt
@@ -97,7 +113,7 @@ def build(actions: "AgentActions") -> dict[str, Callable[[dict], Any]]:
             "kernel": platform.release(), "boot_id": _boot_id(), "uptime_s": uptime,
             "booted_at": time.time() - uptime if uptime is not None else None, "loadavg": _loadavg(),
             "policy": pol.as_dict(), "enabled": pol.enabled,
-            "terminal_service": _tcp_open(host, rm.terminal_port),
+            "terminal_service": _terminal_ready(host, rm.terminal_port),
             "privd": actions.privd.available(),
             "tools": {n: bool(which(n, path="/usr/sbin:/usr/bin:/sbin:/bin"))
                       for n in ("efibootmgr", "ethtool", "systemd-run", "journalctl")},

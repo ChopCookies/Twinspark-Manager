@@ -84,6 +84,7 @@ class ClientSession:
         self._node_at = 0.0
         self._node_lock = asyncio.Lock()
         self._connect_task: Optional[asyncio.Task] = None
+        self._switch_lock = asyncio.Lock()     # connect / disconnect never interleave
 
     # ---- addresses ------------------------------------------------------------------------------
     def _forward(self, label: str) -> Optional[int]:
@@ -149,12 +150,20 @@ class ClientSession:
         conn = self.connections.get(conn_id)
         if conn is None:
             raise KeyError(conn_id)
-        await self.disconnect()
-        self.current = conn
-        self._set("connecting", None, f"connecting to {conn.name} ({conn.host})")
-        self._connect_task = asyncio.create_task(self._connect(conn))
+        # one connection at a time: two tabs (or Connect clicked twice) must not each start a tunnel
+        async with self._switch_lock:
+            await self._disconnect_locked()
+            self.current = conn
+            self._set("connecting", None, f"connecting to {conn.name} ({conn.host})")
+            task = self._connect_task = asyncio.create_task(self._connect(conn))
         if wait:
-            await asyncio.shield(self._connect_task)
+            await asyncio.wait([task])
+            while task is not self._connect_task:      # superseded by a newer connect: report that one
+                async with self._switch_lock:
+                    task = self._connect_task
+                if task is None:                       # or by a disconnect
+                    break
+                await asyncio.wait([task])
         return await self.status()
 
     async def _connect(self, conn: Connection) -> None:
@@ -265,6 +274,10 @@ class ClientSession:
         self._node_at = 0.0                   # re-ask node A after any transport change
 
     async def disconnect(self) -> None:
+        async with self._switch_lock:
+            await self._disconnect_locked()
+
+    async def _disconnect_locked(self) -> None:
         task, self._connect_task = self._connect_task, None
         if task is not None and not task.done():
             task.cancel()

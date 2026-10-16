@@ -141,16 +141,20 @@ class RemoteService:
         host = agent.hostname or "127.0.0.1"
         agent_port = agent.port or (443 if agent.scheme == "https" else 80)
         ssh_host = ep.ssh_host or ep.qsfp_ip or host
-        agent_ok, ssh_ok, term_ok = await asyncio.gather(
-            tcp_open(host, agent_port), tcp_open(ssh_host, ep.ssh_port), tcp_open(host, ep.terminal_port))
+        agent_ok, ssh_ok = await asyncio.gather(tcp_open(host, agent_port), tcp_open(ssh_host, ep.ssh_port))
         answers = False
         detail = ""
+        term_ok: Optional[bool] = None
         if agent_ok:
             try:
-                await self.node(node).call("remote_status", timeout=8)
+                st = await self.node(node).call("remote_status", timeout=8)
                 answers = True
+                term_ok = bool((st or {}).get("terminal_service"))
             except AgentActionError as exc:
                 detail = exc.detail
+        if term_ok is None:
+            # only when the agent cannot say: a connection to a socket-activated terminal starts it
+            term_ok = await tcp_open(host, ep.terminal_port)
         link = None
         peer = "A" if node != "A" else "B"
         if not agent_ok and not ssh_ok and node != self.ctrl.config.node.node_id and peer in self.ctrl.agents:

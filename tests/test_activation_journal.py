@@ -166,3 +166,41 @@ async def test_a_restart_before_the_old_model_was_touched_keeps_it_serving(clust
 async def test_a_finished_switch_leaves_no_journal(cluster):
     await _serving(cluster)
     assert cluster.controller.store.kv_get(JOURNAL_KEY) is None
+
+
+async def test_a_switch_requested_while_recovery_waits_is_refused_not_torn_down(cluster, monkeypatch):
+    """The API answers while recovery still waits for the agents: a switch started then would be stopped by
+    the recovery a moment later. Recovery holds the single-writer lock, so it is refused (409) instead."""
+    from twinspark.controller.controller import BusyError
+    await _serving(cluster)
+    c = cluster.controller
+    c.create_profile(draft("new", Topology.TP2, repo="org/model-b"))
+    c.create_profile(draft("third", Topology.TP2, repo="org/model-c"))
+    entered, real = await _hang(monkeypatch, "_wait_loaded")
+    job = await c.activate("new")
+    await asyncio.wait_for(entered.wait(), 10)
+    monkeypatch.setattr(ActivationCoordinator, "_wait_loaded", real)
+    c2 = _restarted(cluster)
+    release = asyncio.Event()
+
+    async def slow_wait(timeout_s):                       # node B still booting
+        await release.wait()
+        return []
+    c2._wait_for_agents = slow_wait
+    startup = asyncio.create_task(c2.on_startup())
+    for _ in range(100):
+        if c2.busy():
+            break
+        await asyncio.sleep(0.01)
+    assert c2.busy() and c2.current_job == job.job_id
+    with pytest.raises(BusyError):
+        await c2.activate("third")
+    assert c2.store.kv_get(JOURNAL_KEY)["job_id"] == job.job_id      # a second crash now recovers again
+    release.set()
+    rollback = await startup
+    assert rollback is not None and (await _wait(c2, rollback.job_id)).state.value == "completed"
+    assert c2.active()["profile"] == "old" and c2.store.kv_get(JOURNAL_KEY) is None
+    third = await c2.activate("third")                    # afterwards the operator's switch goes through
+    assert (await _wait(c2, third.job_id)).state.value == "completed" and c2.active()["profile"] == "third"
+    for t in list(c._tasks):
+        t.cancel()

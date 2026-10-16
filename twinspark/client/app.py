@@ -27,10 +27,12 @@ import logging
 import secrets
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
@@ -74,6 +76,11 @@ def _loopback_host(host_header: str) -> bool:
         return False
 
 
+def _clean(value: object, limit: int) -> str:
+    """Printable, JSON/UTF-8 safe, bounded text for error payloads."""
+    return str(value)[:limit].encode("utf-8", "replace").decode("utf-8", "replace")
+
+
 def _same_origin(origin: Optional[str], host: str) -> bool:
     return origin is not None and origin.split("://", 1)[-1].rstrip("/") == host
 
@@ -94,6 +101,8 @@ class ConnectionPatch(BaseModel):
     ssh_user: Optional[str] = Field(None, max_length=32)
     ssh_port: Optional[int] = Field(None, ge=1, le=65535)
     identity_file: Optional[str] = Field(None, max_length=1024)
+    # the local ends of the forwards; null = pick again at the next connect
+    local_api_port: Optional[int] = Field(None, ge=1024, le=65535)
     local_gateway_port: Optional[int] = Field(None, ge=1024, le=65535)
 
 
@@ -140,7 +149,7 @@ class ImportIn(BaseModel):
 
 
 def create_client_app(session: ClientSession, local_key: str, *, web_dir: Optional[Path] = None,
-                      autoconnect: bool = False) -> FastAPI:
+                      autoconnect: bool = False, launch_code: Optional[str] = None) -> FastAPI:
     web = Path(web_dir) if web_dir else WEB_ASSETS
 
     async def lifespan(app: FastAPI):
@@ -153,6 +162,19 @@ def create_client_app(session: ClientSession, local_key: str, *, web_dir: Option
     app = FastAPI(title="TwinSpark client", version=__version__, docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=contextlib.asynccontextmanager(lifespan))
     app.state.session = session
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        # FastAPI's default handler echoes the submitted value: a too-long password or key would come
+        # back in the response. Report where and why, never the value.
+        errors = [{"loc": [_clean(x, 60) for x in e.get("loc", ())], "msg": _clean(e.get("msg", ""), 300),
+                   "type": _clean(e.get("type", ""), 60)} for e in exc.errors()[:20]]
+        return JSONResponse(status_code=422, content={"detail": errors})
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception):
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": f"internal error ({type(exc).__name__})"})
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -175,6 +197,21 @@ def create_client_app(session: ClientSession, local_key: str, *, web_dir: Option
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["Referrer-Policy"] = "no-referrer"
         return resp
+
+    # ---- the browser's first visit ----------------------------------------------------------------
+    launch = {"code": launch_code}
+
+    @app.get("/launch/{code}", include_in_schema=False)
+    def open_gui(code: str):
+        """The address `tsm client` gives the browser it starts: a code that works once and turns into the
+        page with the session key in its fragment. A program's command line can be read by other users
+        of this computer; the key itself never appears in one."""
+        if launch["code"] is not None and tokens_equal(code, launch["code"]):
+            launch["code"] = None
+            target = f"/#k={local_key}"
+        else:
+            target = "/"
+        return RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
 
     def conn_or_404(conn_id: str) -> Connection:
         c = session.connections.get(conn_id)
@@ -277,6 +314,8 @@ def create_client_app(session: ClientSession, local_key: str, *, web_dir: Option
             added = await ssh.install_key_with_password(c, req.password, public, home=session.home)
         except ssh.SSHError as exc:
             raise bad(exc, 401 if exc.kind == "auth" else 502) from None
+        except ValueError as exc:            # e.g. a line break in the password; the message never holds it
+            raise bad(exc) from None
         return {"installed": added, "public_key": public}
 
     @app.post("/api/v1/client/connections/{conn_id}/connect")
@@ -365,7 +404,7 @@ def create_client_app(session: ClientSession, local_key: str, *, web_dir: Option
     # ---- everything else: node A --------------------------------------------------------------------
     @app.websocket("/api/v1/remote/terminal/ws")
     async def terminal_ws(ws: WebSocket):
-        await _proxy_ws(ws, session)
+        await _proxy_ws(ws, session, local_key)
 
     @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     async def to_node(path: str, request: Request):
@@ -417,11 +456,12 @@ async def _proxy(request: Request, session: ClientSession) -> Response:
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=out_headers)
 
 
-async def _proxy_ws(ws: WebSocket, session: ClientSession) -> None:
+async def _proxy_ws(ws: WebSocket, session: ClientSession, local_key: str) -> None:
     """The browser terminal: check the browser like the node would, then bridge to node A's socket."""
     host = ws.headers.get("host", "")
     origin = ws.headers.get("origin")
-    if not _loopback_host(host) or (origin is not None and not _same_origin(origin, host)):
+    if (not _loopback_host(host) or (origin is not None and not _same_origin(origin, host))
+            or not tokens_equal(ws.query_params.get("client_key"), local_key)):
         await ws.close(code=1008)
         return
     base = session.node_url()
@@ -431,7 +471,9 @@ async def _proxy_ws(ws: WebSocket, session: ClientSession) -> None:
     from websockets.asyncio.client import connect
     from websockets.exceptions import ConnectionClosed
 
-    target = "ws" + base[4:] + "/api/v1/remote/terminal/ws" + (f"?{ws.url.query}" if ws.url.query else "")
+    # the session key is this client's, not node A's: it is not passed on
+    query = urlencode([(k, v) for k, v in ws.query_params.multi_items() if k != "client_key"])
+    target = "ws" + base[4:] + "/api/v1/remote/terminal/ws" + (f"?{query}" if query else "")
     try:
         # no Origin upstream: the ticket in the query authenticates, and node A treats a socket without
         # an Origin as "not a browser" (the browser's Origin was checked above)

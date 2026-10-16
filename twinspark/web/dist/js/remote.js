@@ -62,7 +62,8 @@ async function openTerminal(node) {
   try { t = await POST("/api/v1/remote/terminal/ticket", { node, cols: term.cols, rows: term.rows }); }
   catch (e) { term.dispose(); closeTerminal(); throw e; }
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}${t.ws_path}?ticket=${enc(t.ticket)}`);
+  // through the workstation client the socket also carries this tab's session key (a browser cannot set headers)
+  const ws = new WebSocket(`${proto}//${location.host}${t.ws_path}?ticket=${enc(t.ticket)}${S.client ? "&client_key=" + enc(S.key) : ""}`);
   ws.binaryType = "arraybuffer";
   R.ws = ws; R.term = term; R.fit = fit;
   const text = new TextEncoder();

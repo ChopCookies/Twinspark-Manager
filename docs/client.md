@@ -49,7 +49,9 @@ tsm client          # opens http://127.0.0.1:18765/#k=… in your browser
 ```
 
 The part after `#k=` is a key for this launch only. It stays in that browser tab and leaves the address
-bar at once; another tab or program on this computer cannot use the client without it. Keep
+bar at once; another tab or program on this computer cannot use the client without it. (The browser
+`tsm client` starts gets a one-time address that turns into this one, so the key never appears on a
+command line; open the printed address yourself if no browser came up.) Keep
 `tsm client` running while you use the GUI or apps connected through it (Ctrl-C ends it).
 
 On **Connection → Add a Spark** enter node A's address (LAN IP, hostname or Tailscale address) and the
@@ -94,9 +96,11 @@ eval "$(tsm client env home)" && tsm status     # the tsm CLI through the client
 
 SSH is the recommended path: it needs no listener changes and authenticates the host. The forwards
 use node A's port numbers locally when they are free (`8443`, `8000`), otherwise free ports; the
-chosen ports are kept, so apps configured once keep working after a restart. The SSH session sends
-keep-alives (a dead link is noticed within about 45 seconds) and reconnects with a back-off of 1 to 30
-seconds when the network drops.
+chosen ports are kept, so apps configured once keep working after a restart. If another program
+takes one of them later, choose others with **Ports** on the Connection page or
+`tsm client ports home --gateway 18000` (`auto` picks a free one); they apply at the next connect. The
+SSH session sends keep-alives (a dead link is noticed within about 45 seconds) and reconnects with a
+back-off of 1 to 30 seconds when the network drops.
 
 ## The endpoint for apps on this computer
 

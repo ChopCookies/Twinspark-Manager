@@ -163,8 +163,9 @@ async def test_a_refused_login_offers_the_one_time_key_install(session, tmp_path
 
 
 async def test_the_terminal_socket_checks_the_browser_then_bridges_to_node_a(session):
-    """The browser terminal's WebSocket: a foreign Origin or Host is refused, no connection closes it, and a
-    connected client relays both ways to node A's socket without passing the browser's Origin on."""
+    """The browser terminal's WebSocket: a foreign Origin or Host, or a missing session key is refused, no
+    connection closes it, and a connected client relays both ways to node A's socket without passing the
+    browser's Origin or the session key on."""
     import asyncio
 
     import uvicorn
@@ -194,14 +195,17 @@ async def test_the_terminal_socket_checks_the_browser_then_bridges_to_node_a(ses
     try:
         while not all(s.started for s in servers):
             await asyncio.sleep(0.05)
-        url = f"ws://127.0.0.1:{client_port}/api/v1/remote/terminal/ws?ticket=t-123"
+        bare = f"ws://127.0.0.1:{client_port}/api/v1/remote/terminal/ws?ticket=t-123"
+        url = f"{bare}&client_key={KEY}"
         own = f"http://127.0.0.1:{client_port}"
         # refused before the handshake completes (the browser sees a socket that never opened)
-        for kw in ({"origin": "https://evil.example"},                  # another web page
-                   {"additional_headers": {"Host": "evil.example"}, "origin": own},   # DNS rebinding
-                   {"origin": own}):                                    # fine, but no Spark connected yet
+        for u, kw in ((url, {"origin": "https://evil.example"}),             # another web page
+                      (url, {"additional_headers": {"Host": "evil.example"}, "origin": own}),   # DNS rebinding
+                      (bare, {}),                                       # no session key (any local program)
+                      (bare + "&client_key=wrong", {"origin": own}),
+                      (url, {"origin": own})):                          # fine, but no Spark connected yet
             with pytest.raises(InvalidStatus) as refused:
-                async with connect(url, **kw):
+                async with connect(u, **kw):
                     pass
             assert refused.value.response.status_code == 403
         conn = session.connections.add(Connection(id="", name="lab", mode="direct", host="127.0.0.1",
@@ -215,3 +219,109 @@ async def test_the_terminal_socket_checks_the_browser_then_bridges_to_node_a(ses
         for s in servers:
             s.should_exit = True
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_overlapping_connects_leave_exactly_one_tunnel(tmp_path, monkeypatch):
+    """Two tabs, or Connect clicked while a connect is still running: the earlier attempt is ended and its
+    tunnel stopped; no ssh process is left behind that nothing would stop."""
+    import asyncio
+
+    from twinspark.client import session as session_mod
+    from twinspark.client.ssh import RemoteResult
+
+    monkeypatch.setenv("TSM_CLIENT_KEYRING", "off")
+    monkeypatch.setattr(session_mod, "known_keys", lambda *a, **k: [object()])   # host keys confirmed
+    tunnels = []
+
+    class SlowTunnel:
+        def __init__(self, conn, forwards, *, home, on_change=None):
+            self.conn, self.forwards, self.state, self.last_error, self.stopped = conn, forwards, "stopped", None, False
+            tunnels.append(self)
+
+        async def start(self):
+            self.state = "up"
+
+        async def wait_for(self, *states, timeout=None):
+            await asyncio.sleep(0.05)
+            return self.state
+
+        async def stop(self):
+            await asyncio.sleep(0.2)                      # ssh takes a moment to exit
+            self.stopped, self.state = True, "stopped"
+
+        def snapshot(self):
+            return {"state": self.state, "forwards": []}
+
+    async def run(conn, argv, *, home, timeout=30, input=None):
+        await asyncio.sleep(0.05)
+        return RemoteResult(0, "node: {node_id: A, role: controller}\n", "")
+
+    def node(request):
+        if request.url.path == "/api/v1/health":
+            return httpx.Response(200, json={"version": "0.6.0"})
+        return httpx.Response(200, json={"nodes": {}, "routes": []})
+
+    s = ClientSession(home=tmp_path / "client", run=run, tunnel_factory=SlowTunnel,
+                      http=httpx.AsyncClient(transport=httpx.MockTransport(node)))
+    ids = []
+    for name in ("one", "two", "three"):
+        c = s.connections.add(Connection(id="", name=name, host=f"spark-{name}.lan", ssh_user="spark"))
+        s.creds.set(c.id, "management_key", "k" * 20)
+        ids.append(c.id)
+    assert (await s.connect(ids[0]))["phase"] == "connected"
+    results = await asyncio.gather(s.connect(ids[1]), s.connect(ids[2]))
+    assert all(r["connection"]["id"] == s.current.id for r in results)          # both report the winner
+    assert s.phase == "connected" and s.tunnel.conn.id == s.current.id
+    running = [t for t in tunnels if not t.stopped]
+    assert running == [s.tunnel]
+    await s.aclose()
+    assert all(t.stopped for t in tunnels)
+
+
+async def test_errors_never_echo_a_password_or_key(session):
+    conn = session.connections.add(Connection(id="", name="lab", host="spark-a.lan", ssh_user="spark"))
+    app = create_client_app(session, KEY)
+    async with client_for(app) as c:
+        secret = "hunter2-" + "x" * 1100                      # longer than the field allows
+        r = await c.post(f"/api/v1/client/connections/{conn.id}/key/install", json={"password": secret})
+        assert r.status_code == 422 and "hunter2" not in r.text
+        r = await c.put(f"/api/v1/client/connections/{conn.id}/credentials", json={"management_key": secret})
+        assert r.status_code == 422 and "hunter2" not in r.text
+        r = await c.post(f"/api/v1/client/connections/{conn.id}/key/install", json={"password": "hunter2\nx"})
+        assert r.status_code == 422 and "line breaks" in r.json()["detail"] and "hunter2" not in r.text
+
+
+async def test_the_local_forward_ports_can_be_changed_or_reset(session, capsys, monkeypatch):
+    conn = session.connections.add(Connection(id="", name="lab", host="spark-a.lan", ssh_user="spark",
+                                              local_api_port=8443, local_gateway_port=8000))
+    app = create_client_app(session, KEY)
+    async with client_for(app) as c:
+        r = await c.patch(f"/api/v1/client/connections/{conn.id}", json={"local_gateway_port": 18000})
+        assert r.status_code == 200 and r.json()["local_gateway_port"] == 18000 and r.json()["local_api_port"] == 8443
+        r = await c.patch(f"/api/v1/client/connections/{conn.id}", json={"local_api_port": None})
+        assert r.json()["local_api_port"] is None                       # picked again at the next connect
+        r = await c.patch(f"/api/v1/client/connections/{conn.id}", json={"local_api_port": 18000})
+        assert r.status_code == 422 and "must be different" in r.json()["detail"]
+    from twinspark import cli_client
+    monkeypatch.setattr(cli_client, "_session", lambda: session)
+    import argparse
+    cli_client.cmd_client(argparse.Namespace(action="ports", name="lab", api="18001", gateway="auto"))
+    assert session.connections.get(conn.id).local_api_port == 18001
+    assert session.connections.get(conn.id).local_gateway_port is None
+    assert "reconnect to use them" in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="not a port"):
+        cli_client.cmd_client(argparse.Namespace(action="ports", name="lab", api="80", gateway=None))
+
+
+async def test_the_browser_is_started_with_a_one_time_code_not_the_key(session):
+    app = create_client_app(session, KEY, launch_code="launch-code-0123456789abcdef")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:18765") as c:
+        r = await c.get("/launch/wrong-code")
+        assert r.status_code == 303 and r.headers["location"] == "/"
+        r = await c.get("/launch/launch-code-0123456789abcdef")
+        assert r.status_code == 303 and r.headers["location"] == f"/#k={KEY}"
+        assert r.headers["cache-control"] == "no-store"
+        r = await c.get("/launch/launch-code-0123456789abcdef")             # used up
+        assert r.headers["location"] == "/"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://evil.example") as e:
+            assert (await e.get("/launch/x")).status_code == 403             # loopback Host only, as everywhere

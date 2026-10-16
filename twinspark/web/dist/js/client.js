@@ -155,7 +155,7 @@ function connectionHtml(info, st, probe) {
     const on = cur && cur.id === c.id;
     return `<div class="item ${on && st.states.client_connected ? "active" : ""}" data-key="${esc(c.id)}"><div class="l"><div class="t">${esc(c.name)} ${tag(MODE_LABEL[c.mode] || c.mode, "muted")}${on ? tag(clientPhase(st).text, clientPhase(st).cls || "muted") : ""}</div>
       <div class="d mono">${esc(connectionWhere(c))}</div><div class="d">${c.last_connected_at ? "last connected " + esc(ago(c.last_connected_at)) : "never connected"}${c.local_gateway_port ? ` · local gateway 127.0.0.1:${esc(c.local_gateway_port)}` : ""}</div></div>
-      <div class="row actions">${on && st.phase !== "idle" ? "" : `<button class="btn primary sm" data-act="conn-connect" data-id="${esc(c.id)}">Connect</button>`}${c.mode !== "direct" ? `<button class="btn sm" data-act="conn-probe" data-id="${esc(c.id)}">Check setup</button>` : ""}<button class="btn sm" data-act="conn-keys" data-id="${esc(c.id)}">Keys</button><button class="btn ghost sm" data-act="conn-remove" data-id="${esc(c.id)}">Remove</button></div></div>`;
+      <div class="row actions">${on && st.phase !== "idle" ? "" : `<button class="btn primary sm" data-act="conn-connect" data-id="${esc(c.id)}">Connect</button>`}${c.mode !== "direct" ? `<button class="btn sm" data-act="conn-probe" data-id="${esc(c.id)}">Check setup</button>` : ""}<button class="btn sm" data-act="conn-keys" data-id="${esc(c.id)}">Keys</button>${c.mode !== "direct" ? `<button class="btn sm" data-act="conn-ports" data-id="${esc(c.id)}">Ports</button>` : ""}<button class="btn ghost sm" data-act="conn-remove" data-id="${esc(c.id)}">Remove</button></div></div>`;
   }).join("")}</div>` : `<div class="card" data-key="conns">${empty("No Spark yet", "Add node A by its address: the LAN IP or hostname, or its Tailscale address.")}<div class="row"><button class="btn primary" data-act="conn-add">Add a Spark</button></div></div>`;
   if (probe) {
     html += `<h3 class="section-title">Setup of ${esc(probe.name)}</h3>`;
@@ -314,6 +314,20 @@ async function viewConnection() {
       const c = byId(btn.dataset.id); if (!c) return;
       const r = await busy(btn, () => POST(`/api/v1/client/connections/${enc(c.id)}/probe`));
       probe = { name: c.name, checks: r.checks, error: r.error }; await draw();
+    },
+    "conn-ports": async (btn) => {
+      const c = byId(btn.dataset.id); if (!c) return;
+      const v = await formBox(`Local ports for ${c.name}`, [
+        { id: "gw", label: "Model gateway (what apps on this computer use)", value: c.local_gateway_port || "", placeholder: "automatic" },
+        { id: "api", label: "Management API", value: c.local_api_port || "", placeholder: "automatic" },
+      ], { label: "Save", intro: "The local ends of the SSH forwards. Leave a field empty to pick a free port at the next connect. Changes apply when you connect again; apps configured with the old gateway port need the new one.",
+        validate: (vals) => {
+          for (const k of ["gw", "api"]) if (vals[k] && !(/^\d+$/.test(vals[k]) && +vals[k] >= 1024 && +vals[k] <= 65535)) throw new Error("A port is a number from 1024 to 65535, or empty.");
+          return true;
+        } });
+      if (!v) return;
+      await api("PATCH", `/api/v1/client/connections/${enc(c.id)}`, { local_gateway_port: v.gw ? +v.gw : null, local_api_port: v.api ? +v.api : null });
+      toast("ports saved — they apply at the next connect"); await draw();
     },
     "conn-keys": async (btn) => { const c = byId(btn.dataset.id); if (c && await keysFlow(c, null)) { toast("keys saved"); await draw(); } },
     "conn-remove": async (btn) => {

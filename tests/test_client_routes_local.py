@@ -153,3 +153,19 @@ async def test_recipe_conversion_runs_here_and_only_the_draft_reaches_node_a(tmp
             r = await c.post("/api/v1/cookbook/import-recipe", json={"url": "http://x/y.yaml"})
             assert r.status_code == 422 and "https" in r.json()["detail"]
         await session.aclose()
+
+
+async def test_hermes_on_node_a_uses_the_gateway_as_node_a_reaches_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("TSM_CLIENT_KEYRING", "off")
+    session = ClientSession(home=tmp_path / "client")
+
+    async def models():
+        return [{"id": "glm", "max_model_len": 131072, "twinspark": {"revision_id": "r1"}}]
+    session.models = models
+    session.node_cfg = {"gateway_port": 8000}
+    ep = await integrations_local.endpoint_for(session, "node-a", None)
+    assert ep.base_url == "http://127.0.0.1:8000/v1" and ep.alias == "glm" and ep.context_length == 131072
+    session.node_cfg = {"gateway_port": 8443, "gateway_tls": True, "gateway_forward_host": "10.0.0.5"}
+    assert (await integrations_local.endpoint_for(session, "node-a", "glm")).base_url == "https://10.0.0.5:8443/v1"
+    session.node_cfg = {"gateway_port": 8000, "gateway_forward_host": "fd00::5"}
+    assert (await integrations_local.endpoint_for(session, "node-a", "glm")).base_url == "http://[fd00::5]:8000/v1"

@@ -97,6 +97,7 @@ async def test_the_client_gui_connects_to_node_a_and_passes_its_pages_through(br
             # node A's own GUI stays as it was: no client pages
             node_page = await browser.new_page()
             await node_page.goto(f"{demo.url}/")
+            await node_page.wait_for_selector("#gate:not(.hidden)", timeout=15000)
             await node_page.evaluate("k => { sessionStorage.setItem('tsm_key', k); }", demo.key)
             await node_page.reload()
             await node_page.wait_for_selector("#nav a", timeout=15000)

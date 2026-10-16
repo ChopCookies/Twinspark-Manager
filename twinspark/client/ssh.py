@@ -165,7 +165,8 @@ def ssh_failure(stderr: str, *, host: str, port: int = 22, user: str = "") -> SS
                "is right and that this computer is on the same network (or signed in to the tailnet).")
     elif kind == "port-in-use":
         msg = ("A local port of the tunnel is already used by another program on this computer. Close that "
-               "program or choose other local ports in the connection settings.")
+               "program or choose other local ports (Connection → Ports in the GUI, or "
+               "`tsm client ports NAME --api PORT --gateway PORT`).")
     else:
         msg = f"ssh to {who} failed" + (f": {detail}" if detail else ".")
     return SSHError(kind, msg, detail=detail)
@@ -906,8 +907,8 @@ class Tunnel:
         if busy:
             # checked first: something else answering on the port would otherwise look like a healthy tunnel
             return "port-in-use", (f"Local port {busy[0]} is already used by another program on this computer. "
-                                   "Close that program or choose another local port in the connection "
-                                   "settings."), 0.0
+                                   "Close that program or choose other local ports (Connection → Ports in the "
+                                   "GUI, or `tsm client ports NAME --api PORT --gateway PORT`)."), 0.0
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,

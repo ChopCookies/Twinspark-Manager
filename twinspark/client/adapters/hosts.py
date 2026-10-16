@@ -354,14 +354,18 @@ class LocalHost:
             return True
 
     async def process_args(self, pid: int) -> Optional[str]:
+        if self._platform == "windows":
+            # no /proc and no ps: ask WMI for the command line (Stop and Restart check it before ending a pid)
+            shell = await self.which("powershell") or await self.which("pwsh") or "powershell"
+            query = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"
+            result = await self.run([shell, "-NoProfile", "-NonInteractive", "-Command", query], 15)
+            return (result.stdout.strip() or None) if result.rc == 0 else None
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as fh:
                 raw = fh.read(8192)
             return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip() or None
         except OSError:
             pass
-        if self._platform == "windows":
-            return None
         result = await self.run(["ps", "-o", "args=", "-p", str(pid)], 5)
         return (result.stdout.strip() or None) if result.rc == 0 else None
 

@@ -3,7 +3,7 @@
     tsm client                      # open the GUI in your browser (http://127.0.0.1:<port>)
     tsm client add home 192.168.1.20 --user spark
     tsm client connect home         # same flow in the terminal; keeps the tunnel up until Ctrl-C
-    tsm client list | remove NAME | env NAME
+    tsm client list | remove NAME | env NAME | ports NAME [--gateway 18000]
 
 The GUI is served on loopback only; the address it prints carries a session key in its fragment.
 """
@@ -40,8 +40,8 @@ async def _serve(port: Optional[int], open_browser: bool, autoconnect: bool) -> 
     from .client.app import create_client_app, new_session_key
     from .client.ssh import free_local_port
     session = _session()
-    key = new_session_key()
-    app = create_client_app(session, key, autoconnect=autoconnect)
+    key, launch = new_session_key(), new_session_key()
+    app = create_client_app(session, key, autoconnect=autoconnect, launch_code=launch)
     port = port or free_local_port(DEFAULT_PORT)
     # loop="none": keep the default event loop (on Windows the Proactor loop, which can start ssh)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", loop="none",
@@ -57,7 +57,9 @@ async def _serve(port: Optional[int], open_browser: bool, autoconnect: bool) -> 
     print("Keep this running while you use the GUI or apps connected through it (Ctrl-C ends it; the Sparks "
           "keep serving).")
     if open_browser:
-        threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+        # the browser gets a one-time code, not the key: its command line is visible to other users
+        threading.Thread(target=webbrowser.open, args=(f"http://127.0.0.1:{port}/launch/{launch}",),
+                         daemon=True).start()
     await task
 
 
@@ -110,12 +112,35 @@ def cmd_client(args, api=None) -> None:
         print(f"# OpenAI-compatible endpoint for local apps: http://127.0.0.1:{c.local_gateway_port}/v1 "
               f"(while `tsm client` or `tsm client connect {c.name}` runs)")
         return
+    if action == "ports":
+        s = _session()
+        c = _find(s, args.name)
+        changes = {}
+        for flag, field in (("api", "local_api_port"), ("gateway", "local_gateway_port")):
+            value = getattr(args, flag)
+            if value is not None:
+                changes[field] = None if value == "auto" else _port(value)
+        if changes:
+            try:
+                c = s.connections.update(c.id, **changes)
+            except ValueError as exc:
+                sys.exit(str(exc))
+        auto = "picked at the next connect"
+        print(f"{c.name}: local API port {c.local_api_port or auto}, local gateway port "
+              f"{c.local_gateway_port or auto}" + (" — reconnect to use them" if changes else ""))
+        return
     if action == "connect":
         try:
             asyncio.run(_connect_interactive(args.name))
         except KeyboardInterrupt:
             print("\ndisconnected (the Sparks keep serving)")
         return
+
+
+def _port(value: str) -> int:
+    if not value.isdigit() or not 1024 <= int(value) <= 65535:
+        sys.exit(f"{value!r} is not a port from 1024 to 65535 (or `auto`)")
+    return int(value)
 
 
 def _yes(prompt: str) -> bool:
@@ -220,4 +245,8 @@ def add_parsers(sub, cmd) -> None:
     c.add_argument("name")
     e = cs.add_parser("env", help="print TSM_API/TSM_KEY for the tsm CLI through a connection")
     e.add_argument("name")
+    pp = cs.add_parser("ports", help="show or change the local ends of the forwards (applies at the next connect)")
+    pp.add_argument("name")
+    pp.add_argument("--api", metavar="PORT|auto", help="local port of node A's management API")
+    pp.add_argument("--gateway", metavar="PORT|auto", help="local port of the model gateway (what apps use)")
     cmd_client.local = True

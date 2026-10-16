@@ -47,6 +47,8 @@ async def test_the_dashboard_is_patched_in_place(browser):
     async with DemoCluster() as demo:
         page = await browser.new_page()
         await page.goto(f"{demo.url}/")
+        # the keyless first load ends at the key gate (its 401 clears the stored key): store the key after that
+        await page.wait_for_selector("#gate:not(.hidden)", timeout=15000)
         await page.evaluate("k => { sessionStorage.setItem('tsm_key', k); location.hash = '#/dashboard'; }", demo.key)
         await page.reload()
         await page.wait_for_selector('.view[data-live="dashboard"]', timeout=15000)

@@ -121,12 +121,17 @@ def _terminal_unit(lay: Layout, enable: bool) -> list[str]:
                 path.chmod(0o644)
                 notes.append(f"installed {path}")
         old_link = lay.systemd / "multi-user.target.wants" / f"{UNIT}.service"
-        if old_link.is_symlink():                      # 0.5.x ran the terminal always-on
+        always_on = old_link.is_symlink()             # 0.5.x ran the terminal always-on
+        if always_on:
             old_link.unlink()
         if lay.sandbox:
             notes.append("sandbox: service not started")
         else:
             _systemctl("daemon-reload")
+            if always_on:
+                # the old process still holds the port: the socket could not bind it until a reboot
+                _systemctl("stop", f"{UNIT}.service")
+                notes.append("stopped the always-on terminal of 0.5 (open shells ended)")
             rc, out = _systemctl("enable", "--now", f"{UNIT}.socket")
             notes.append("terminal ready (starts on the first connection)" if rc == 0 else
                          f"could not start the terminal socket: {out}")

@@ -63,7 +63,11 @@ async def endpoint_for(session: ClientSession, host: str, alias: Optional[str]) 
     meta = m.get("twinspark") or {}
     ctx = m.get("max_model_len")
     if host == "node-a":
-        base = f"http://127.0.0.1:{session.node_cfg.get('gateway_port', 8000)}/v1"
+        # the gateway as node A itself reaches it: the same address and scheme the SSH forward targets there
+        cfg = session.node_cfg
+        gw_host = cfg.get("gateway_forward_host") or "127.0.0.1"
+        gw_host = f"[{gw_host}]" if ":" in gw_host and not gw_host.startswith("[") else gw_host
+        base = f"{'https' if cfg.get('gateway_tls') else 'http'}://{gw_host}:{cfg.get('gateway_port', 8000)}/v1"
         source = "spark-local"
     else:
         base = session.gateway_url() or ""

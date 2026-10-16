@@ -73,12 +73,15 @@ own API — otherwise any web page you visit could use it as a confused deputy:
 
 - It listens on loopback only. Every `/api/` call needs the session key of this launch (random, 192
   bits), handed to the browser in the URL **fragment** (`#k=…`), which never reaches a server, a log or a
-  `Referer`; the page moves it to the tab's `sessionStorage` and removes it from the address bar.
+  `Referer`; the page moves it to the tab's `sessionStorage` and removes it from the address bar. The
+  browser `tsm client` starts is given a one-time `/launch/<code>` address that redirects to the page
+  with the key, so the key is never in a command line other local users could read.
 - Requests whose `Host` is not a loopback name or address are refused (DNS rebinding), as are
   state-changing requests with a foreign `Origin` or `Sec-Fetch-Site: cross-site`. Responses carry
   `X-Frame-Options: DENY` and `nosniff`. The browser's own `Origin`, cookies and `x-api-key` are never
-  passed upstream; the terminal's WebSocket is checked the same way and authenticated upstream by the
-  controller's one-time ticket.
+  passed upstream. The terminal's WebSocket is checked the same way — the session key travels as a
+  query parameter there, because a browser cannot set headers on a WebSocket, and is removed before the
+  relay — and node A still requires its one-time ticket.
 - **SSH host keys are trust-on-first-use with an explicit confirmation**: the client shows the
   fingerprints, stores only the confirmed ones in its own `known_hosts`, and connects with
   `StrictHostKeyChecking=yes` against that file. A changed key stops the connection until the user
