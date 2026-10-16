@@ -265,6 +265,9 @@ def parse_controller_yaml(text: str) -> dict[str, Any]:
         "gateway_tls": bool(gw.get("tls_cert")),
         "gateway_forward_host": forward_host(g_bind),
         "management_auth": str(doc.get("management_auth") or "apikey"),
+        # where the client browses community recipes (the node's configured list; default as on the node)
+        "recipe_sources": [str(x) for x in doc.get("recipe_sources") or [] if isinstance(x, str)][:20]
+        or ["eugr/spark-vllm-docker:recipes"],
     }
 
 

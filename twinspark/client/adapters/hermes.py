@@ -573,6 +573,9 @@ class HermesAdapter(ClientAdapter):
         self.stop_grace = stop_grace
         self._secret_values: set[str] = set(self._forbidden)
         self._launcher_cache: dict[tuple, tuple[float, Optional[str], Optional[str]]] = {}
+        # When Hermes runs on another host: where *this* computer reaches the same gateway (its address in
+        # the endpoint is the one on that host). Used for reachability probes and endpoint checks.
+        self.probe_base_url: Optional[str] = None
 
     # ---- helpers ----
     def _pflag(self) -> list[str]:
@@ -1364,16 +1367,21 @@ class HermesAdapter(ClientAdapter):
         return RestoreResult(chosen, restored, removed, safety, notes)
 
     # ---- validate ----
-    async def validate(self, endpoint: Endpoint) -> list[Check]:
+    async def validate(self, endpoint: Endpoint, *, probe_url: Optional[str] = None) -> list[Check]:
+        """Endpoint checks plus Hermes's own configuration. ``probe_url``: where *this* computer reaches the
+        same gateway when Hermes runs elsewhere (``endpoint.base_url`` is then the address on that host,
+        e.g. 127.0.0.1 on node A, which means something else here)."""
         self._remember(endpoint.api_key)
-        checks = await validate_endpoint(endpoint.base_url, endpoint.api_key, endpoint.alias, http=self._http,
+        target = probe_url or self.probe_base_url or endpoint.base_url
+        checks = await validate_endpoint(target, endpoint.api_key, endpoint.alias, http=self._http,
                                          min_context=MIN_CONTEXT, timeout=self.request_timeout)
         if not self.host.is_local:
             checks.insert(0, Check("vantage", "Checked from the workstation", "client", "warn",
-                                   f"These requests went from the workstation, not from {self.host.label} where "
-                                   f"Hermes runs. Hermes there must reach {endpoint.base_url} itself, and 127.0.0.1 "
-                                   f"on {self.host.label} is that machine, not this one. After launching, watch the "
-                                   "gateway log on that host for connection errors."))
+                                   f"These requests went from the workstation ({target}), not from "
+                                   f"{self.host.label} where Hermes runs. Hermes there must reach "
+                                   f"{endpoint.base_url} itself, and 127.0.0.1 on {self.host.label} is that "
+                                   "machine, not this one. After launching, watch the gateway log on that host "
+                                   "for connection errors."))
         alias_check = next((c for c in checks if c.id == "alias"), None)
         served = alias_check.data.get("served_aliases") if alias_check else None
         deployed = alias_check.data.get("max_model_len") if alias_check else None
@@ -1620,7 +1628,8 @@ class HermesAdapter(ClientAdapter):
         headers = {"Authorization": f"Bearer {endpoint.api_key}"} if endpoint.api_key else {}
         try:
             async with asyncio.timeout(6.0):
-                response = await client.get(endpoint.base_url + "/models", headers=headers)
+                response = await client.get((self.probe_base_url or endpoint.base_url) + "/models",
+                                            headers=headers)
         except (httpx.HTTPError, TimeoutError):
             return False, None
         finally:
