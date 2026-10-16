@@ -20,8 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _modules_after(code: str) -> set[str]:
-    out = subprocess.run([sys.executable, "-I", "-c", code + "\nimport sys, json\nprint(json.dumps(sorted(sys.modules)))"],
-                         capture_output=True, text=True, timeout=120, cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)})
+    script = code + "\nimport sys, json\nprint(json.dumps(sorted(sys.modules)))"
+    out = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=120,
+                         cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)})
     assert out.returncode == 0, out.stderr[-2000:]
     return set(json.loads(out.stdout.strip().splitlines()[-1]))
 
