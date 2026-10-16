@@ -18,6 +18,9 @@ from .agent_client import AgentActionError, AgentClient
 from .launch import LaunchError, LaunchPlan, LaunchPlanner
 from .planner import MemoryPlanner, ModelSpec
 from .staging import StageError, WeightsStager
+from .timeline import STAGES as TIMELINE_STAGES
+from .timeline import StartupTimeline
+from .timeline import observation as timeline_observation
 
 if TYPE_CHECKING:
     from ..gateway.gateway import Gateway
@@ -71,7 +74,8 @@ class ActivationCoordinator:
                  model_specs: Optional[dict[str, ModelSpec]] = None,
                  poll_interval: float = 5.0,
                  cancel_check: Optional[Callable[[], bool]] = None,
-                 staging_wait: Optional[Callable[[str, str], "asyncio.Future | None"]] = None):
+                 staging_wait: Optional[Callable[[str, str], "asyncio.Future | None"]] = None,
+                 store=None):
         self.config = config
         self.agents = agents
         self.gateway = gateway
@@ -86,6 +90,10 @@ class ActivationCoordinator:
         self.drained: list[str] = []            # aliases we put into draining
         self.cancel_check = cancel_check or (lambda: False)
         self.staging_wait = staging_wait
+        # Where a successful start's observed startup peak is kept for the planner. The controller hands
+        # over its bound ``_persist``; until it passes ``store=`` itself, its store is taken from there.
+        self.store = store if store is not None else getattr(getattr(persist, "__self__", None), "store", None)
+        self.timeline: Optional[StartupTimeline] = None
 
     def agent(self, node: str) -> AgentClient:
         if node not in self.agents:
@@ -108,7 +116,62 @@ class ActivationCoordinator:
             ActivationStage.ROUTING: self._route,
             ActivationStage.HEALTHY: self._healthy,
         }[stage]
-        return await handler(job, rev, step)
+        if stage.value in TIMELINE_STAGES:
+            await self._timeline_mark(job, rev, stage)
+        try:
+            message = await handler(job, rev, step)
+        except Exception:
+            await self._timeline_failed()
+            raise
+        if stage == ActivationStage.HEALTHY:
+            await self._timeline_success(job, rev)
+        return message
+
+    # ---- startup memory timeline (best effort: never fails the activation) ------------------------
+    async def _timeline_mark(self, job: Job, rev: ProfileRevision, stage: ActivationStage) -> None:
+        try:
+            if self.timeline is None:
+                # the destructive part begins: from here on every node of the plan records its memory
+                nodes = list(self.plan.nodes) if self.plan else rev.required_nodes()
+                containers: dict[str, list[str]] = {}
+                for c in (self.plan.containers if self.plan else []):
+                    containers.setdefault(c.node, []).append(c.name)
+                self.timeline = StartupTimeline(self.agents, job, nodes, containers)
+                await self.timeline.start()
+            await self.timeline.mark(stage.value)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a bug here must not take the activation down
+            log.exception("startup timeline mark failed")
+
+    async def _timeline_failed(self) -> None:
+        """The evidence capture reads the timeline back after a failure; here it only stops growing."""
+        if self.timeline is None:
+            return
+        try:
+            await self.timeline.mark("failed")
+            await self.timeline.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("startup timeline could not be stopped")
+
+    async def _timeline_success(self, job: Job, rev: ProfileRevision) -> None:
+        if self.timeline is None:
+            return
+        try:
+            summaries = await self.timeline.finish_success()
+            if summaries:
+                obs = timeline_observation(summaries, job.job_id)
+                job.payload["startup_timeline"]["observed"] = obs["nodes"]
+                if self.store is not None:
+                    # its own key: the revision's observed:{id} record is rewritten when the job completes
+                    self.store.kv_set(f"observed_startup:{rev.revision_id}", obs)
+            self.persist(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("startup timeline could not be kept")
 
     # ---- helpers -------------------------------------------------------------
     def _models(self, rev: ProfileRevision):

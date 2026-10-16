@@ -906,12 +906,53 @@ async function profileOverview(name, p, d) {
   }
   return html;
 }
+/* memory plan: per node, three verdicts and every bucket with its source (measured / calibrated / estimated / unknown) */
+const SRC_CLASS = { measured: "good", calibrated: "info", estimated: "muted", unknown: "warn" };
+const PHASE_LABEL = { resident: "Resident before vLLM starts", pool: "Inside vLLM's claim", outside: "Next to vLLM's claim", load: "While loading only", kv: "KV cache needed" };
+function srcTag(s) { return tag(s || "unknown", SRC_CLASS[s] || "warn"); }
+function gibOr(v, d = 1) { return v == null || isNaN(v) ? "unknown" : Number(v).toFixed(d) + " GiB"; }
+function signedGib(v) { return v == null || isNaN(v) ? "unknown" : (v >= 0 ? "+" : "−") + Math.abs(Number(v)).toFixed(1) + " GiB"; }
+function rangeText(b) { return b.gib == null || b.low == null || b.high == null || b.high - b.low < 0.05 ? "—" : `${Number(b.low).toFixed(1)}–${Number(b.high).toFixed(1)}`; }
+function verdictBox(title, v, body) {
+  v = v || {};
+  const state = v.ok === true ? "good" : v.ok === false ? "bad" : "muted";
+  return `<div class="verdict ${state}"><div class="row between"><b>${esc(title)}</b>${tag(v.level || "UNKNOWN", levelClass(v.level))}</div><div class="small">${body}</div>${v.note ? `<div class="small muted">${esc(v.note)}</div>` : ""}</div>`;
+}
+function planNodeHtml(node, p) {
+  const st = p.startup || {}, one = p.one_context || {}, full = p.full_concurrency || {}, total = Number(p.mem_total_gib) || 0;
+  const sum = (phase) => (p.buckets || []).filter(b => b.phase === phase && b.gib != null).reduce((a, b) => a + Number(b.gib), 0);
+  const resident = sum("resident"), outside = sum("outside"), claim = Number(p.vllm_claim_gib) || 0;
+  const pct = (x) => total ? Math.max(0, Math.min(100, x / total * 100)) : 0;
+  let h = `<div class="section-title">Node ${esc(node)} · ${gib(total)}${p.mem_total_source === "measured" ? "" : " (assumed, not reported yet)"} · vLLM claims ${esc(p.gpu_memory_utilization)} × ${gib(total)} = ${gib(claim)}</div>`;
+  h += `<div class="verdicts">
+    ${verdictBox("Startup peak", st, `${st.ok ? "fits" : st.ok === false ? "does not fit" : "unknown"} · peak ${gib(st.peak_gib)} (${gib(st.peak_low_gib)}–${gib(st.peak_high_gib)}) · margin ${signedGib(st.margin_gib)} ${srcTag(st.source)}`)}
+    ${verdictBox("One max-length request", one, `${one.ok ? "fits" : one.ok === false ? "does not fit" : "unknown"} · KV room ${gibOr(one.kv_space_gib)} for ${gibOr(one.needed_gib)} ${srcTag(one.source)}`)}
+    ${verdictBox("Requested concurrency", full, `≈ ${num(full.est_full_length_seqs, 1)} full-length sequences, ${esc(full.requested_concurrency ?? "—")} requested · ≈ ${num(full.est_kv_tokens)} KV tokens ${srcTag(full.source)}`)}
+  </div>`;
+  h += `<div class="meter big" style="margin:12px 0 4px" title="startup peak per node"><i class="cache" style="width:${pct(resident)}%"></i><i style="left:${pct(resident)}%;width:${pct(claim)}%"></i><i class="warn" style="left:${pct(resident + claim)}%;width:${pct(outside)}%"></i></div>
+    <div class="legend"><span><i style="background:rgba(143,155,186,.6)"></i>resident ${gib(resident)}</span><span><i style="background:var(--accent)"></i>vLLM claim ${gib(claim)}</span><span><i style="background:var(--warn)"></i>next to it ${gib(outside)}</span><span>steady state ${gib(p.steady_state?.gib)}</span></div>`;
+  let rows = "", phase = null;
+  for (const b of p.buckets || []) {
+    if (b.phase !== phase) { phase = b.phase; rows += `<tr class="phase"><td colspan="4">${esc(PHASE_LABEL[phase] || phase)}</td></tr>`; }
+    rows += `<tr data-key="bucket:${esc(node)}:${esc(b.key)}"><td>${esc(b.label)}${b.note ? `<div class="sub">${esc(b.note)}</div>` : ""}</td><td class="num">${esc(gibOr(b.gib, 2))}</td><td class="num">${esc(rangeText(b))}</td><td>${srcTag(b.source)}</td></tr>`;
+  }
+  h += `<div class="table-wrap" style="margin-top:10px"><table class="buckets"><thead><tr><th>Bucket</th><th class="num">GiB</th><th class="num">Range</th><th>Source</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  const conf = p.confidence || {};
+  h += `<p class="small muted">${esc(conf.text || "")}${(conf.unknown || []).length ? ` · unknown: ${esc(conf.unknown.join(", "))}` : ""}${p.drafter ? ` · drafter: ${esc(p.drafter.placement)}` : ""}</p>`;
+  for (const n of p.notes || []) h += `<p class="small muted">${esc(n)}</p>`;
+  return h;
+}
 function fitHtml(fit) {
   if (!fit) return empty("Unavailable");
   if (fit.nodes) return Object.entries(fit.nodes).map(([node, detail]) => `<div class="section-title">Node ${esc(node)} · ${esc(detail.model)}</div>${fitHtml(detail)}`).join('<hr class="sep">');
   let h = "";
   if (!fit.known) h += `<p class="muted small">${esc(fit.note || "model size unknown")}</p>`;
-  else {
+  else if (fit.plan) {
+    const v = fit.verdicts || {};
+    h += `<div class="row between small"><span>${tag(v.startup?.ok ? "starts" : "startup does not fit", v.startup?.ok ? "good" : "bad")} ${tag(v.one_context?.ok === false ? "one request does not fit" : "one request fits", v.one_context?.ok === false ? "bad" : "good")} ${v.full_concurrency?.ok === false ? tag("fewer parallel full-length sequences", "warn") : ""}</span><span class="muted">${esc(fit.confidence || "")}</span></div>`;
+    h += Object.entries(fit.plan).map(([node, p]) => planNodeHtml(node, p)).join("");
+    h += `<p class="small muted">Every number is per node. The startup peak and the steady state are separate figures; a calibrated figure comes from this revision's last startup timeline.</p>`;
+  } else {
     const pool = fit.kv_pool_gib_per_node, w = fit.weights_gib_per_node, total = fit.budget.mem_total;
     h += `<div class="row between small"><span>${fit.fits ? tag("fits", "good") : tag("does not fit", "bad")} ${fit.full_concurrency_fits ? "" : tag("fewer parallel full-length sequences", "warn")}</span><span class="muted">gpu_memory_utilization ${esc(fit.gpu_memory_utilization)}</span></div>
       <div class="meter big" style="margin:10px 0 4px"><i style="width:${Math.min(100, w / total * 100)}%"></i><i class="cache" style="left:${Math.min(100, w / total * 100)}%;width:${Math.min(100, pool / total * 100)}%;background:rgba(74,222,128,.55)"></i></div>
@@ -923,6 +964,9 @@ function fitHtml(fit) {
   const o = fit.observed;
   if (o && (o.kv || o.max_model_len)) {
     h += `<hr class="sep"><div class="small"><b>Last successful run:</b> ${o.kv && o.kv.kv_cache_tokens ? num(o.kv.kv_cache_tokens) + " KV tokens" : ""}${o.max_model_len ? ` · max_model_len ${num(o.max_model_len)}` : ""}${o.load_seconds ? ` · loaded in ${Math.round(o.load_seconds)} s` : ""} <span class="muted">(${esc(ago(o.at))})</span></div>`;
+  }
+  if (o && o.startup && o.startup.nodes) {
+    h += `<div class="small"><b>Last startup:</b> ${Object.entries(o.startup.nodes).map(([n, s]) => `node ${esc(n)} took ${gibOr(s && s.footprint_gib)}, lowest MemAvailable ${gibOr(s && s.min_mem_available_gib)}${s && s.simulated ? " (simulated)" : ""}`).join(" · ")}</div>`;
   }
   return h;
 }
@@ -1253,13 +1297,76 @@ function phasesHtml(items) {
       <div class="d">${esc(x.detail || "")}${x.ref ? ` <span class="mono faint" title="${esc(x.ref)}">${esc(x.ref.length > 90 ? x.ref.slice(0, 90) + "…" : x.ref)}</span>` : ""}</div>
       ${x.state === "running" && x.progress != null ? `<div class="progress-line"><i style="width:${Math.round(x.progress * 100)}%"></i></div>` : ""}</div></div>`).join("")}</div></div>`;
 }
+/* startup memory timeline: MemAvailable over time per node, stage markers, the lowest point */
+const STAGE_SHORT = { stopping: "stop", reclaiming: "reclaim", "starting-cluster": "start", loading: "load", testing: "test", routing: "route", healthy: "healthy", failed: "failed" };
+const CAUSE_TEXT = {
+  "driver-allocation": "the NVIDIA driver could not allocate memory", "host-oom": "the kernel ran out of memory and killed a process",
+  "container-limit": "a container hit its own memory limit", timeout: "the start ran out of time", "rdma-nccl": "the nodes could not communicate (NCCL / RDMA)",
+  "application-exception": "vLLM stopped on an error in its own code or settings", unknown: "the cause could not be determined from the evidence",
+};
+function memTimelineSvg(series, summary) {
+  const t = (series && series.t) || [], v = (series && series.mem_available_gib) || [];
+  const pts = t.map((x, i) => [Number(x), v[i] == null ? null : Number(v[i])]).filter(p => Number.isFinite(p[0]));
+  const known = pts.filter(p => p[1] != null && Number.isFinite(p[1]));
+  if (known.length < 2) return `<p class="small muted">Not enough MemAvailable readings for a curve.</p>`;
+  const W = 320, H = 92, L = 4, R = 316, T = 10, B = 74;
+  const t0 = Math.min(...pts.map(p => p[0])), t1 = Math.max(...pts.map(p => p[0])), span = t1 - t0 || 1;
+  const ymax = Math.max(Number(summary && summary.mem_total_gib) || 0, ...known.map(p => p[1]), 1);
+  const X = (x) => L + ((x - t0) / span) * (R - L), Y = (y) => B - (y / ymax) * (B - T);
+  let d = "", pen = false;
+  for (const [x, y] of pts) {
+    if (y == null || !Number.isFinite(y)) { pen = false; continue; }
+    d += (pen ? "L" : "M") + X(x).toFixed(1) + " " + Y(y).toFixed(1) + " "; pen = true;
+  }
+  let marks = "", lastLabel = -1e9;
+  for (const m of (summary && summary.marks) || []) {
+    const mt = Number(m && m.t);
+    if (!Number.isFinite(mt)) continue;
+    const xn = X(Math.max(t0, Math.min(t1, mt))), x = xn.toFixed(1), label = STAGE_SHORT[m.stage] || String(m.stage || "");
+    marks += `<line class="mark${m.stage === "failed" ? " failed" : ""}" x1="${x}" y1="${T}" x2="${x}" y2="${B}"><title>${esc(m.stage)} at ${esc(mt.toFixed(0))} s</title></line>`;
+    if (xn - lastLabel >= 24) { marks += `<text class="mark-label" x="${x}" y="${B + 9}">${esc(label)}</text>`; lastLabel = xn; }
+  }
+  let low = "";
+  const minV = Number(summary && summary.min_mem_available_gib), minT = Number(summary && summary.min_at_s);
+  if (Number.isFinite(minV) && Number.isFinite(minT)) {
+    const x = X(Math.max(t0, Math.min(t1, minT))), y = Y(minV);
+    const what = `lowest MemAvailable ${minV.toFixed(1)} GiB at ${minT.toFixed(0)} s${summary.min_stage ? " (" + summary.min_stage + ")" : ""}`;
+    low = `<circle class="min" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"><title>${esc(what)}</title></circle><text class="min-label" x="${Math.min(R - 40, x + 4).toFixed(1)}" y="${Math.max(T + 6, y - 4).toFixed(1)}">${esc(minV.toFixed(1))} GiB</text>`;
+  }
+  return `<svg class="memtl" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(`MemAvailable from ${t0.toFixed(0)} to ${t1.toFixed(0)} s`)}">
+    <text class="axis-label" x="${L}" y="${T - 3}">${esc(ymax.toFixed(0))} GiB</text><line class="axis" x1="${L}" y1="${B}" x2="${R}" y2="${B}"/>
+    <path class="line" d="${d.trim()}"/>${marks}${low}<text class="axis-label end" x="${R}" y="${T - 3}">${esc(span.toFixed(0))} s</text></svg>`;
+}
+function timelineHtml(nodes) {
+  return Object.entries(nodes || {}).map(([node, d]) => {
+    if (!d || d.error) return `<div class="small muted" data-key="tl:${esc(node)}">Node ${esc(node)}: no memory timeline (${esc((d && d.error) || "not recorded")})</div>`;
+    const s = d.summary || {};
+    const facts = [
+      s.min_mem_available_gib != null ? `lowest MemAvailable ${gib(s.min_mem_available_gib)} at ${num(s.min_at_s)} s${s.min_stage ? " (" + s.min_stage + ")" : ""}` : "MemAvailable not read",
+      s.footprint_gib != null ? `the new model took ${gib(s.footprint_gib)}` : "",
+      s.min_mem_free_gib != null ? `lowest MemFree ${gib(s.min_mem_free_gib)}` : "",
+      s.max_psi_full_avg10 != null ? `memory pressure peak ${num(s.max_psi_full_avg10, 1)}% (PSI full)` : "memory pressure: unknown",
+      s.peak_swap_out_pps != null ? `swap-out peak ${num(s.peak_swap_out_pps)} pages/s` : "swap traffic: unknown",
+      ...(s.oom_events || []).map(e => `${e.container}: oom_kill ${e.oom_kill}${e.limit_mib ? " (limit " + gib(e.limit_mib / 1024) + ")" : ""}`),
+    ].filter(Boolean);
+    return `<div class="memtl-node" data-key="tl:${esc(node)}"><div class="row between small"><b>Node ${esc(node)}</b><span class="muted">${num(d.points)} points${d.simulated ? " · simulated (dry-run)" : ""}</span></div>${memTimelineSvg(d.series, s)}<div class="small muted">${facts.map(esc).join(" · ")}</div></div>`;
+  }).join("");
+}
+function causeHtml(c) {
+  if (!c || !c.cause) return "";
+  return `<div class="callout ${c.cause === "unknown" ? "info" : "warn"}"><div><b>Likely cause: ${esc(CAUSE_TEXT[c.cause] || c.cause)}</b> ${tag(c.cause, "muted")} ${tag((c.confidence || "low") + " confidence", c.confidence === "high" ? "info" : "muted")}${(c.evidence || []).length ? `<ul>${c.evidence.map(e => `<li>${esc(e)}</li>`).join("")}</ul>` : ""}</div></div>`;
+}
+const TIMELINE_NOTE = "MemAvailable on each node from just before the old model was stopped; the vertical lines are the stages. What the NVIDIA driver itself holds is unknown on a GB10 (nvidia-smi reports no memory figures): it shows only as falling MemAvailable.";
 function evidenceHtml(ev) {
-  if (!ev || !(ev.containers || []).length) return "";
+  const timeline = ev && ev.timeline && Object.keys(ev.timeline).length ? ev.timeline : null;
+  if (!ev || !((ev.containers || []).length || timeline || ev.classification)) return "";
   const exitText = (c) => c.error ? `no evidence: ${c.error}` : c.status === "missing" ? "no such container (it never started, or was already removed)" :
     [c.status, c.exit_code != null && c.status !== "running" ? `exit code ${c.exit_code}` : "", c.oom_killed ? "killed by the kernel OOM killer" : ""].filter(Boolean).join(", ");
   return `<div class="card"><div class="card-head"><h2>Startup evidence</h2><span class="small muted">saved before cleanup removed the containers · ${esc(ev.profile || "")} ${esc(ev.revision_id || "")}</span></div>
+    ${causeHtml(ev.classification)}
+    ${timeline ? `<div class="section-title">Memory during the start</div><p class="small muted">${esc(TIMELINE_NOTE)}</p>${timelineHtml(timeline)}` : ""}
     <p class="small muted">Image ${(ev.images || []).map(i => `<span class="mono">${esc(i)}</span>`).join(", ") || "—"}. Logs are redacted, at most ${bytes(ev.limits?.max_log_chars)} each (the end is kept); the newest ${esc(ev.limits?.kept_jobs ?? "")} failed jobs keep theirs. An exit code 1 does not rule out a GPU memory failure — compare the kernel messages and memory below.</p>
-    ${ev.containers.map(c => { const m = c.memory || {}; return `<div class="evidence" data-key="ev:${esc(c.node)}:${esc(c.name)}">
+    ${(ev.containers || []).map(c => { const m = c.memory || {}; return `<div class="evidence" data-key="ev:${esc(c.node)}:${esc(c.name)}">
       <div class="row between"><b>Node ${esc(c.node)} · <span class="mono">${esc(c.name)}</span> ${c.role ? tag(c.role, "muted") : ""}</b>${c.file ? `<button class="btn sm" data-act="evidence-log" data-file="${esc(c.file)}">Download log (${bytes(c.bytes)}${c.log_truncated ? ", end of a longer log" : ""})</button>` : ""}</div>
       <div class="kv"><b>State</b><span>${esc(exitText(c))}</span>
         <b>Memory after the failure</b><span>${m.mem_available_gib != null ? `${gib(m.mem_available_gib)} available of ${gib(m.mem_total_gib)} · page cache ${gib(m.page_cache_gib)} · swap used ${gib(m.swap_used_gib)}` : "—"}</span>
@@ -1310,6 +1417,10 @@ function jobHtml(job) {
   h += phasesHtml(pl.phases);
   if (pl.evidence_error) h += `<div class="callout warn"><div>${esc(pl.evidence_error)}</div></div>`;
   h += evidenceHtml(pl.startup_evidence);
+  const startTl = pl.startup_timeline && pl.startup_timeline.nodes_data;
+  if (activation && job.state === "completed" && startTl && Object.keys(startTl).length) {
+    h += `<div class="card"><h2>Startup memory</h2><p class="small muted">${esc(TIMELINE_NOTE)} The lowest point is the margin this revision had; the planner uses it for the next plan of the same settings.</p>${timelineHtml(startTl)}</div>`;
+  }
   const excerpt = (job.steps || []).map(s => s.log_excerpt).filter(Boolean).pop();
   // the evidence card already shows each rank's errors; the step's excerpt stays when it has none (agent unreachable)
   const evShown = ((pl.startup_evidence || {}).containers || []).some(c => c && (c.first_error || c.final_error));

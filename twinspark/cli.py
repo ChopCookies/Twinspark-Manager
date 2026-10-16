@@ -444,12 +444,40 @@ def _print_evidence(job: dict) -> None:
     if payload.get("evidence_error"):
         print(f"\n! {payload['evidence_error']}")
     ev = payload.get("startup_evidence") or {}
-    if not ev.get("containers"):
+    if not ev.get("containers") and not ev.get("timeline") and not ev.get("classification"):
         return
-    from .controller.evidence import describe_exit
+    from .controller.evidence import CAUSE_TEXT, describe_exit
     print(f"\n--- startup evidence ({ev.get('profile')} {ev.get('revision_id')}; "
           f"image {', '.join(ev.get('images') or []) or '?'}) ---")
-    for c in ev["containers"]:
+    cls = ev.get("classification") or {}
+    if cls.get("cause"):
+        print(f"  likely cause: {cls['cause']} ({cls.get('confidence', '?')} confidence) — "
+              f"{CAUSE_TEXT.get(cls['cause'], '')}")
+        for line in cls.get("evidence") or []:
+            print(f"    · {line}")
+    for node, t in sorted((ev.get("timeline") or {}).items()):
+        if not isinstance(t, dict):
+            continue
+        if t.get("error"):
+            print(f"  node {node} memory timeline: not recorded ({t['error']})")
+            continue
+        s = t.get("summary") or {}
+        bits = []
+        if s.get("min_mem_available_gib") is not None:
+            bits.append(f"lowest MemAvailable {s['min_mem_available_gib']:.1f} GiB at {s.get('min_at_s', 0):.0f} s"
+                        + (f" ({s['min_stage']})" if s.get("min_stage") else ""))
+        if s.get("footprint_gib") is not None:
+            bits.append(f"the new model took {s['footprint_gib']:.1f} GiB")
+        for key, label in (("peak_swap_out_pps", "swap-out peak {:,.0f} pages/s"),
+                           ("max_psi_full_avg10", "memory pressure peak {:.0f}% (PSI full)")):
+            if s.get(key):
+                bits.append(label.format(s[key]))
+        for e in s.get("oom_events") or []:
+            bits.append(f"{e.get('container')}: oom_kill {e.get('oom_kill')}")
+        sim = ", simulated" if t.get("simulated") else ""
+        print(f"  node {node} memory timeline ({t.get('points', 0)} points{sim}): "
+              + ("; ".join(bits) or "no readings"))
+    for c in ev.get("containers") or []:
         mem = c.get("memory") or {}
         bits = [describe_exit(c)]
         if mem.get("mem_available_gib") is not None:

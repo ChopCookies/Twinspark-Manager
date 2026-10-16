@@ -390,3 +390,22 @@ input[type="search"]::-webkit-search-cancel-button{cursor:pointer}
 .evidence { border-top:1px solid var(--stroke); padding:14px 0 4px; display:flex; flex-direction:column; gap:10px; }
 .evidence:first-of-type { border-top:0; padding-top:4px; }
 .evidence .section-title { margin:6px 0 0; }
+
+/* memory plan (0.6): three verdicts per node, buckets with their source */
+.verdicts { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:8px; }
+.verdict { padding:9px 11px; border-radius:12px; border:1px solid var(--stroke); background:var(--panel-2); display:flex; flex-direction:column; gap:4px; min-width:0; }
+.verdict.good { border-color:rgba(74,222,128,.3); }
+.verdict.bad { border-color:rgba(248,113,113,.4); background:rgba(248,113,113,.06); }
+table.buckets tr.phase td { font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; padding-top:12px; }
+/* startup memory timeline */
+.memtl-node { display:flex; flex-direction:column; gap:4px; margin:8px 0 12px; }
+svg.memtl { display:block; width:100%; height:auto; max-height:170px; }
+svg.memtl .line { fill:none; stroke:var(--accent); stroke-width:1.4; }
+svg.memtl .axis { stroke:var(--stroke-2); stroke-width:.6; }
+svg.memtl .mark { stroke:var(--stroke-2); stroke-width:.6; stroke-dasharray:2 2; }
+svg.memtl .mark.failed { stroke:var(--bad); }
+svg.memtl .min { fill:var(--bad); }
+svg.memtl text { fill:var(--muted); font-size:6.5px; }
+svg.memtl .mark-label { text-anchor:middle; }
+svg.memtl .axis-label.end { text-anchor:end; }
+svg.memtl .min-label { fill:var(--bad); }
