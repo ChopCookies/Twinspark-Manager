@@ -113,6 +113,18 @@ def recipe_digest_note(draft: ProfileDraft, img: dict[str, Any]) -> Optional[str
             f"written for ({want[:19]}…). To use the author's build: pin with --image {hint_name}@{want}")
 
 
+async def _register_extra_spec(ctrl: "Controller", repo: str, sha: str, token: Optional[str]) -> str:
+    """Register a drafter's (extra model's) ModelSpec like the main model's, so the memory planner knows
+    its weight bytes. Best effort: offline, or a repo without config.json, only costs the estimate."""
+    try:
+        resolved = await asyncio.to_thread(resolve_hf_revision, f"{repo}@{sha}", token)
+        spec = spec_from_resolved(resolved)
+    except Exception as exc:  # noqa: BLE001 - the pin itself must not depend on the drafter's metadata
+        return f"{repo}: memory spec not registered ({str(exc)[:160]}); the planner shows its size as unknown"
+    ctrl.set_model_spec(repo, spec)
+    return f"{repo}: memory spec registered ({(spec.weight_bytes or 0) / 1024 ** 3:.1f} GiB weights)"
+
+
 async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
                      image=None, local_image=None, nodes=None) -> tuple[ProfileDraft, dict, list[str]]:
     repo = draft.simple.model
@@ -191,6 +203,8 @@ async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
     for ref_x in draft.advanced.extra_models:
         x_repo, x_sha = await asyncio.to_thread(resolve_model_ref, ref_x, token)
         extras.append(f"{x_repo}@{x_sha}")
+        if ctrl.model_spec(x_repo) is None:
+            notes.append(await _register_extra_spec(ctrl, x_repo, x_sha, token))
     adv_update: dict[str, Any] = {}
     if extras != draft.advanced.extra_models:
         adv_update["extra_models"] = extras

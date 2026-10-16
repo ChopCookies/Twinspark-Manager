@@ -231,10 +231,11 @@ class Controller:
     def profile_fit(self, name: str, ref: Optional[str] = None) -> dict[str, Any]:
         """Will this profile fit, and roughly how many KV tokens does it leave?
 
-        Uses the registered ModelSpec (real checkpoint size from the Hub, measured
-        KV bytes/token from the recipe) and the nodes' real MemTotal. After a
-        successful activation the observed KV pool from vLLM's boot log is shown
-        next to the estimate.
+        Uses the registered ModelSpecs (real checkpoint sizes from the Hub for the model and its
+        drafter, measured KV bytes/token from the recipe) and each node's last hardware facts. Every
+        node gets its own plan with three verdicts (startup peak, one max-length request, the full
+        requested concurrency). After a successful activation the observed KV pool from vLLM's boot
+        log and the observed startup footprint calibrate the plan of the same settings.
         """
         p = self.get_profile(name)
         if p is None:
@@ -245,21 +246,34 @@ class Controller:
         d = rev.draft if rev else p.working_draft()
         if d is None:
             raise ValueError("profile has no draft")
+        obs_rev = rev or p.latest()
+        # an observation only calibrates the settings it was made with
+        same = obs_rev is not None and (rev is not None or obs_rev.draft == d)
+        observed = self.store.kv_get(f"observed:{obs_rev.revision_id}") if obs_rev is not None else None
+        startup_obs = self.store.kv_get(f"observed_startup:{obs_rev.revision_id}") if same else None
         if d.secondary:
-            fits = {node: self._draft_fit(part, [node], recipe_kv=True)
+            fits = {node: self._draft_fit(part, [node], recipe_kv=True, observed_startup=startup_obs)
                     for node, part in zip(("A", "B"), d.parts(), strict=True)}
-            return {"profile": name, "topology": "split", "nodes": fits,
-                    "known": all(f["known"] for f in fits.values()),
-                    "fits": all(f.get("fits", False) for f in fits.values())}
-        out = self._draft_fit(d, rev.required_nodes() if rev else None)
+            out = {"profile": name, "topology": "split", "nodes": fits,
+                   "known": all(f["known"] for f in fits.values()),
+                   "fits": all(f.get("fits", False) for f in fits.values())}
+            if startup_obs:
+                out["observed"] = {**(observed or {}), "startup": startup_obs}
+            return out
+        kv_tokens = ((observed or {}).get("kv") or {}).get("kv_cache_tokens") if same else None
+        out = self._draft_fit(d, rev.required_nodes() if rev else None, observed_startup=startup_obs,
+                              observed_kv_tokens=kv_tokens if isinstance(kv_tokens, int) else None)
         out["profile"] = name
-        if rev is None and p.latest():
-            rev = p.latest()
-        if rev is not None:
-            out["observed"] = self.store.kv_get(f"observed:{rev.revision_id}")
+        if obs_rev is not None:
+            obs = dict(observed) if isinstance(observed, dict) else None
+            if startup_obs:
+                obs = {**(obs or {}), "startup": startup_obs}
+            out["observed"] = obs
         return out
 
-    def _draft_fit(self, d: ProfileDraft, nodes=None, recipe_kv=False) -> dict:
+    def _draft_fit(self, d: ProfileDraft, nodes=None, recipe_kv=False, *,
+                   observed_startup: Optional[dict] = None, observed_kv_tokens: Optional[int] = None) -> dict:
+        from .planner import drafter_inputs
         s, a = d.simple, d.advanced
         out = {"model": s.model, "known": False}
         spec = self.model_spec(s.model)
@@ -274,24 +288,62 @@ class Controller:
                                        kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
                                        mem_total_gib=self._mem_total(nodes))
         util = a.gpu_memory_utilization or self.planner.gpu_memory_utilization(budget)
-        fits, headroom = self.planner.fits(budget, util)
-        fixed = budget.vllm_needed - budget.kv_cache           # weights + scratch + graphs + comms
-        pool = util * budget.mem_total - fixed
-        per_tok = budget.kv_cache * 1024**3 / max(1, ctx * conc)
+        if nodes is None:
+            t = s.topology.value
+            nodes = ["A"] if t == "single-a" else ["B"] if t == "single-b" else ["A", "B"]
+        drafters = drafter_inputs(a, self.model_spec)
+        backend = "ray" if str(getattr(d.distributed_backend, "value", d.distributed_backend)) == "ray" else "native"
+        plans = {}
+        for n in nodes:
+            facts = self.store.kv_get(f"hardware:{n}") or {}
+            plans[n] = self.planner.plan_node(
+                spec=spec, quant=s.quantization, context_length=ctx, concurrency=conc, topology=s.topology,
+                node_id=n, backend=backend, kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
+                gpu_memory_utilization=util, facts=facts if isinstance(facts, dict) else {}, drafters=drafters,
+                max_num_batched_tokens=a.max_num_batched_tokens, chunked_prefill=a.chunked_prefill,
+                observed=observed_startup, observed_kv_tokens=observed_kv_tokens)
+        # the 0.5 keys, now from the per-node plans: the worst node decides
+        startup = min((p.startup for p in plans.values()), key=lambda v: v["margin_gib"])
+        one = [p.one_context for p in plans.values()]
+        full = [p.full_concurrency for p in plans.values()]
+        kv_space = min(p.one_context["kv_space_gib"] for p in plans.values())
+        tokens = [f["est_kv_tokens"] for f in full if f.get("est_kv_tokens") is not None]
+        seqs = [f["est_full_length_seqs"] for f in full if f.get("est_full_length_seqs") is not None]
+        measured = sum(p.confidence["measured_inputs"] for p in plans.values())
+        inputs = sum(p.confidence["inputs"] for p in plans.values())
+
+        def worst(items: list[dict]) -> dict:
+            known = [v for v in items if v.get("margin_gib") is not None]
+            return min(known, key=lambda v: v["margin_gib"]) if known else items[0]
+        first = next(iter(plans.values()))
         out.update({
-            # vLLM starts as long as weights + one max-length sequence fit in its pool
-            "known": True, "fits": pool > 0 and pool * 1024**3 >= per_tok * ctx,
-            "full_concurrency_fits": fits,
-            "headroom_gib": round(headroom, 2), "level": self.planner.classify_headroom(headroom),
-            "gpu_memory_utilization": util, "weights_gib_per_node": round(budget.model_weights, 2),
-            "kv_pool_gib_per_node": round(max(0.0, pool), 2),
-            "kv_needed_gib_per_node": round(budget.kv_cache, 2),
-            "est_kv_tokens": int(max(0.0, pool) * 1024**3 / per_tok) if per_tok > 0 else None,
-            "est_full_context_seqs": round(max(0.0, pool) * 1024**3 / per_tok / ctx, 1)
-            if per_tok > 0 else None,
+            "known": True,
+            # starts = the startup peak fits on every node and vLLM's claim holds one max-length sequence
+            "fits": all(p.startup["ok"] and p.one_context["ok"] is not False for p in plans.values()),
+            "full_concurrency_fits": all(f["ok"] is not False for f in full),
+            # headroom = the smallest startup margin of any node (the risk the 0.5 single verdict hid)
+            "headroom_gib": startup["margin_gib"], "level": startup["level"],
+            "gpu_memory_utilization": util,
+            "weights_gib_per_node": round(first.bucket("main_weights").gib, 2),
+            "drafter_gib_per_node": max((getattr(p.bucket("drafter_weights"), "gib", None) or 0.0)
+                                        for p in plans.values()),
+            "kv_pool_gib_per_node": round(max(0.0, kv_space), 2),
+            "kv_needed_gib_per_node": first.full_concurrency["needed_gib"],
+            "est_kv_tokens": min(tokens) if tokens else None,
+            "est_full_context_seqs": min(seqs) if seqs else None,
             "context_length": ctx, "concurrency": conc,
             "kv_bytes_per_token_source": "measured" if spec.kv_bytes_per_token else "formula",
             "budget": budget.as_dict(),
+            "plan": {n: p.as_dict() for n, p in plans.items()},
+            "verdicts": {
+                "startup": {**{k: startup[k] for k in ("ok", "level", "margin_gib", "source")},
+                            "node": next(n for n, p in plans.items() if p.startup is startup)},
+                "one_context": {k: worst(one).get(k) for k in ("ok", "level", "margin_gib", "source")},
+                "full_concurrency": {**{k: worst(full).get(k) for k in ("ok", "level", "margin_gib", "source")},
+                                     "est_full_length_seqs": min(seqs) if seqs else None},
+            },
+            "confidence": f"measured inputs: {measured}/{inputs}",
+            "drafters": [x.repo for x in drafters],
         })
         return out
 
@@ -535,8 +587,10 @@ class Controller:
         return Redactor(values)
 
     async def _capture_evidence(self, job: Job, rev: ProfileRevision) -> None:
-        """Save each started container's state and log (both ranks) before the containers are removed."""
+        """Save each started container's state and log (both ranks) before the containers are removed,
+        each node's startup memory timeline, and what the evidence says the failure was."""
         from . import evidence as ev
+        from . import timeline as tl
         from .state_machine import guidance_for
         seen, started = set(), []
         for item in job.payload.get("started_containers") or []:
@@ -544,10 +598,21 @@ class Controller:
             if key not in seen and item.get("node") in self.agents:
                 seen.add(key)
                 started.append(item)
-        if not started:
+        recorded = (job.payload.get("startup_timeline") or {}).get("nodes") or []
+        tl_nodes = [n for n in recorded if n in self.agents]
+        if not started and not tl_nodes:
             return
         root = ev.evidence_dir(self.config.db_path)
         redact = self._redactor()
+
+        async def timeline() -> dict[str, dict]:
+            if not tl_nodes:
+                return {}
+            try:
+                return tl.stored(await tl.collect(self.agents, job.job_id, tl_nodes, tl.EVIDENCE_POINTS, stop=True))
+            except Exception as exc:  # noqa: BLE001 - the timeline is best effort like the rest
+                log.exception("startup timeline could not be read")
+                return {n: {"error": f"{type(exc).__name__}: {exc}"[:300]} for n in tl_nodes}
 
         async def one(item: dict) -> dict[str, Any]:
             node, name = item["node"], item["name"]
@@ -579,12 +644,17 @@ class Controller:
             rec.update(await asyncio.to_thread(digest))
             return rec
 
-        records = list(await asyncio.gather(*(one(i) for i in started)))
+        gathered, timelines = await asyncio.gather(asyncio.gather(*(one(i) for i in started)), timeline())
+        records = list(gathered)
+        summaries = {n: d["summary"] for n, d in timelines.items() if isinstance(d.get("summary"), dict)}
         job.payload["startup_evidence"] = {
             "containers": records, "profile": rev.profile_name, "revision_id": rev.revision_id,
             "images": list(dict.fromkeys(p.identity.image_ref for p in rev.parts() if p.identity)),
             "captured_at": time.time(),
-            "limits": {"max_log_chars": ev.MAX_LOG_CHARS, "kept_jobs": ev.KEEP_JOBS}}
+            "timeline": timelines,
+            "classification": ev.classify(records, summaries, job),
+            "limits": {"max_log_chars": ev.MAX_LOG_CHARS, "kept_jobs": ev.KEEP_JOBS,
+                       "timeline_points_per_node": tl.EVIDENCE_POINTS}}
         failed = next((st for st in reversed(job.steps) if st.status == "failed"), None)
         text = ev.excerpt(records)
         if failed is not None and text:

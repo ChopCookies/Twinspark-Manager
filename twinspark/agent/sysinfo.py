@@ -139,6 +139,139 @@ def desktop_facts(proc: str = "/proc") -> dict[str, Any]:
     }
 
 
+# ---- per-unit and per-process memory (0.6 planner inputs) -------------------------------------------
+TSM_UNITS = ("twinspark-agent", "twinspark-controller", "twinspark-privd", "twinspark-terminal")
+CGROUP_ROOT = "/sys/fs/cgroup"
+_MIB = 1024 ** 2
+# a process in one of these cgroups belongs to a container (its memory is the container's, not the host's)
+_CONTAINER_CGROUP = re.compile(r"docker|containerd|kubepods|libpod|/lxc|machine\.slice")
+_RUNTIME_PROCS = {"dockerd", "containerd", "containerd-shim", "containerd-shim-runc-v2", "docker-proxy", "runc"}
+_INTERPRETERS = re.compile(r"^(?:python[0-9.]*|node|java|ruby|perl|bash|sh|uv|deno|bun)\Z")
+
+
+def _int_text(text: Optional[str]) -> Optional[int]:
+    return int(text) if text is not None and text.isdigit() else None
+
+
+def cgroup_memory(path: str | Path) -> Optional[dict[str, Any]]:
+    """memory.current/peak/events/max of one cgroup v2 directory, or None when it cannot be read.
+
+    ``limit_mib`` is None for an unlimited cgroup (memory.max = "max"); ``peak_mib`` is None on kernels
+    without memory.peak (< 5.19). Counts from memory.events are None when the file is missing.
+    """
+    p = Path(path)
+    cur = _int_text(_read(p / "memory.current"))
+    if cur is None:
+        return None
+    peak = _int_text(_read(p / "memory.peak"))
+    events: dict[str, int] = {}
+    for line in (_read(p / "memory.events") or "").splitlines():
+        key, _, val = line.partition(" ")
+        if val.strip().isdigit():
+            events[key] = int(val.strip())
+    limit = _int_text(_read(p / "memory.max"))
+    have_events = bool(events)
+    return {"current_mib": round(cur / _MIB, 1), "peak_mib": None if peak is None else round(peak / _MIB, 1),
+            "oom": events.get("oom") if have_events else None,
+            "oom_kills": events.get("oom_kill") if have_events else None,
+            "limit_mib": None if limit is None else round(limit / _MIB, 1)}
+
+
+def services_memory(root: str = CGROUP_ROOT) -> dict[str, dict[str, Any]]:
+    """The TwinSpark systemd units present on this node with their cgroup memory (values None when unreadable)."""
+    out: dict[str, dict[str, Any]] = {}
+    base = Path(root) / "system.slice"
+    for unit in TSM_UNITS:
+        d = base / f"{unit}.service"
+        if not d.is_dir():
+            continue
+        m = cgroup_memory(d) or {}
+        out[unit] = {"current_mib": m.get("current_mib"), "peak_mib": m.get("peak_mib"),
+                     "oom_kills": m.get("oom_kills")}
+    return out
+
+
+def _display_name(comm: str, cmdline: str) -> str:
+    """``python3 /opt/hermes/gateway.py`` -> ``gateway.py``: an interpreter's name says little."""
+    args = [a for a in cmdline.split("\0") if a]
+    if args and _INTERPRETERS.match(comm):
+        rest = args[1:]
+        for i, a in enumerate(rest):
+            if a == "-m" and i + 1 < len(rest):
+                return rest[i + 1][:60]
+            if not a.startswith("-"):
+                return Path(a).name[:60] or comm
+    return comm
+
+
+def other_processes(proc: str = "/proc", limit: int = 5, min_mib: int = 100,
+                    max_pids: int = 8192) -> list[dict[str, Any]]:
+    """The largest processes above ``min_mib`` RSS that are neither TwinSpark, a desktop session, the
+    container runtime nor inside a container (those are counted elsewhere). Bounded: at most
+    ``max_pids`` entries of /proc are looked at."""
+    rows = []
+    try:
+        pids = [p for p in os.listdir(proc) if p.isdigit()][:max_pids]
+    except OSError:
+        return []
+    for pid in pids:
+        status = _read(f"{proc}/{pid}/status")
+        if not status:
+            continue
+        m = re.search(r"^VmRSS:\s+(\d+)", status, re.M)
+        if not m or int(m.group(1)) < min_mib * 1024:          # kernel threads have no VmRSS
+            continue
+        nm = re.search(r"^Name:\s*(.+)$", status, re.M)
+        comm = nm.group(1).strip() if nm else "?"
+        if comm in DESKTOP_PROCS or comm in _RUNTIME_PROCS:
+            continue
+        cgroup = _read(f"{proc}/{pid}/cgroup") or ""
+        if _CONTAINER_CGROUP.search(cgroup) or "twinspark-" in cgroup:
+            continue
+        try:
+            cmdline = Path(f"{proc}/{pid}/cmdline").read_bytes()[:4096].decode("utf-8", "replace")
+        except OSError:
+            cmdline = ""
+        if "twinspark" in cmdline:                               # a manual install without systemd units
+            continue
+        rows.append({"name": _display_name(comm, cmdline), "pid": int(pid),
+                     "rss_mib": round(int(m.group(1)) / 1024)})
+    rows.sort(key=lambda r: r["rss_mib"], reverse=True)
+    return rows[:limit]
+
+
+def container_cgroup_dir(container_id: str, root: str = CGROUP_ROOT) -> Optional[Path]:
+    """The cgroup v2 directory of a Docker container (systemd or cgroupfs driver), or None."""
+    if not re.fullmatch(r"[0-9a-f]{64}", container_id or ""):
+        return None
+    for rel in (f"system.slice/docker-{container_id}.scope", f"docker/{container_id}",
+                f"system.slice/docker/{container_id}"):
+        d = Path(root) / rel
+        if d.is_dir():
+            return d
+    return None
+
+
+def read_vmstat(path: str = "/proc/vmstat") -> dict[str, int]:
+    out: dict[str, int] = {}
+    for line in (_read(path) or "").splitlines():
+        key, _, val = line.partition(" ")
+        if key in ("pswpin", "pswpout") and val.strip().isdigit():
+            out[key] = int(val.strip())
+    return out
+
+
+def read_psi(path: str = "/proc/pressure/memory") -> Optional[dict[str, float]]:
+    """Memory pressure stall info (``some``/``full`` avg10, percent), or None without PSI support."""
+    out: dict[str, float] = {}
+    for line in (_read(path) or "").splitlines():
+        kind, _, rest = line.partition(" ")
+        m = re.search(r"avg10=([0-9.]+)", rest)
+        if kind in ("some", "full") and m:
+            out[f"{kind}_avg10"] = float(m.group(1))
+    return out or None
+
+
 def swappiness() -> Optional[int]:
     v = _read("/proc/sys/vm/swappiness")
     return int(v) if v and v.isdigit() else None

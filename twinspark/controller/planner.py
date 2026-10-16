@@ -3,22 +3,25 @@
 DGX Spark is a single unified-memory system, NOT a GPU with separate VRAM. The
 planner works per node — two Sparks are never treated as one 256 GiB pool.
 
-Two outputs matter:
+Three outputs matter:
 
-* ``NodeBudget`` — estimated memory per node, bucket by bucket.
+* ``NodeBudget`` — the 0.5 estimate per node (kept for the launch path and old callers).
 * ``gpu_memory_utilization`` — the value handed to vLLM. vLLM *pre-allocates*
   ``util * total`` for weights + activations + KV cache. On a UMA system that
   pool competes with the OS, Docker and this manager, so it must be derived from
   the non-vLLM reserve, never left at vLLM's default of 0.9.
+* ``NodePlan`` (``plan_node``) — every bucket of one node with its source
+  (measured / calibrated / estimated / unknown) and range, and three separate
+  verdicts: startup peak, one max-length request, full requested concurrency.
 
-Values: Estimated (math), Observed (post-launch telemetry), Calibrated (blend).
+docs/memory-planning.md explains the formulas and which numbers are measured.
 """
 
 from __future__ import annotations
 
 import statistics
 from dataclasses import asdict, dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from ..schemas.enums import DistributedBackend, Quantization, Topology
 
@@ -63,6 +66,15 @@ class ModelSpec:
     # makes the textbook formula useless, so a measured number always wins.
     kv_bytes_per_token: Optional[float] = None
     num_attention_heads: int = 0
+    # Sizes the first-prefill activation peak (0 = unknown: the 0.5 rule of thumb is used instead).
+    hidden_size: int = 0
+    # config.json's num_hidden_layers; ``layers`` carries the same number for the KV formula. Kept as
+    # its own field so specs registered before 0.6 (which lack it) still load.
+    num_hidden_layers: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.num_hidden_layers:
+            self.num_hidden_layers = self.layers
 
     @property
     def is_mla(self) -> bool:
@@ -241,6 +253,572 @@ class MemoryPlanner:
         budget.system_usage += blended - budget.total
         return budget.compute()
 
+    # ---- per-node plan with sources and three verdicts (0.6) -------------------------------
+    def plan_node(
+        self,
+        *,
+        spec: ModelSpec,
+        quant: Quantization,
+        context_length: int,
+        concurrency: int,
+        topology: Topology,
+        node_id: str = "A",
+        backend: DistributedBackend | str = DistributedBackend.NATIVE,
+        kv_dtype: Optional[str] = None,
+        using_cuda_graphs: bool = True,
+        gpu_memory_utilization: Optional[float] = None,
+        facts: Optional[dict] = None,
+        drafters: Iterable["DrafterInput"] = (),
+        max_num_batched_tokens: Optional[int] = None,
+        chunked_prefill: Optional[bool] = None,
+        observed: Optional[dict] = None,
+        observed_kv_tokens: Optional[int] = None,
+        mem_total_gib: Optional[float] = None,
+    ) -> "NodePlan":
+        """Everything one node holds for this deployment, bucket by bucket, and three verdicts.
+
+        ``facts`` are the node's last ``hardware_facts``; ``observed`` is the revision's observed startup
+        (``{"nodes": {node: timeline summary}}``) and ``observed_kv_tokens`` the KV pool vLLM reported
+        on its last successful start. See docs/memory-planning.md for every formula.
+        """
+        return _plan_node(self, spec=spec, quant=quant, context_length=context_length,
+                          concurrency=concurrency, topology=topology, node_id=node_id,
+                          backend=DistributedBackend(backend), kv_dtype=kv_dtype,
+                          using_cuda_graphs=using_cuda_graphs, util=gpu_memory_utilization,
+                          facts=facts or {}, drafters=list(drafters),
+                          batched_tokens=max_num_batched_tokens, chunked_prefill=chunked_prefill,
+                          observed=observed or {}, observed_kv_tokens=observed_kv_tokens,
+                          mem_total_gib=mem_total_gib)
+
+
+# ---- per-node plan ------------------------------------------------------------------------------
+# Defaults are the 0.5 reserves, now shown as "estimated" so a measured reading visibly replaces them.
+GB10_MEM_TOTAL_GIB = 121.6       # MemTotal DGX OS reports on a GB10 (the nominal 128 GB minus firmware carve-outs)
+OS_DOCKER_GIB = 6.4              # OS, kernel and Docker on a headless node: 0.5's 6.0 system + 0.4 runtime
+SERVICES_GIB = 0.2               # TwinSpark agent, controller, privd and terminal (0.5's control plane)
+CUDA_GRAPHS_GIB = 1.2            # captured graphs; 0 in eager mode
+COMM_GIB = {"native": 0.8, "ray": 1.7}   # NCCL buffers + distributed backend (0.5: 0.3/1.2 backend + 0.5 NCCL)
+DEFAULT_BATCHED_TOKENS = 8192    # vLLM's default max_num_batched_tokens for online serving with chunked prefill
+ACT_BUFFERS = 24                 # hidden-sized buffers alive per prefill token (see docs/memory-planning.md)
+ACT_ELEM_BYTES = 2               # bf16/fp16 activations
+LOADER_MIN_GIB = 0.5             # repacking holds the old and the new copy of one layer; at least this much
+LOADER_FIXED_GIB = 1.0           # when the layer count is unknown
+DRAFTER_SCRATCH_MIN_GIB = 0.25
+DRAFTER_SCRATCH_FRACTION = 0.10  # of the drafter's weights, when its hidden size is unknown
+SOURCES = ("measured", "calibrated", "estimated", "unknown")
+# speculative methods that bring no separate drafter checkpoint (they use the target's own layers or none)
+_NO_DRAFTER_METHODS = {"ngram", "suffix", "mtp", "deepseek_mtp", "qwen3_next_mtp", "glm4_moe_mtp", "ernie_mtp"}
+
+
+@dataclass
+class DrafterInput:
+    """A separate drafter checkpoint the deployment loads next to the main model."""
+
+    repo: str
+    spec: Optional[ModelSpec] = None
+    draft_tensor_parallel_size: Optional[int] = None
+    method: Optional[str] = None
+
+
+def drafter_inputs(advanced: Any, spec_lookup: Callable[[str], Optional[ModelSpec]]) -> list[DrafterInput]:
+    """The separate drafter checkpoints a draft's advanced settings load, with their registered specs.
+
+    ``advanced.extra_models`` (pinned "org/repo@sha" or plain "org/repo") plus a Hub repo named by
+    ``speculative_config.model``. An extra model that ``speculative_config`` does not name is loaded by
+    something else (raw flags, a mod): where it lives is unknown, so it is counted like a one-rank drafter.
+    """
+    import re as _re
+    sc = getattr(advanced, "speculative_config", None)
+    sc = sc if isinstance(sc, dict) else {}
+    spec_model = sc.get("model") if isinstance(sc.get("model"), str) else None
+    raw = sc.get("draft_tensor_parallel_size")
+    dtp: Optional[int] = None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        dtp = raw
+    elif isinstance(raw, str) and raw.isdigit():
+        dtp = int(raw)
+    repos = [str(ref).partition("@")[0] for ref in getattr(advanced, "extra_models", None) or []]
+    if spec_model and _re.match(r"^[^/\s]+/[^/\s]+$", spec_model) and spec_model not in repos:
+        repos.append(spec_model)
+    out = []
+    for repo in dict.fromkeys(repos):
+        if repo == spec_model:
+            out.append(DrafterInput(repo, spec_lookup(repo), dtp, sc.get("method")))
+        else:
+            out.append(DrafterInput(repo, spec_lookup(repo), 1, None))
+    return out
+
+
+@dataclass
+class Bucket:
+    """One part of a node's memory. ``gib`` None means unknown: it is shown, never counted as 0."""
+
+    key: str
+    label: str
+    gib: Optional[float]
+    source: str
+    note: str = ""
+    low: Optional[float] = None
+    high: Optional[float] = None
+    # resident (before vLLM) | pool (inside vLLM's claim) | outside (next to it) | load | kv
+    phase: str = "resident"
+
+    def __post_init__(self) -> None:
+        if self.source not in SOURCES:
+            raise ValueError(f"unknown bucket source {self.source!r}")
+        if self.gib is not None:
+            self.low = self.gib if self.low is None else min(self.low, self.gib)
+            self.high = self.gib if self.high is None else max(self.high, self.gib)
+
+    def as_dict(self) -> dict:
+        return {"key": self.key, "label": self.label, "gib": _r(self.gib), "low": _r(self.low),
+                "high": _r(self.high), "source": self.source, "note": self.note, "phase": self.phase}
+
+
+@dataclass
+class NodePlan:
+    node_id: str
+    mem_total_gib: float
+    mem_total_source: str
+    gpu_memory_utilization: float
+    vllm_claim_gib: float
+    buckets: list[Bucket]
+    startup: dict
+    one_context: dict
+    full_concurrency: dict
+    steady_state: dict
+    context_length: int
+    concurrency: int
+    kv_bytes_per_token: Optional[float]
+    drafter: Optional[dict]
+    confidence: dict
+    notes: list[str]
+
+    def bucket(self, key: str) -> Optional[Bucket]:
+        return next((b for b in self.buckets if b.key == key), None)
+
+    def as_dict(self) -> dict:
+        return {"node": self.node_id, "mem_total_gib": round(self.mem_total_gib, 2),
+                "mem_total_source": self.mem_total_source,
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "vllm_claim_gib": round(self.vllm_claim_gib, 2),
+                "buckets": [b.as_dict() for b in self.buckets],
+                "startup": self.startup, "one_context": self.one_context,
+                "full_concurrency": self.full_concurrency, "steady_state": self.steady_state,
+                "context_length": self.context_length, "concurrency": self.concurrency,
+                "kv_bytes_per_token": None if self.kv_bytes_per_token is None else round(self.kv_bytes_per_token, 1),
+                "drafter": self.drafter, "confidence": self.confidence, "notes": self.notes}
+
+
+def _r(v: Optional[float], d: int = 2) -> Optional[float]:
+    return None if v is None else round(v, d)
+
+
+def _num(v: Any) -> Optional[float]:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+        return None
+    return float(v)
+
+
+def _host_buckets(facts: dict) -> list[Bucket]:
+    """OS + Docker, TwinSpark services, desktop and other processes, from the node's last facts.
+
+    When MemTotal/MemAvailable were read, their difference *is* everything resident on the node, so a
+    part that could not be read separately is included in "OS, kernel + Docker" (0 here) rather than
+    guessed twice. Without any reading, the 0.5 defaults are used and desktop / other processes stay
+    unknown.
+    """
+    dry = facts.get("runtime_mode") == "dry-run"
+    total, avail = _num(facts.get("mem_total_gib")), _num(facts.get("mem_available_gib"))
+    have_used = bool(total) and avail is not None and not dry
+    age = _num(facts.get("read_at"))
+    when = ""
+    if age:
+        import time as _time
+        hours = (_time.time() - age) / 3600
+        when = f" (read {hours:.0f} h ago)" if hours >= 2 else ""
+
+    # TwinSpark services: cgroup v2 memory.current of each unit
+    svc = facts.get("services_memory") if isinstance(facts.get("services_memory"), dict) else {}
+    units = {k: v for k, v in svc.items() if isinstance(v, dict)}
+    cur = {k: _num(v.get("current_mib")) for k, v in units.items()}
+    known = {k: v for k, v in cur.items() if v is not None}
+    simulated = any(v.get("simulated") for v in units.values())
+    if known:
+        gib = sum(known.values()) / 1024
+        peak = sum((_num(units[k].get("peak_mib")) or known[k]) for k in known) / 1024
+        src = "estimated" if (simulated or dry) else "measured"
+        note = ", ".join(f"{k.replace('twinspark-', '')} {v:.0f} MiB" for k, v in sorted(known.items()))
+        note = ("simulated by the dry-run agent: " if simulated else "cgroup memory.current: ") + note
+        if len(known) < len(units):
+            note += f"; {len(units) - len(known)} unit(s) unreadable"
+        services = Bucket("twinspark_services", "TwinSpark services", gib, src, note + when, high=max(gib, peak))
+    elif have_used:
+        services = Bucket("twinspark_services", "TwinSpark services", 0.0, "measured",
+                          "no per-unit reading (older agent or no systemd units): included in OS, kernel + Docker")
+    else:
+        services = Bucket("twinspark_services", "TwinSpark services", SERVICES_GIB, "estimated",
+                          "no reading: the 0.5 default", low=0.1, high=0.6)
+
+    # desktop session
+    if not dry and isinstance(facts.get("desktop_running"), bool) and _num(facts.get("desktop_rss_gib")) is not None:
+        gib = float(facts["desktop_rss_gib"]) if facts["desktop_running"] else 0.0
+        names = ", ".join(facts.get("desktop_processes") or [])[:120]
+        desktop = Bucket("desktop", "Desktop session", gib, "measured",
+                         (f"RSS of {names}" if facts["desktop_running"] and names else
+                          "no graphical session running" if not facts["desktop_running"] else "desktop RSS") + when)
+    elif dry:
+        desktop = Bucket("desktop", "Desktop session", 0.0, "estimated", "dry-run: assumed headless")
+    elif have_used:
+        desktop = Bucket("desktop", "Desktop session", 0.0, "measured",
+                         "not read separately: included in OS, kernel + Docker")
+    else:
+        desktop = Bucket("desktop", "Desktop session", None, "unknown",
+                         "not read yet: a desktop session (about 3 GiB) would come on top")
+
+    # other processes: the largest few above 100 MiB
+    procs = facts.get("other_processes")
+    if isinstance(procs, list) and not dry:
+        rows = [p for p in procs if isinstance(p, dict) and _num(p.get("rss_mib")) is not None]
+        gib = sum(float(p["rss_mib"]) for p in rows) / 1024
+        note = ", ".join(f"{str(p.get('name'))[:40]} {float(p['rss_mib']):.0f} MiB" for p in rows[:5]) or \
+            "none above 100 MiB"
+        other = Bucket("other_apps", "Other processes", gib, "measured",
+                       f"RSS, largest above 100 MiB: {note}" + when)
+    elif have_used:
+        other = Bucket("other_apps", "Other processes", 0.0, "measured",
+                       "not listed by this agent: included in OS, kernel + Docker")
+    else:
+        other = Bucket("other_apps", "Other processes", None, "unknown",
+                       "not read (dry-run or no hardware facts yet)" if dry or not facts else "not read by this agent")
+
+    # OS, kernel + Docker: what MemTotal - MemAvailable leaves after the parts above
+    if have_used:
+        used = total - avail
+        owned = facts.get("owned_containers") if isinstance(facts.get("owned_containers"), dict) else {}
+        running = int(_num(owned.get("running")) or 0)
+        owned_mib = _num(owned.get("current_mib"))
+        if running and owned_mib is None:
+            os_b = Bucket("os_kernel_docker", "OS, kernel + Docker", OS_DOCKER_GIB, "estimated",
+                          f"a TwinSpark model was running when the node was read{when}; its memory cannot be "
+                          f"separated, so the 0.5 default is used", low=4.5, high=8.0)
+        else:
+            parts = sum(b.gib or 0.0 for b in (services, desktop, other) if b.source == "measured")
+            gib = used - parts - (owned_mib or 0.0) / 1024
+            note = f"MemTotal - MemAvailable = {used:.1f} GiB minus the parts listed separately"
+            if running:
+                note += f" and the running model ({(owned_mib or 0) / 1024:.1f} GiB)"
+            if gib < 0:
+                note += "; the readings disagree (taken at different moments), shown as 0"
+                gib = 0.0
+            os_b = Bucket("os_kernel_docker", "OS, kernel + Docker", gib, "measured", note + when,
+                          low=max(0.0, gib - max(0.5, gib * 0.1)), high=gib + max(0.5, gib * 0.1))
+    else:
+        os_b = Bucket("os_kernel_docker", "OS, kernel + Docker", OS_DOCKER_GIB, "estimated",
+                      "dry-run: the 0.5 default for a headless Spark" if dry else
+                      "no reading yet: the 0.5 default for a headless node", low=4.5, high=8.0)
+    return [os_b, services, desktop, other]
+
+
+def _prefill_gib(spec: ModelSpec, tokens: int) -> Optional[float]:
+    """First-prefill activation peak: ``tokens x hidden_size x 2 bytes x ACT_BUFFERS``.
+
+    Inference keeps one layer's activations at a time, so the layer count does not multiply this.
+    ACT_BUFFERS = 24 hidden-sized buffers per token covers q/k/v/o, the MLP or MoE gate/up/down
+    intermediates including top-k token copies, residual and norm buffers. Under tensor parallelism
+    the hidden states are replicated on every rank, so the figure is not halved.
+    """
+    if not spec.hidden_size or tokens <= 0:
+        return None
+    return tokens * spec.hidden_size * ACT_ELEM_BYTES * ACT_BUFFERS / 1024 ** 3
+
+
+def _drafter_bucket(drafters: list[DrafterInput], sharded: bool, node_id: str, observed_nodes: dict,
+                    batched: int) -> tuple[Optional[Bucket], Optional[Bucket], Optional[dict]]:
+    """Drafter weights + scratch on this node, and the placement shown to the user.
+
+    ``draft_tensor_parallel_size: 1`` means a one-rank drafter. Which rank holds it under TP2 is not
+    something TwinSpark can confirm before a start, so the whole drafter is counted on every node that
+    can host it until a startup timeline shows otherwise.
+    """
+    real = [d for d in drafters if (d.method or "").lower() not in _NO_DRAFTER_METHODS]
+    if not real:
+        return None, None, None
+    weights: list[float] = []
+    scratch: list[float] = []
+    unknown, placements = [], []
+    calibrated = False
+    for d in real:
+        if d.spec is None or not (d.spec.weight_bytes or d.spec.num_params):
+            unknown.append(d.repo)
+            continue
+        full = (d.spec.weight_bytes or d.spec.num_params * 2.0) / 1024 ** 3
+        dtp = d.draft_tensor_parallel_size
+        split = sharded and (dtp is None or dtp >= 2)
+        gib = full / 2 if split else full
+        placement = ("split over both nodes (" + ("draft_tensor_parallel_size 2" if dtp else
+                     "vLLM default: the drafter uses the target's tensor parallel size") + ")") if split else \
+            ("on this node" if not sharded else "unconfirmed (counted on both nodes)")
+        if sharded and not split:
+            cal = _drafter_calibration(observed_nodes, full)
+            if cal is not None:
+                placement, on_this = cal(node_id)
+                calibrated = True
+                if not on_this:
+                    gib = 0.0
+        weights.append(gib)
+        placements.append(f"{d.repo}: {placement}")
+        act = _prefill_gib(d.spec, batched)
+        scratch.append(act if act is not None else max(DRAFTER_SCRATCH_MIN_GIB, full * DRAFTER_SCRATCH_FRACTION))
+    if unknown and not weights:
+        wb = Bucket("drafter_weights", "Drafter weights", None, "unknown",
+                    f"size of {', '.join(unknown)} unknown: pin the profile so its config and checkpoint size are "
+                    f"registered", phase="pool")
+        sb = Bucket("drafter_scratch", "Drafter scratch", None, "unknown", "drafter size unknown", phase="outside")
+    else:
+        note = "; ".join(placements) + (f"; size of {', '.join(unknown)} unknown, not counted" if unknown else "")
+        wb = Bucket("drafter_weights", "Drafter weights", sum(weights), "calibrated" if calibrated else "measured",
+                    "checkpoint size; " + note, high=sum(weights) * 1.05, phase="pool")
+        sb = Bucket("drafter_scratch", "Drafter scratch", sum(scratch), "estimated",
+                    "the drafter's own working memory for a prefill batch; not every speculative method's dummy "
+                    "run is profiled by vLLM, so it is counted next to vLLM's claim",
+                    low=sum(scratch) * 0.5, high=sum(scratch) * 2, phase="outside")
+    info = {"repos": [d.repo for d in real], "placement": "; ".join(placements) or "unknown",
+            "confirmed": calibrated, "unknown_size": unknown}
+    return wb, sb, info
+
+
+def _drafter_calibration(observed_nodes: dict, drafter_gib: float):
+    """Placement from the last startup timeline: node A's and B's vLLM footprints differ by about the
+    drafter's size when only one rank holds it. Ambiguous differences leave it unconfirmed."""
+    fa = _num((observed_nodes.get("A") or {}).get("footprint_gib"))
+    fb = _num((observed_nodes.get("B") or {}).get("footprint_gib"))
+    if fa is None or fb is None or drafter_gib < 0.5:
+        return None
+    diff = fa - fb
+    if abs(diff) <= 0.25 * drafter_gib:
+        return lambda node: ("on both nodes (calibrated from the last startup)", True)
+    if abs(diff) >= 0.75 * drafter_gib:
+        holder = "A" if diff > 0 else "B"
+        return lambda node: (f"node {holder} only (calibrated: its startup footprint was {abs(diff):.1f} GiB "
+                             f"larger)", node == holder)
+    return None
+
+
+def _level(margin: Optional[float]) -> str:
+    return "UNKNOWN" if margin is None else MemoryPlanner.classify_headroom(margin)
+
+
+def _plan_node(planner: MemoryPlanner, *, spec: ModelSpec, quant: Quantization, context_length: int,
+               concurrency: int, topology: Topology, node_id: str, backend: DistributedBackend,
+               kv_dtype: Optional[str], using_cuda_graphs: bool, util: Optional[float], facts: dict,
+               drafters: list[DrafterInput], batched_tokens: Optional[int], chunked_prefill: Optional[bool],
+               observed: dict, observed_kv_tokens: Optional[int], mem_total_gib: Optional[float]) -> NodePlan:
+    notes: list[str] = []
+    sharded = topology in _SHARDED
+    shards = 2 if sharded else 1
+    observed_nodes = observed.get("nodes") if isinstance(observed.get("nodes"), dict) else {}
+
+    # ---- the node itself ----------------------------------------------------------------------
+    total = _num(facts.get("mem_total_gib"))
+    if total:
+        mem_total, mem_src = total, "measured"
+    elif mem_total_gib:
+        mem_total, mem_src = float(mem_total_gib), "measured"
+    else:
+        mem_total, mem_src = GB10_MEM_TOTAL_GIB, "estimated"
+        notes.append(f"node {node_id} has not reported its MemTotal yet: {GB10_MEM_TOTAL_GIB} GiB (a GB10) is assumed")
+    if util is None:
+        util = planner.gpu_memory_utilization(planner.reserve_budget(node_id, mem_total_gib=mem_total))
+    claim = util * mem_total                     # vLLM sizes its KV cache to fill this
+    buckets = _host_buckets(facts)
+
+    # ---- inside vLLM's claim ------------------------------------------------------------------
+    if spec.weight_bytes:
+        weights = spec.weight_bytes / 1024 ** 3 / shards
+        wnote = "checkpoint size (safetensors index)" + (", split over 2 nodes" if sharded else "")
+        wsrc = "measured"
+    else:
+        weights = spec.num_params * _BYTES_PER_PARAM[quant] / 1024 ** 3 / shards
+        wnote = f"parameters x {_BYTES_PER_PARAM[quant]} bytes ({quant.value})" + \
+            (", split over 2 nodes" if sharded else "")
+        wsrc = "estimated"
+    buckets.append(Bucket("main_weights", "Model weights", weights, wsrc, wnote,
+                          low=weights * 0.98, high=weights * 1.05, phase="pool"))
+
+    tokens = batched_tokens or (context_length if chunked_prefill is False else DEFAULT_BATCHED_TOKENS)
+    tok_note = (f"max_num_batched_tokens {tokens:,}" if batched_tokens else
+                f"chunked prefill off: one full {tokens:,}-token prefill" if chunked_prefill is False else
+                f"vLLM's default max_num_batched_tokens {tokens:,} assumed")
+    drafter_w, drafter_s, drafter_info = _drafter_bucket(drafters, sharded, node_id, observed_nodes, tokens)
+    if drafter_w is not None:
+        buckets.append(drafter_w)
+
+    act = _prefill_gib(spec, tokens)
+    if act is not None:
+        buckets.append(Bucket("first_prefill", "First-prefill peak", act, "estimated",
+                              f"{tok_note} x hidden {spec.hidden_size} x {ACT_ELEM_BYTES} bytes x "
+                              f"{ACT_BUFFERS} buffers",
+                              low=act * 0.5, high=act * 1.5, phase="pool"))
+    else:
+        old = max(1.0, weights * 0.05) + 0.25 * min(concurrency, 16)
+        buckets.append(Bucket("first_prefill", "First-prefill peak", old, "estimated",
+                              "hidden size unknown: 0.5's rule (5% of the weights + 0.25 GiB per sequence)",
+                              low=old * 0.5, high=old * 2, phase="pool"))
+    graphs = CUDA_GRAPHS_GIB if using_cuda_graphs else 0.0
+    buckets.append(Bucket("cuda_graphs", "CUDA graphs", graphs, "estimated",
+                          "captured graphs (fixed allowance)" if using_cuda_graphs else "eager mode: no CUDA graphs",
+                          low=graphs * 0.4, high=graphs * 2.5, phase="pool"))
+
+    # ---- next to vLLM's claim -----------------------------------------------------------------
+    comm = 0.0 if not sharded else COMM_GIB["ray" if backend == DistributedBackend.RAY else "native"]
+    buckets.append(Bucket("comm_buffers", "NCCL / backend buffers", comm, "estimated",
+                          "single node: no inter-node communication" if not sharded else
+                          f"NCCL buffers + {'Ray' if backend == DistributedBackend.RAY else 'native'} backend "
+                          f"(fixed allowance)", low=comm * 0.5, high=comm * 1.5, phase="outside"))
+    if drafter_s is not None:
+        buckets.append(drafter_s)
+    layers = spec.num_hidden_layers or spec.layers
+    if layers:
+        loader = max(LOADER_MIN_GIB, weights / layers)
+        lnote = f"one layer's weights on this node ({weights / layers:.2f} GiB): repacking briefly holds two copies"
+    else:
+        loader, lnote = LOADER_FIXED_GIB, "layer count unknown: fixed allowance"
+    buckets.append(Bucket("loader_transient", "Loader transient", loader, "estimated", lnote,
+                          low=min(loader, 0.25), high=loader * 2, phase="load"))
+
+    # ---- KV ------------------------------------------------------------------------------------
+    kv_elem = _KV_BYTES.get((kv_dtype or "auto").lower(), 2.0)
+    if spec.kv_bytes_per_token:
+        per_tok = float(spec.kv_bytes_per_token)
+        kv_src, kv_note = "measured", "KV bytes per token measured by the recipe (per node, as served)"
+    else:
+        per_tok = _kv_bytes_per_token(spec, kv_elem)
+        if (topology == Topology.PP2 or (topology in (Topology.TP2, Topology.TP_EP) and not spec.is_mla
+                                         and spec.num_kv_heads >= 2)):
+            per_tok /= 2
+        kv_src, kv_note = "estimated", f"textbook KV formula ({kv_dtype or 'auto'} cache)"
+    if per_tok > 0:
+        kv_one = per_tok * context_length / 1024 ** 3
+        kv_full = kv_one * concurrency
+        buckets.append(Bucket("kv_one_sequence", "KV: one max-length sequence", kv_one, kv_src,
+                              f"{kv_note}; {context_length:,} tokens", phase="kv"))
+        buckets.append(Bucket("kv_full_concurrency", "KV: requested concurrency", kv_full, kv_src,
+                              f"{concurrency} x {context_length:,} tokens", phase="kv"))
+    else:
+        kv_one = kv_full = None
+        why = "no KV size: the model's attention layout is not known"
+        buckets.append(Bucket("kv_one_sequence", "KV: one max-length sequence", None, "unknown", why, phase="kv"))
+        buckets.append(Bucket("kv_full_concurrency", "KV: requested concurrency", None, "unknown", why, phase="kv"))
+
+    # ---- verdicts ------------------------------------------------------------------------------
+    def total_of(phases: tuple[str, ...], attr: str, skip: tuple[str, ...] = ()) -> float:
+        return sum(getattr(b, attr) for b in buckets
+                   if b.phase in phases and b.gib is not None and b.key not in skip)
+
+    not_counted = [b.label for b in buckets if b.gib is None and b.phase != "kv"]
+    rng = {}
+    for attr in ("gib", "low", "high"):
+        resident = total_of(("resident",), attr)
+        pool_fixed = total_of(("pool",), attr)
+        outside = total_of(("outside",), attr)
+        prefill = next(getattr(b, attr) for b in buckets if b.key == "first_prefill")
+        comm_part = next(getattr(b, attr) for b in buckets if b.key == "comm_buffers")
+        load_part = total_of(("pool",), attr, skip=("first_prefill", "cuda_graphs"))
+        one = 0.0 if kv_one is None else kv_one
+        # vLLM fills its claim with KV cache; it never holds less than its fixed part plus one sequence
+        vllm = max(claim, pool_fixed + one)
+        serve_peak = resident + outside + vllm
+        # while loading, no KV cache exists yet: weights + one layer being repacked
+        load_peak = resident + comm_part + load_part + total_of(("load",), attr)
+        rng[attr] = {"resident": resident, "pool_fixed": pool_fixed, "serve": serve_peak, "load": load_peak,
+                     "peak": max(serve_peak, load_peak), "steady": serve_peak - prefill,
+                     "kv_space": claim - pool_fixed}
+    est = rng["gib"]
+    # the pessimistic peak uses the high ends of every range and the optimistic one the low ends
+    peak, peak_hi, peak_lo = est["peak"], rng["high"]["peak"], rng["low"]["peak"]
+    phase = "weight loading" if est["load"] > est["serve"] else "first prefill"
+    startup = {"peak_gib": _r(peak), "peak_low_gib": _r(peak_lo), "peak_high_gib": _r(peak_hi),
+               "estimate_gib": _r(peak), "mem_total_gib": _r(mem_total), "phase": phase,
+               "source": "estimated", "not_counted": not_counted}
+    obs = observed_nodes.get(node_id) if isinstance(observed_nodes.get(node_id), dict) else None
+    footprint = _num((obs or {}).get("footprint_gib"))
+    if footprint is not None:
+        # what this revision's containers took on this node at the startup's lowest MemAvailable,
+        # on top of what is resident now
+        peak = est["resident"] + footprint
+        peak_lo, peak_hi = rng["low"]["resident"] + footprint, rng["high"]["resident"] + footprint
+        startup.update(peak_gib=_r(peak), peak_low_gib=_r(peak_lo), peak_high_gib=_r(peak_hi), source="calibrated",
+                       observed_footprint_gib=_r(footprint), observed_at=(observed or {}).get("at"),
+                       observed_min_available_gib=_r(_num(obs.get("min_mem_available_gib"))),
+                       observed_min_stage=obs.get("min_stage"))
+    margin = mem_total - peak
+    startup.update(margin_gib=_r(margin), margin_low_gib=_r(mem_total - peak_hi),
+                   margin_high_gib=_r(mem_total - peak_lo), ok=margin >= 0, level=_level(margin))
+    if startup["source"] == "calibrated":
+        startup["note"] = (f"last startup of this revision took {footprint:.1f} GiB here at its lowest MemAvailable; "
+                           f"with what is resident now that peaks at {peak:.1f} of {mem_total:.1f} GiB "
+                           f"(estimate: {est['peak']:.1f} GiB)")
+    else:
+        startup["note"] = (f"peak during {phase}: {peak:.1f} of {mem_total:.1f} GiB "
+                           f"(vLLM claims {util:.2f} x {mem_total:.1f} = {claim:.1f} GiB and fills it with KV cache)")
+    if margin >= 0 > mem_total - peak_hi:
+        startup["note"] += "; the pessimistic end of the range does not fit"
+    if not_counted:
+        startup["note"] += f"; not counted (unknown): {', '.join(not_counted)}"
+
+    kv_space = est["kv_space"]
+    one_ctx: dict[str, Any] = {"kv_space_gib": _r(kv_space), "needed_gib": _r(kv_one), "source": kv_src}
+    full: dict[str, Any] = {"kv_space_gib": _r(kv_space), "needed_gib": _r(kv_full), "source": kv_src,
+                            "requested_concurrency": concurrency}
+    if kv_one is None:
+        one_ctx.update(ok=None, level="UNKNOWN", margin_gib=None, note="KV size per token unknown")
+        full.update(ok=None, level="UNKNOWN", margin_gib=None, est_full_length_seqs=None, est_kv_tokens=None,
+                    note="KV size per token unknown")
+    else:
+        tokens_fit = max(0.0, kv_space) * 1024 ** 3 / per_tok
+        seqs = tokens_fit / context_length
+        one_ctx.update(ok=kv_space >= kv_one, margin_gib=_r(kv_space - kv_one), level=_level(kv_space - kv_one),
+                       note=(f"vLLM's claim minus weights, first prefill and graphs leaves {kv_space:.1f} GiB of KV; "
+                             f"one {context_length:,}-token sequence needs {kv_one:.1f} GiB") if kv_space >= kv_one else
+                       (f"only {max(0.0, kv_space):.1f} GiB of KV is left, one {context_length:,}-token sequence "
+                        f"needs {kv_one:.1f} GiB: vLLM refuses to start"))
+        ok = kv_space >= kv_full
+        full.update(ok=ok, margin_gib=_r(kv_space - kv_full),
+                    level=_level(kv_space - kv_full) if ok else ("LOW" if kv_space >= kv_one else "CRITICAL"),
+                    est_full_length_seqs=round(seqs, 1), est_kv_tokens=int(tokens_fit),
+                    note=f"room for about {seqs:.1f} full-length sequences, {concurrency} requested"
+                    + ("" if ok else ": vLLM serves fewer in parallel"))
+        if observed_kv_tokens:
+            cal = observed_kv_tokens / context_length
+            full.update(source="calibrated", est_kv_tokens=int(observed_kv_tokens),
+                        est_full_length_seqs=round(cal, 1), ok=cal >= concurrency, estimate_kv_tokens=int(tokens_fit),
+                        note=f"vLLM reported {observed_kv_tokens:,} KV tokens on its last start of this revision: "
+                             f"about {cal:.1f} full-length sequences, {concurrency} requested")
+            full["level"] = "SAFE" if full["ok"] else ("LOW" if cal >= 1 else "CRITICAL")
+            one_ctx.update(source="calibrated", ok=cal >= 1, level="SAFE" if cal >= 1 else "CRITICAL")
+    steady = {"gib": _r(est["steady"]), "low_gib": _r(rng["low"]["steady"]), "high_gib": _r(rng["high"]["steady"]),
+              "note": "weights, KV cache and everything else resident while serving; the first-prefill working set "
+                      "comes on top only while a long prefill runs"}
+
+    # ---- confidence: how many inputs were read rather than assumed --------------------------------
+    inputs = [mem_src] + [b.source for b in buckets if b.key in (
+        "os_kernel_docker", "twinspark_services", "desktop", "other_apps", "main_weights", "drafter_weights",
+        "kv_one_sequence")] + [startup["source"]]
+    measured = sum(1 for s in inputs if s in ("measured", "calibrated"))
+    confidence = {"measured_inputs": measured, "inputs": len(inputs),
+                  "text": f"measured inputs: {measured}/{len(inputs)}",
+                  "unknown": [b.label for b in buckets if b.source == "unknown"]}
+    if drafter_info and not drafter_info["confirmed"] and sharded and "unconfirmed" in drafter_info["placement"]:
+        notes.append("the drafter runs with draft_tensor_parallel_size 1; which node holds it is not confirmed, so it "
+                     "is counted fully on both")
+    return NodePlan(node_id=node_id, mem_total_gib=mem_total, mem_total_source=mem_src,
+                    gpu_memory_utilization=util, vllm_claim_gib=claim, buckets=buckets, startup=startup,
+                    one_context=one_ctx, full_concurrency=full, steady_state=steady,
+                    context_length=context_length, concurrency=concurrency,
+                    kv_bytes_per_token=per_tok if per_tok > 0 else None, drafter=drafter_info,
+                    confidence=confidence, notes=notes)
+
 
 _MOE_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
@@ -289,4 +867,5 @@ def make_spec_from_hf(config: dict, weight_bytes: Optional[int] = None) -> Model
         num_attention_heads=_cfg_int(cfg, "num_attention_heads"),
         kv_lora_rank=_cfg_int(cfg, "kv_lora_rank"),
         qk_rope_head_dim=_cfg_int(cfg, "qk_rope_head_dim"),
+        hidden_size=hidden, num_hidden_layers=layers,
     )
