@@ -295,6 +295,20 @@ def _gid_ipv4(gid: str) -> Optional[str]:
     return str(mapped) if mapped else None
 
 
+# Interfaces made by container runtimes, VPNs, bridges and overlays. Some of them have a ``device`` link in
+# sysfs (a macvlan or a VLAN on the QSFP port, a VF) and can even carry RoCE GIDs of the real port: never a
+# QSFP port, an NCCL interface or the GID NCCL should use. GPUStack's discovery learned the same list.
+VIRTUAL_PREFIXES = ("lo", "docker", "br-", "veth", "virbr", "vnet", "cni", "flannel", "cali", "weave", "cilium",
+                    "kube", "tailscale", "tun", "tap", "wg", "zt", "vxlan", "genev", "lxc", "lxdbr", "podman",
+                    "vmnet", "dummy", "ifb", "nerdctl", "macvlan", "macvtap", "ipvlan")
+
+
+def is_virtual_name(name: str) -> bool:
+    """A name that only a virtual interface has: the prefixes above, or a VLAN/alias (``x.100``, ``x@y``)."""
+    n = (name or "").lower()
+    return n.startswith(VIRTUAL_PREFIXES) or "." in n or "@" in n or ":" in n
+
+
 def rdma_devices(sysfs: str = "/sys/class/infiniband") -> list[dict[str, Any]]:
     """Every RoCE/IB device with state, rate, netdev and its RoCE v2 IPv4 GIDs."""
     root = Path(sysfs)
@@ -307,8 +321,8 @@ def rdma_devices(sysfs: str = "/sys/class/infiniband") -> list[dict[str, Any]]:
             state = _read(port / "state") or ""
             rate = _read(port / "rate") or ""
             m = re.match(r"([0-9.]+)", rate)
-            netdevs = sorted(p.name for p in (dev / "device" / "net").iterdir()) \
-                if (dev / "device" / "net").is_dir() else []
+            netdevs = sorted(p.name for p in (dev / "device" / "net").iterdir()
+                             if not is_virtual_name(p.name)) if (dev / "device" / "net").is_dir() else []
             gids = []
             gdir, tdir, ndir = port / "gids", port / "gid_attrs" / "types", port / "gid_attrs" / "ndevs"
             for g in sorted(gdir.iterdir(), key=lambda p: int(p.name)) if gdir.is_dir() else []:
@@ -318,7 +332,9 @@ def rdma_devices(sysfs: str = "/sys/class/infiniband") -> list[dict[str, Any]]:
                 gids.append({"index": int(g.name), "gid": gid,
                              "type": _read(tdir / g.name), "ndev": _read(ndir / g.name),
                              "ipv4": _gid_ipv4(gid)})
-            v2 = [g for g in gids if g["ipv4"] and (g["type"] or "").lower().startswith("roce v2")]
+            # a GID of a macvlan, VLAN or container interface on top of the port is not the port's own address
+            v2 = [g for g in gids if g["ipv4"] and (g["type"] or "").lower().startswith("roce v2")
+                  and not is_virtual_name(g["ndev"] or "")]
             out.append({
                 "hca": dev.name, "port": int(port.name),
                 "state": state.split(":", 1)[-1].strip() if ":" in state else state,

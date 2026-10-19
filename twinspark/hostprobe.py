@@ -84,7 +84,7 @@ def list_interfaces(sysfs: str = "/sys/class/net", run: Runner = run_cmd,
     for p in sorted(root.iterdir(), key=lambda x: x.name):
         if p.name == "lo":
             continue
-        virtual = not (p / "device").exists()
+        virtual = not (p / "device").exists() or sysinfo.is_virtual_name(p.name)
         speed = _read(p / "speed")
         mac = _read(p / "address")
         ifaces.append(Iface(

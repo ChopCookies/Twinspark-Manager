@@ -1,3 +1,5 @@
+import re
+
 import httpx
 import pytest
 from pydantic import ValidationError
@@ -102,6 +104,10 @@ async def test_split_checks_memory_of_second_model_before_stopping(cluster):
                                              num_kv_heads=8, head_dim=128))
     job = await cluster.wait_job((await c.activate("duo")).job_id)
     assert job.state.value == "failed" and "duo-b: estimated not to fit" in job.error
+    # the verdict names the numbers: the claim, what the node has, what vLLM needs and for what
+    assert re.search(r"--gpu-memory-utilization=0\.\d\d vLLM may use [\d.]+ of [\d.]+ GiB per node and needs "
+                     r"[\d.]+ GiB \(weights [\d.]+", job.error) or "the node has" in job.error, job.error
+    assert re.search(r"[\d.]+ GiB short per node", job.error), job.error
     assert c.active()["profile"] == "baseline"
     assert set(c.profile_fit("duo")["nodes"]) == {"A", "B"}
 

@@ -271,11 +271,13 @@ class ActivationCoordinator:
                     single = self.planner.estimate(context_length=one_ctx, concurrency=1, **common)
                     ok1, head1 = self.planner.fits(single, util)
                     if not ok1:
-                        raise RuntimeError(f"{part.profile_name}: estimated not to fit: weights "
-                                           f"{single.model_weights:.1f} GiB/node + one sequence are "
-                                           f"{-head1:.1f} GiB short per node (out of memory expected)")
-                    notes.append(f"{part.profile_name}: KV estimate exceeds pool by {-headroom:.1f} "
-                                 "GiB/node — vLLM fits fewer parallel sequences")
+                        raise RuntimeError(f"{part.profile_name}: estimated not to fit: for one {one_ctx:,}-token "
+                                           f"sequence, {self.planner.explain(single, util)} — {-head1:.1f} GiB short "
+                                           "per node (out of memory expected)")
+                    seqs = a.max_num_seqs or s.concurrency
+                    notes.append(f"{part.profile_name}: {seqs} sequence(s) of {s.planning_context():,} tokens need "
+                                 f"{budget.kv_cache:.1f} GiB of KV cache per node, {-headroom:.1f} GiB more than "
+                                 f"fits ({self.planner.explain(budget, util)}) — vLLM serves fewer in parallel")
                 notes.append(f"{part.profile_name}: estimated headroom {headroom:.1f} GiB/node")
                 startup = self._startup_verdicts(part, spec, util, nodes)
                 if startup:

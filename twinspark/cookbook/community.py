@@ -8,8 +8,9 @@ A report is built from an allowlist, never by stripping a full record:
 * the outcome (``works``, ``works-with-changes``, ``fails`` with the stage it failed in);
 * the TwinSpark, engine and engine versions, the topology;
 * numbers from the newest valid benchmark of each preset (tok/s, TTFT, concurrency; numbers only);
-* the settings changed against the recipe — only known tuning fields, only numbers, booleans and short
-  plain words (no paths, addresses, model names, environment variables, raw arguments);
+* the settings changed against the recipe — only known tuning fields with numbers, booleans and short
+  plain words, and free-form vLLM flags with numbers and booleans only (no paths, addresses, model names,
+  environment variables, raw arguments);
 * an optional comment the user typed (500 characters), shown in the preview like everything else;
 * a random reporter id (not derived from anything on the machine) so a later report replaces the earlier
   one instead of counting twice; ``--anonymous`` leaves it out.
@@ -85,6 +86,16 @@ def _flatten(doc: Any, path: str = "") -> dict[str, Any]:
     return {path: doc}
 
 
+def _reportable(field: str, value: Any) -> bool:
+    """A named tuning field takes a plain value; a free-form flag (``extra_vllm_flags.*``, compilation
+    options) only a number or a boolean — a word there could be a name someone chose."""
+    if not _FIELD.match(field) or not _plain(value):
+        return False
+    if field in _TUNING:
+        return True
+    return field.startswith(_TUNING_PREFIXES) and (value is None or isinstance(value, (bool, int, float)))
+
+
 def tuning_changes(baseline: Optional[dict], current: dict) -> list[dict[str, Any]]:
     """Fields of the allowlist whose value differs from the recipe's, with the new value."""
     if not isinstance(baseline, dict):
@@ -92,10 +103,8 @@ def tuning_changes(baseline: Optional[dict], current: dict) -> list[dict[str, An
     a, b = _flatten(baseline), _flatten(current)
     out = []
     for field in sorted(set(a) | set(b)):
-        if field not in _TUNING and not field.startswith(_TUNING_PREFIXES):
-            continue
         before, after = a.get(field), b.get(field)
-        if before == after or not _plain(after) or not _FIELD.match(field):
+        if before == after or not _reportable(field, after):
             continue
         out.append({"field": field, "value": after})
     return out[:MAX_CHANGES]
@@ -201,9 +210,7 @@ def check_report(doc: Any) -> dict[str, Any]:
     if not isinstance(changes, list) or len(changes) > MAX_CHANGES:
         raise ReportError("invalid changes")
     for c in changes:
-        field = str(c.get("field")) if isinstance(c, dict) else ""
-        if not isinstance(c, dict) or set(c) != {"field", "value"} or not _FIELD.match(field) \
-                or not (field in _TUNING or field.startswith(_TUNING_PREFIXES)) or not _plain(c["value"]):
+        if not isinstance(c, dict) or set(c) != {"field", "value"} or not _reportable(str(c["field"]), c["value"]):
             raise ReportError(f"a changed setting is not reportable: {str(c)[:80]}")
     comment = doc.get("comment")
     if not isinstance(comment, str) or len(comment) > MAX_COMMENT:

@@ -79,7 +79,7 @@ foreach ($rows as $r) {
     unset($m);
     if ($r['outcome'] !== 'fails') {           // what people changed in setups that work
         foreach (json_decode((string)$r['changes'], true) ?: [] as $c) {
-            if (is_array($c) && isset($c['field']) && ts_tuning((string)$c['field']) && ts_plain($c['value'] ?? null)) {
+            if (is_array($c) && isset($c['field']) && ts_reportable((string)$c['field'], $c['value'] ?? null)) {
                 $pair = json_encode([$c['field'], $c['value'] ?? null]);
                 $s['pairs'][$pair] = ($s['pairs'][$pair] ?? 0) + 1;
             }

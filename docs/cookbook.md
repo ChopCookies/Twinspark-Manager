@@ -105,7 +105,7 @@ In the GUI: a profile imported from the Cookbook has *Share result…*; the Cook
 | `outcome`, `failure_stage` | `works`, `works-with-changes` or `fails`, and where (download, pull, start, health, …) |
 | `twinspark`, `engine`, `engine_version`, `topology` | versions and the node arrangement |
 | `benchmarks` | the newest valid result of each benchmark preset: tok/s, TTFT, concurrency — numbers only |
-| `changes` | settings you changed against the recipe: known tuning fields only (context, batch sizes, memory, parsers, sampling, vLLM flags), and only numbers, booleans and short plain words |
+| `changes` | settings you changed against the recipe: known tuning fields only (context, batch sizes, memory, parsers, sampling) with numbers, booleans and short plain words; extra vLLM flags with numbers and booleans only |
 | `comment` | what you typed (500 characters); refused if it contains an address or a home path |
 | `reporter` | a random id made for this installation (next to node A's state database, `community-reporter`) so a later report replaces the earlier one; left out with `--anonymous` |
 

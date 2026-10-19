@@ -132,6 +132,16 @@ function ts_tuning(string $field): bool
     return false;
 }
 
+/** A named tuning field takes a plain value; a free-form flag only a number or a boolean. */
+function ts_reportable(string $field, $value): bool
+{
+    if (!preg_match('/^[a-z_][a-z0-9_.-]{0,95}$/', $field) || !ts_tuning($field) || !ts_plain($value)) {
+        return false;
+    }
+    return in_array($field, TS_TUNING, true) || $value === null || is_bool($value) || is_int($value)
+        || is_float($value);
+}
+
 /** The report, checked field by field; throws InvalidArgumentException with the reason. */
 function ts_check_report($doc): array
 {
@@ -202,8 +212,7 @@ function ts_check_report($doc): array
         if (!is_array($c) || array_keys($c) != ['field', 'value'] && array_keys($c) != ['value', 'field']) {
             $bad('a changed setting is malformed');
         }
-        $field = (string)$c['field'];
-        if (!preg_match('/^[a-z_][a-z0-9_.-]{0,95}$/', $field) || !ts_tuning($field) || !ts_plain($c['value'])) {
+        if (!ts_reportable((string)$c['field'], $c['value'])) {
             $bad('a changed setting is not reportable');
         }
     }

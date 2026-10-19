@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        The client can send these automatically (Cookbook → Report, opt-in, previewed). This form is for
+        TwinSpark can send these itself (Share result… on a profile, or `tsm cookbook report`; opt-in, previewed). This form is for
         reports by hand, or for a recipe that is not in the catalog yet.
   - type: input
     id: recipe

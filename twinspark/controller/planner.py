@@ -232,6 +232,20 @@ class MemoryPlanner:
         headroom = min(budget.headroom_gib(), pool_headroom)
         return headroom >= 0, headroom
 
+    def explain(self, budget: NodeBudget, util: Optional[float] = None) -> str:
+        """The numbers behind :meth:`fits`, for a verdict a person can check: which limit binds, what vLLM
+        may use and what this setup needs from it, bucket by bucket."""
+        util = util if util is not None else self.gpu_memory_utilization(budget)
+        pool = util * budget.mem_total
+        parts = [("weights", budget.model_weights), ("KV cache", budget.kv_cache), ("CUDA graphs", budget.cuda_graphs),
+                 ("activations", budget.activations), ("NCCL", budget.nccl + budget.distributed_backend)]
+        needs = ", ".join(f"{name} {gib:.1f}" for name, gib in parts if gib >= 0.05)
+        if pool - budget.vllm_needed <= budget.headroom_gib():
+            return (f"with --gpu-memory-utilization={util:.2f} vLLM may use {pool:.1f} of {budget.mem_total:.1f} GiB "
+                    f"per node and needs {budget.vllm_needed:.1f} GiB ({needs})")
+        return (f"the node has {budget.mem_total:.1f} GiB; the OS, Docker and TwinSpark keep {budget.non_vllm:.1f} GiB "
+                f"and vLLM needs {budget.vllm_needed:.1f} GiB ({needs})")
+
     @staticmethod
     def classify_headroom(headroom_gib: float) -> str:
         if headroom_gib >= 4.0:

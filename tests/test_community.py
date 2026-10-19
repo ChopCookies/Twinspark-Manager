@@ -81,7 +81,8 @@ def test_only_tuning_settings_with_plain_values_count_as_changes():
     mine.advanced.gpu_memory_utilization = 0.8
     mine.advanced.env = {"HF_TOKEN": "hf_secret", "NCCL_SOCKET_IFNAME": "enp1s0f1np1"}
     mine.advanced.extra_vllm_args = ["--served-model-name", "/home/me/x"]
-    mine.advanced.extra_vllm_flags = {**base.advanced.extra_vllm_flags, "swap-space": 4, "download-dir": "/mnt/models"}
+    mine.advanced.extra_vllm_flags = {**base.advanced.extra_vllm_flags, "swap-space": 4, "download-dir": "/mnt/models",
+                                      "tokenizer": "my-private-tokenizer"}
     mine.simple.api_alias = "my-secret-alias"
     mine.simple.model = "me/private-finetune"
     changes = tuning_changes(base.source["receipt"]["baseline"], settings(mine))
@@ -101,6 +102,8 @@ def test_only_tuning_settings_with_plain_values_count_as_changes():
     (lambda d: d.update(comment="x" * 501), "500 characters"),
     (lambda d: d["changes"].append({"field": "advanced.env.HF_TOKEN", "value": "abc"}), "not reportable"),
     (lambda d: d["changes"].append({"field": "advanced.max_num_seqs", "value": "/home/me"}), "not reportable"),
+    (lambda d: d["changes"].append({"field": "advanced.extra_vllm_flags.tokenizer", "value": "my-private-tok"}),
+     "not reportable"),
     (lambda d: d["benchmarks"].update(context={"text": "free text"}), "benchmark"),
     (lambda d: d.update(outcome="great"), "outcome"),
     (lambda d: d.update(reporter="spark-a"), "reporter"),

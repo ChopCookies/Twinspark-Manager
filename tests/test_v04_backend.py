@@ -535,3 +535,31 @@ def test_cookbook_import_recipe_route_preview(cluster):
                         json={"node": "A", "name": "vllm_node", "confirm": "vllm_node"})
         assert r.status_code == 200 and r.json()["stopped"] == "vllm_node"
 
+
+
+def test_virtual_interfaces_never_count_as_qsfp_ports_or_nccl_gids(tmp_path):
+    from twinspark.agent.sysinfo import is_virtual_name
+    from twinspark.hostprobe import list_interfaces
+    for name in ("docker0", "br-1a2b3c", "veth12ab", "cni0", "flannel.1", "tailscale0", "virbr0", "wg0",
+                 "enp1s0f1np1.100", "macvlan0", "cali123", "vxlan.calico", "podman0"):
+        assert is_virtual_name(name), name
+    for name in ("enp1s0f1np1", "enP2p1s0f1np1", "enP7s7", "eth0", "wlP9s9"):
+        assert not is_virtual_name(name), name
+    # a macvlan on top of the QSFP port gets a RoCE v2 GID of its own address: NCCL must not pick that index
+    ib = tmp_path / "ib"
+    _fake_sysfs(ib, "rocep1s0f1", "enp1s0f1np1", "c0a8:6401")             # 192.168.100.1, GID index 3
+    port = ib / "rocep1s0f1" / "ports" / "1"
+    (port / "gids" / "4").write_text("0000:0000:0000:0000:0000:ffff:c0a8:64fe\n")    # 192.168.100.254
+    (port / "gid_attrs" / "types" / "4").write_text("RoCE v2\n")
+    (port / "gid_attrs" / "ndevs" / "4").write_text("macvlan0\n")
+    (ib / "rocep1s0f1" / "device" / "net" / "macvlan0").mkdir()
+    (dev,) = rdma_devices(str(ib))
+    assert dev["netdevs"] == ["enp1s0f1np1"]
+    assert [g["index"] for g in dev["roce_v2_ipv4"]] == [3]
+    # a docker bridge that has a device link (some drivers set one) is still virtual
+    net = tmp_path / "net"
+    for name in ("enp1s0f1np1", "docker0"):
+        (net / name / "device").mkdir(parents=True)
+        (net / name / "operstate").write_text("up\n")
+    ifaces = {i.name: i for i in list_interfaces(str(net), run=lambda cmd, timeout: (1, ""))}
+    assert ifaces["docker0"].virtual and not ifaces["enp1s0f1np1"].virtual
