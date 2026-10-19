@@ -45,6 +45,9 @@ class RouteState:
     since: float = field(default_factory=time.time)
     _rr: itertools.count = field(default_factory=itertools.count, repr=False)
     _idle: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    # request token -> monotonic start: how long the oldest in-flight request has been running
+    _active: dict = field(default_factory=dict, repr=False)
+    _tok: itertools.count = field(default_factory=itertools.count, repr=False)
     _down_until: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -74,19 +77,33 @@ class RouteState:
     def backend_failed(self, backend: str) -> None:
         self._down_until[backend] = time.monotonic() + BACKEND_BACKOFF_S
 
-    def acquire(self) -> None:
+    def acquire(self) -> int:
+        tok = next(self._tok)
+        self._active[tok] = time.monotonic()
         self.inflight += 1
         self.requests += 1
         self._idle.clear()
+        return tok
 
-    def release(self) -> None:
+    def release(self, tok: Optional[int] = None) -> None:
+        if tok is not None:
+            self._active.pop(tok, None)
+        elif self._active:                       # a caller without its token: forget the oldest
+            self._active.pop(next(iter(self._active)))
         self.inflight = max(0, self.inflight - 1)
         if self.inflight == 0:
+            self._active.clear()
             self._idle.set()
+
+    def oldest_inflight_s(self) -> Optional[float]:
+        if not self._active:
+            return None
+        return round(time.monotonic() - min(self._active.values()), 1)
 
     def to_payload(self) -> dict:
         return {"alias": self.alias, "status": self.status, "model": self.served_model,
                 "revision": self.revision_id, "inflight": self.inflight,
+                "oldest_inflight_s": self.oldest_inflight_s(),
                 "retry_after": self.retry_after, "requests": self.requests,
                 "errors": self.errors, "last_error": self.last_error,
                 "max_model_len": self.max_model_len, "down_reason": self.down_reason,
@@ -138,6 +155,13 @@ class Gateway:
     def mark_up(self, alias: str) -> None:
         if alias in self.routes:
             self.routes[alias].down_reason = None
+
+    def inflight(self, aliases: list[str]) -> tuple[int, Optional[float]]:
+        """(requests in flight, seconds the oldest of them has been running) over ``aliases``."""
+        sts = [self.routes[a] for a in aliases if a in self.routes]
+        oldest = [s.oldest_inflight_s() for s in sts]
+        oldest = [o for o in oldest if o is not None]
+        return sum(s.inflight for s in sts), (max(oldest) if oldest else None)
 
     async def wait_idle(self, alias: str, timeout: float) -> bool:
         """True if all in-flight requests on ``alias`` finished within ``timeout``."""

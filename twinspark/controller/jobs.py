@@ -444,10 +444,38 @@ class ActivationCoordinator:
         for a in aliases:
             self.gateway.begin_drain(a, retry_after=30)
         self.drained = aliases
-        timeout = self.config.runtime.drain_timeout_s
-        idle = await asyncio.gather(*(self.gateway.wait_idle(a, timeout) for a in aliases))
-        forced = [a for a, ok in zip(aliases, idle, strict=True) if not ok]
-        return "drained " + ", ".join(aliases) + (f" (forced after {timeout}s: {forced})" if forced else "")
+        rt = self.config.runtime
+        drain = job.payload.get("drain") or {}
+        policy = drain.get("policy") or rt.drain_policy
+        timeout = float(drain.get("timeout_s") or rt.drain_timeout_s)
+        limit = float(rt.drain_wait_max_s) if policy == "wait" else timeout
+        started = time.monotonic()
+        while True:
+            busy, oldest = self.gateway.inflight(aliases)
+            if busy == 0:
+                waited = time.monotonic() - started
+                return "drained " + ", ".join(aliases) + (f" after {waited:.0f}s" if waited >= 1 else "")
+            waited = time.monotonic() - started
+            if self.cancel_check():
+                # nothing was stopped: the old model is reopened (non-destructive failure)
+                raise RuntimeError(f"cancelled while {busy} request(s) were still running; the old model keeps serving")
+            if waited >= limit:
+                break
+            step.message = (f"waiting for {busy} running request(s)"
+                            + (f", the longest for {oldest:.0f}s" if oldest is not None else "")
+                            + (f" — {policy} after {limit:.0f}s" if policy != "wait" else
+                               f" — waits up to {limit:.0f}s, cancel the switch to keep the old model"))
+            step.progress = min(0.95, waited / max(limit, 1.0))
+            self.persist(job)
+            await asyncio.sleep(min(0.5, self.poll) if self.poll else 0.5)
+        longest = f" (the longest running for {oldest:.0f}s)" if oldest is not None else ""
+        if policy == "force":
+            return (f"drained {', '.join(aliases)}: forced after {waited:.0f}s with {busy} request(s) still running"
+                    f"{longest}; they end with the old model")
+        raise RuntimeError(
+            f"switch aborted: {busy} request(s) still running on {', '.join(aliases)} after {waited:.0f}s{longest}. "
+            f"The old model keeps serving. Switch again when they are done, or choose drain 'wait' (waits for "
+            f"them, up to {rt.drain_wait_max_s}s) or 'force' (ends them).")
 
     async def _stop(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         stopped = []

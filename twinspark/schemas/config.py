@@ -166,6 +166,10 @@ class RuntimeSettings(BaseModel):
     ray_port: int = 6379
     health_timeout_s: int = 2400            # big models + CUDA graph capture are slow
     drain_timeout_s: int = 30
+    # what a switch does with requests still running after drain_timeout_s: abort the switch (the old
+    # model keeps serving), wait for them (up to drain_wait_max_s), or force (end them)
+    drain_policy: Literal["abort", "wait", "force"] = "abort"
+    drain_wait_max_s: int = Field(default=3600, ge=1)
     max_download_gib: Optional[float] = Field(default=None, gt=0)
     min_disk_free_gib: float = Field(default=2.0, ge=0)
     allow_image_pull: bool = True

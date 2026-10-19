@@ -453,6 +453,8 @@ class Controller:
             "telemetry": self.telemetry,
             "maintenance": self.maintenance.state(),
             "routes": [st.to_payload() for st in self.gateway.routes.values()],
+            "drain": {"policy": self.config.runtime.drain_policy, "timeout_s": self.config.runtime.drain_timeout_s,
+                      "wait_max_s": self.config.runtime.drain_wait_max_s},
             "metrics": self.sampler.latest(),
             "watchdog": {"enabled": self.config.watchdog.enabled,
                          "unhealthy_streak": self.watch_state["unhealthy_streak"],
@@ -462,6 +464,7 @@ class Controller:
     # ---- activation ---------------------------------------------------------------
     async def activate(self, profile_name: str, ref: str = "latest", *,
                        request_id: Optional[str] = None, expected_active: Any = _ANY,
+                       drain: Optional[dict] = None,
                        _rollback_of: Optional[str] = None, _recovery: bool = False,
                        _maintenance: bool = False) -> Job:
         """Validate synchronously, then run the activation in the background.
@@ -470,7 +473,16 @@ class Controller:
         (a client that lost its connection mid-request can safely send it again). ``expected_active``
         is the revision id the caller saw as active (None = nothing active); when the deployment changed
         since, the request is refused instead of switching on a stale view (two clients racing).
+        ``drain`` is ``{"policy": "abort"|"wait"|"force", "timeout_s": n}`` for requests still running when
+        the switch starts (default: ``runtime.drain_policy``). Switches the controller makes itself (a
+        rollback, a recovery, maintenance) force: the model they replace has already failed or must go.
         """
+        if drain is not None:
+            if not isinstance(drain, dict) or drain.get("policy") not in (None, "abort", "wait", "force"):
+                raise ValueError("drain policy must be abort, wait or force")
+            t = drain.get("timeout_s")
+            if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 <= t <= 86400):
+                raise ValueError("drain timeout_s must be between 0 and 86400 seconds")
         if request_id is not None:
             if not isinstance(request_id, str) or not _REQUEST_ID_RE.match(request_id):
                 raise ValueError("request_id must be 8-80 characters: letters, digits and . _ : -")
@@ -506,7 +518,9 @@ class Controller:
             profile_revision=rev.revision_id,
             payload={"profile": profile_name, "revision_id": rev.revision_id,
                      "label": rev.label, "alias": rev.draft.simple.api_alias,
-                     "rollback_of": _rollback_of},
+                     "rollback_of": _rollback_of,
+                     "drain": self._drain_settings(drain, controller_made=bool(_rollback_of or _recovery
+                                                                                   or _maintenance))},
         )
         self.store.save_job(job)
         await self._lock.acquire()           # taken now so a second request gets 409
@@ -524,6 +538,15 @@ class Controller:
                     f"profile/{profile_name}", {"revision": rev.revision_id, "job": job.job_id,
                                                 "kind": kind})
         return job
+
+    def _drain_settings(self, drain: Optional[dict], *, controller_made: bool) -> dict:
+        rt = self.config.runtime
+        if controller_made:
+            return {"policy": "force", "timeout_s": rt.drain_timeout_s}
+        drain = drain or {}
+        timeout = drain.get("timeout_s")
+        return {"policy": drain.get("policy") or rt.drain_policy,
+                "timeout_s": rt.drain_timeout_s if timeout is None else timeout}
 
     def cancel_job(self, job_id: str) -> dict:
         job = self.store.load_job(job_id)

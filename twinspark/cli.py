@@ -512,8 +512,12 @@ def cmd_activate(args, api: Api):
     import secrets as _secrets
     # an id per invocation: if the connection drops while the request is in flight, sending it again
     # (e.g. by the client's retry) returns the same job instead of starting a second switch
-    job = api("POST", f"/api/v1/profiles/{args.profile}/activate", params={"revision": args.revision},
-              json={"request_id": f"cli-{_secrets.token_hex(8)}"})
+    body = {"request_id": f"cli-{_secrets.token_hex(8)}"}
+    if args.drain:
+        body["drain_policy"] = args.drain
+    if args.drain_timeout is not None:
+        body["drain_timeout_s"] = args.drain_timeout
+    job = api("POST", f"/api/v1/profiles/{args.profile}/activate", params={"revision": args.revision}, json=body)
     print(f"job {job['job_id']}  (Ctrl-C stops watching, not the switch; `tsm cancel {job['job_id']}`)")
     if args.no_wait:
         return
@@ -1191,6 +1195,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("profile")
     s.add_argument("revision", nargs="?", default="latest")
     s.add_argument("--no-wait", action="store_true")
+    s.add_argument("--drain", choices=["abort", "wait", "force"],
+                   help="requests still running when the switch starts: abort the switch (default: keep the old "
+                        "model), wait for them, or force (end them)")
+    s.add_argument("--drain-timeout", type=int, metavar="S", help="seconds before abort/force (default 30)")
     s = cmd("prepare", cmd_prepare, "check images/patches and stage a recipe without switching")
     s.add_argument("profile")
     s.add_argument("revision", nargs="?", default="latest")

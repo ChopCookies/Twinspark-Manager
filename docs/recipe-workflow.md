@@ -5,6 +5,29 @@ a distributed model, replicated copies, or two independent models in a split
 profile. Activating any deployment drains and replaces the current one.
 Preparation leaves the current deployment serving.
 
+## Switching while requests are running
+
+A switch first stops new requests to the model (they get `503` with `Retry-After`) and waits for the
+running ones. What happens to requests still running after `runtime.drain_timeout_s` (30 s) is the drain
+policy:
+
+| Policy | After the timeout | Use it when |
+|---|---|---|
+| `abort` (default) | the switch fails **before anything is stopped**; the old model is reopened and keeps serving | always, unless you know better: an agent in the middle of a long task is not cut off |
+| `wait` | keeps waiting, up to `runtime.drain_wait_max_s` (an hour); cancelling the job keeps the old model | the requests matter and will finish |
+| `force` | stops the old model; those requests end | they do not matter, or the old model is stuck |
+
+```bash
+tsm activate my-experiment                      # abort if requests outlast 30 s
+tsm activate my-experiment --drain wait
+tsm activate my-experiment --drain force --drain-timeout 0
+```
+
+The GUI asks when requests are running, and the dashboard shows how long the oldest one has been
+running. A client that disconnects releases its request at once. Switches TwinSpark makes on its own
+(a rollback after a failed start, a recovery, maintenance) always force: the model they replace has
+already failed or has to go. Set `runtime.drain_policy` in `controller.yaml` to change the default.
+
 ## Import and prepare
 
 In Cookbook → Paste / URL, open a YAML/JSON file, paste its contents, or give a

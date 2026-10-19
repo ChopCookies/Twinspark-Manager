@@ -130,7 +130,7 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
 
         body["model"] = st.served_model
         payload = json.dumps(body).encode()
-        st.acquire()
+        tok = st.acquire()
         upstream = None
         last_exc: Exception | None = None
         try:
@@ -163,12 +163,12 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
                     break
         except BaseException:
             # Cancellation before upstream headers must not block future drains.
-            st.release()
+            st.release(tok)
             raise
         if upstream is None:
             st.errors += 1
             st.last_error = f"backend request failed: {type(last_exc).__name__}"
-            st.release()
+            st.release(tok)
             status_code = 504 if isinstance(last_exc, httpx.TimeoutException) else 502
             return _error(status_code, st.last_error, "backend_error")
         if upstream.status_code >= 500:
@@ -185,7 +185,7 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
             except httpx.HTTPError:
                 pass
             finally:
-                st.release()
+                st.release(tok)
             return _error(502, "compatibility checks require uncompressed upstream responses", "backend_error")
 
         connection_headers = {h.strip().lower() for h in upstream.headers.get("connection", "").split(",")}
@@ -227,7 +227,7 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
                 finally:
                     if not released:
                         released = True
-                        st.release()
+                        st.release(tok)
 
         is_sse = headers.get("content-type", "").lower().startswith("text/event-stream")
         if max_response_bytes is not None and not is_sse:

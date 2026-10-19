@@ -68,10 +68,28 @@ async function api(method, path, body) {
   return data;
 }
 /** Body for an activation: an id that makes a retried request harmless, and the deployment we decided on. */
-function activationBody() {
+/** Requests still running when a switch starts: ask what to do with them. null = do not switch. */
+async function drainChoice() {
+  let st;
+  try { st = await GET("/api/v1/status"); } catch (e) { return {}; }
+  const routes = (st.routes || []).filter(r => r.inflight > 0);
+  const busy = routes.reduce((n, r) => n + r.inflight, 0);
+  if (!busy) return {};
+  const longest = Math.max(...routes.map(r => r.oldest_inflight_s || 0));
+  const { value } = await modal({
+    title: `${busy} request${busy === 1 ? " is" : "s are"} still running`,
+    body: `<p>${esc(routes.map(r => `${r.alias}: ${r.inflight}`).join(", "))}${longest ? ` — the longest for ${esc(Math.round(longest))} s` : ""}.</p>
+      <p class="small muted">An agent may be in the middle of a long task. By default the switch waits ${esc((st.drain || {}).timeout_s ?? 30)} s and is then <b>aborted</b>: the old model keeps serving and nothing is stopped.</p>`,
+    actions: [{ label: "Cancel", value: null }, { label: "Wait for them", value: "wait" },
+      { label: "End them and switch", value: "force", cls: "danger" }, { label: "Switch, abort if they take longer", value: "abort", cls: "primary" }],
+  });
+  if (value === null || value === undefined) return null;
+  return value === "abort" ? {} : value === "force" ? { drain_policy: "force", drain_timeout_s: 0 } : { drain_policy: "wait" };
+}
+function activationBody(extra = {}) {
   const rnd = (globalThis.crypto && crypto.getRandomValues) ? Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, "0")).join("")
     : Math.random().toString(16).slice(2, 18).padEnd(16, "0");
-  const body = { request_id: "gui-" + rnd };
+  const body = { request_id: "gui-" + rnd, ...extra };
   if (S.seenActive !== undefined) body.expected_active = S.seenActive;
   return body;
 }
@@ -483,7 +501,8 @@ async function viewDashboard() {
   onAct({
     activate: async (el) => {
       const name = $("#qs-profile").value; if (!name) return;
-      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(name)}/activate`, activationBody()));
+      const drain = await drainChoice(); if (drain === null) return;
+      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(name)}/activate`, activationBody(drain)));
       toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
     },
     stop: async (el) => { if (await stopFlow(el)) draw().catch(() => { }); },
@@ -562,7 +581,7 @@ function dashboardHtml(st, series, profs, job) {
   html += `<div class="card"><div class="card-head"><h2>Gateway routes</h2><span class="small muted">OpenAI-compatible endpoint · port 8000 by default</span></div>`;
   html += routes.length ? `<div class="table-wrap"><table><thead><tr><th>Model name</th><th>Status</th><th>Serves</th><th class="num">In flight</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Max len</th></tr></thead><tbody>
     ${routes.map(r => `<tr data-key="route:${esc(r.alias)}"><td class="mono">${esc(r.alias)}</td><td>${tag(r.status, r.status === "serving" ? "good" : r.status === "down" ? "bad" : "warn")}${r.down_reason ? `<div class="sub">${esc(r.down_reason)}</div>` : ""}</td>
-      <td>${esc(r.model || "—")}</td><td class="num">${num(r.inflight)}</td><td class="num">${num(r.requests)}</td>
+      <td>${esc(r.model || "—")}</td><td class="num">${num(r.inflight)}${r.oldest_inflight_s ? `<div class="sub">longest ${esc(Math.round(r.oldest_inflight_s))} s</div>` : ""}</td><td class="num">${num(r.requests)}</td>
       <td class="num">${num(r.errors)}${r.last_error ? `<div class="sub">${esc(r.last_error)}</div>` : ""}</td><td class="num">${num(r.max_model_len)}</td></tr>`).join("")}
     </tbody></table></div>` : empty("No routes", "The gateway returns 404 until a model is activated.");
   html += `</div>`;
@@ -736,7 +755,8 @@ async function viewProfiles() {
 }
 
 async function activateFlow(name, revision = "latest", btn = null) {
-  const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/activate${qs({ revision })}`, activationBody()));
+  const drain = await drainChoice(); if (drain === null) return;
+  const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/activate${qs({ revision })}`, activationBody(drain)));
   toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
 }
 async function splitFlow(rows) {

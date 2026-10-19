@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..controller.controller import BusyError, Controller, DuplicateProfileError, StaleViewError
 from ..controller.launch import LaunchError
@@ -278,9 +278,12 @@ async def prepare(name: str, revision: str = "latest", ctrl: Controller = Depend
 
 
 class ActivateRequest(BaseModel):
-    """Optional body. ``expected_active``: the revision id the caller saw as active (null = nothing)."""
+    """Optional body. ``expected_active``: the revision id the caller saw as active (null = nothing).
+    ``drain_policy``: what to do with requests still running (abort the switch, wait, or force)."""
     request_id: Optional[str] = None
     expected_active: Optional[str] = None
+    drain_policy: Optional[Literal["abort", "wait", "force"]] = None
+    drain_timeout_s: Optional[int] = Field(None, ge=0, le=86400)
 
 
 @router.post("/{name}/activate", response_model=Job, status_code=202)
@@ -289,6 +292,8 @@ async def activate(name: str, revision: str = "latest", req: Optional[ActivateRe
     kw: dict = {}
     if req is not None:
         kw["request_id"] = req.request_id
+        if req.drain_policy or req.drain_timeout_s is not None:
+            kw["drain"] = {"policy": req.drain_policy, "timeout_s": req.drain_timeout_s}
         if "expected_active" in req.model_fields_set:
             kw["expected_active"] = req.expected_active
     try:
