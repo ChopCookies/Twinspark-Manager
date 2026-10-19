@@ -43,7 +43,7 @@ function client() {
     window: { addEventListener: (name, fn) => events.set(name, fn) },
     document: { addEventListener() {}, querySelector: element },
   });
-  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "keys.js", "client.js"]) {
+  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "keys.js", "playground.js", "client.js"]) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js", file), "utf8"), context, { filename: file });
   }
   return { context, element, events, storage, run: code => vm.runInContext(code, context) };
@@ -611,4 +611,87 @@ test("an activation carries a request id and the deployment the browser saw", ()
   const b = c.run("activationBody()");
   assert.equal(b.expected_active, "glm-r1-abc");
   assert.notEqual(b.request_id, first.request_id);
+});
+
+test("a recipe with modes asks which one to import, and shows what each measured", async () => {
+  const c = client();
+  c.run(`
+    var shown;
+    modal = async options => { shown = options; return { value: 'go', root: { querySelector: () => ({ value: 'throughput' }) } }; };
+  `);
+  const recipe = { name: "glm", title: "GLM <fast>", default_mode: "latency", modes: [
+    { name: "latency", title: "Low latency", description: "MTP drafter", measured: { decode_tok_s: 61 } },
+    { name: "throughput", title: "Throughput", description: "no drafter", measured: {} }] };
+  c.context.recipe = recipe;
+  assert.equal(await c.run("chooseRecipeMode(recipe)"), "throughput");
+  const body = c.run("shown.body"), title = c.run("shown.title");
+  assert.match(title, /GLM <fast>/);                       // modal() escapes the title itself
+  assert.match(body, /decode tok s: 61/);
+  assert.match(body, /Not measured yet/);
+  assert.match(body, /value="latency" checked/);
+  assert.equal(await c.run("chooseRecipeMode({modes:[{name:'only'}]})"), "");          // one mode: no question
+  assert.equal(await c.run("chooseRecipeMode(undefined)"), "");
+  c.run("modal = async () => ({ value: null })");
+  assert.equal(await c.run("chooseRecipeMode(recipe)"), null);                          // cancelled
+});
+
+test("sharing a result previews the exact document and sends only when switched on", async () => {
+  const c = client();
+  c.run(`
+    var calls = [], modals = [], toasts = [], reportsOn = false;
+    api = async (method, path, body) => { calls.push({ method, path, body });
+      if (path.startsWith('/api/v1/cookbook/report/')) return { enabled: reportsOn, url: 'https://r.example/ts', report: { format: 'twinspark-report/1', recipe: 'glm', comment: '<b>x</b>' } };
+      return { ok: true }; };
+    formBox = async () => ({ outcome: 'works', comment: 'fine', anonymous: true });
+    busy = async (el, fn) => fn();
+    toast = (m) => toasts.push(m);
+    modal = async (o) => { modals.push(o); const a = o.actions[o.actions.length - 1]; if (a.validate) await a.validate(); return { value: a.value }; };
+  `);
+  assert.equal(await c.run("shareResultFlow('glm-tp', null)"), null);
+  let calls = JSON.parse(c.run("JSON.stringify(calls)"));
+  assert.deepEqual(calls.map(x => x.path), ["/api/v1/cookbook/report/glm-tp?outcome=works&comment=fine&anonymous=true"]);
+  assert.match(c.run("modals[0].body"), /Community reports are off/);
+  assert.match(c.run("modals[0].body"), /&lt;b&gt;x&lt;\/b&gt;/);              // the preview is escaped
+  c.run("calls = []; modals = []; reportsOn = true");
+  assert.equal(await c.run("shareResultFlow('glm-tp', null)"), "sent");
+  calls = JSON.parse(c.run("JSON.stringify(calls)"));
+  assert.deepEqual(calls.map(x => x.method + " " + x.path.split("?")[0]), ["GET /api/v1/cookbook/report/glm-tp", "POST /api/v1/cookbook/report"]);
+  assert.equal(calls[1].body.report.recipe, "glm");
+});
+
+test("community totals and the catalog line read well and escape what the server sent", () => {
+  const c = client();
+  assert.equal(c.run("communityLine(undefined)"), "");
+  const line = c.run(`communityLine({reports: 12, success_rate: 0.833, median_tok_s: 811.6, top_changes: [{field: 'advanced.max_num_seqs', value: '<8>', count: 4}]})`);
+  assert.match(line, /12 reports · 83 % work · median 812 tok\/s/);
+  assert.match(line, /max_num_seqs = &lt;8&gt; \(4×\)/);
+  assert.match(c.run("catalogLine({enabled: false})"), /catalog is off/);
+  const cat = c.run("catalogLine({enabled: true, fetched_at: 1, new: ['a'], updated: ['b', 'c'], last_error: '<x>'})");
+  assert.match(cat, /1 new, 2 updated/);
+  assert.match(cat, /&lt;x&gt;/);
+});
+
+test("the playground parses streamed events, measures as an app would, and writes curl without a key", () => {
+  const c = client();
+  const parsed = JSON.parse(c.run(`JSON.stringify(sseEvents('data: {"a":1}\\n\\ndata: [DONE]\\n\\ndata: {"b"'))`));
+  assert.deepEqual(parsed, { events: ['{"a":1}', "[DONE]"], rest: 'data: {"b"' });
+  assert.deepEqual(JSON.parse(c.run(`JSON.stringify(sseEvents(': keep-alive\\r\\n\\r\\ndata: x\\r\\n\\r\\n'))`)).events, ["x"]);
+  const st = JSON.parse(c.run("JSON.stringify(playgroundStats({t0: 0, first: 250, end: 2250, usage: {completion_tokens: 101, prompt_tokens: 12}, chunks: 90}))"));
+  assert.deepEqual(st, { ttft_ms: 250, tok_s: 50, completion_tokens: 101, prompt_tokens: 12, total_ms: 2250, estimated: false });
+  const counted = JSON.parse(c.run("JSON.stringify(playgroundStats({t0: 0, first: null, end: 100, usage: null, chunks: 0}))"));
+  assert.equal(counted.ttft_ms, null); assert.equal(counted.tok_s, null); assert.equal(counted.estimated, true);
+  const body = JSON.parse(c.run("JSON.stringify(playgroundRequest('coder', [{role:'user', content:'hi'}], {temperature: '0.2', max_tokens: '', top_p: 'x'}))"));
+  assert.deepEqual(body, { model: "coder", messages: [{ role: "user", content: "hi" }], stream: true, stream_options: { include_usage: true }, temperature: 0.2 });
+  const curl = c.run(`playgroundCurl('http://spark:8000/v1/', {model: 'coder', messages: [{role: 'user', content: "it's"}], stream: true})`);
+  assert.match(curl, /^curl http:\/\/spark:8000\/v1\/chat\/completions/);
+  assert.match(curl, /Bearer \$TWINSPARK_API_KEY/);
+  assert.match(curl, /"stream": false/);
+  assert.match(curl, /it'\\''s/);                                    // quoted for the shell
+  assert.doesNotMatch(curl, /stream_options/);
+});
+
+test("the playground is in the navigation before Integrations", () => {
+  const c = client();
+  const nav = JSON.parse(c.run("JSON.stringify(NAV.map(n => n[0]))"));
+  assert.equal(nav.indexOf("playground") + 1, nav.indexOf("integrations"));
 });

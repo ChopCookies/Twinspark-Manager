@@ -279,6 +279,30 @@ class GatewaySettings(BaseModel):
         return self
 
 
+CATALOG_URL = "https://raw.githubusercontent.com/ChopCookies/Twinspark-Manager/main/catalog/index.json"
+
+
+class CookbookSettings(BaseModel):
+    """The recipe catalog and community reports (docs/cookbook.md)."""
+    model_config = ConfigDict(extra="forbid")
+    # new and corrected recipes from the repository's main branch; "" switches it off (air-gapped)
+    catalog_url: Optional[str] = CATALOG_URL
+    catalog_refresh_hours: float = Field(default=24.0, ge=0, le=720)     # 0: only on `tsm cookbook refresh`
+    # where `tsm cookbook report` sends a result (opt-in, previewed) and the Cookbook reads totals from;
+    # a TwinSpark community endpoint (community/strato) — unset: no reports, no totals
+    community_url: Optional[str] = None
+
+    @field_validator("catalog_url", "community_url")
+    @classmethod
+    def _https(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return None
+        parts = urlsplit(v)
+        if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+            raise ValueError("must be an https:// URL without credentials")
+        return v
+
+
 class ControllerConfig(BaseModel):
     node: "NodeIdentity"
     db_path: str = "/var/lib/twinspark/state.db"
@@ -305,6 +329,7 @@ class ControllerConfig(BaseModel):
     download_node: Literal["A", "B"] = "A"
     # community recipe folders shown in the Cookbook ("owner/repo:path[@ref]" on GitHub)
     recipe_sources: list[str] = Field(default_factory=lambda: ["eugr/spark-vllm-docker:recipes"])
+    cookbook: CookbookSettings = Field(default_factory=CookbookSettings)
 
     management_auth: Literal["none", "apikey"] = "apikey"
     csrf_protection: bool = True

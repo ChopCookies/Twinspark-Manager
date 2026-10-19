@@ -61,6 +61,17 @@ def _clean(value: object, limit: int) -> str:
     return text.encode("utf-8", "replace").decode("utf-8", "replace")
 
 
+class _GZip(GZipMiddleware):
+    """Compression for the API and the GUI, but not for the playground's token streams: older Starlette
+    versions would hold back the first tokens until enough text for a compressed block had arrived."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/api/v1/playground/"):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 def create_app(controller: Controller, management_key: str, run_startup: bool = True,
                background: Optional[bool] = None) -> FastAPI:
     """``background`` (watchdog + metrics loops) defaults to ``run_startup``."""
@@ -94,9 +105,11 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
     app.state.controller = controller
     app.state.management_key = management_key
     app.state.rate_buckets = {}
+    from ..cookbook import catalog
+    catalog.configure(controller.catalog)       # the Cookbook overlays this node's copy of the recipe catalog
 
     app.add_middleware(BodyLimitMiddleware)
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(_GZip, minimum_size=1000)
 
     loaded: set[str] = set()
 
@@ -158,6 +171,9 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
               routes_diagnostics.router, routes_files.router, routes_remote.router, routes_remote.ws_router,
               routes_gateway.router):
         app.include_router(r)
+
+    from . import playground
+    app.router.routes.extend(playground.routes(controller))       # the GUI's chat playground (streams as is)
 
     @app.get("/api/v1/health")
     def health():

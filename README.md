@@ -310,6 +310,7 @@ before). Update the client with `pipx upgrade twinspark-manager` (a git install:
 
 - [The workstation client: connect by address, local GUI, Hermes on your computer](docs/client.md)
 - [Recipe and split-model workflow](docs/recipe-workflow.md)
+- [The Cookbook: recipe modes, the recipe catalog, community results, the playground](docs/cookbook.md)
 - [Automatic recipe imports and source updates](docs/recipe-automation.md)
 - [Agent clients and evaluation harnesses](docs/agent-integrations.md)
 - [Monitoring and coordinated maintenance](docs/maintenance.md)

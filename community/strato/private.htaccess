@@ -1,0 +1,3 @@
+# Copy this file into the twinspark-private folder as ".htaccess": should that folder ever be reachable
+# from the web, nothing in it is served.
+Require all denied

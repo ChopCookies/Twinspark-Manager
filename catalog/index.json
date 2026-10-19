@@ -1,0 +1,125 @@
+{
+  "format": "twinspark-catalog/1",
+  "recipes": [
+    {
+      "default_mode": null,
+      "engine": "vllm",
+      "files": [
+        {
+          "path": "twinspark/cookbook/recipes/deepseek-v4-flash-0731-b12x.yaml",
+          "sha256": "f7e9b47d5ea439df11ed3ddc34dd7827d91bb68051d1ce760b5b27b45fcf4318",
+          "size": 2704
+        },
+        {
+          "path": "twinspark/cookbook/recipes/deepseek-v4-flash-0731-b12x.meta.json",
+          "sha256": "50dc757de5a5a22960bd730fe2124c0a1b99a419b36b3637c2db53737c8b5c10",
+          "size": 1518
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "modes": [],
+      "name": "deepseek-v4-flash-0731-b12x",
+      "title": "DeepSeek V4 Flash 0731 — B12X + DSpark (eugr recipe)",
+      "topology": "tp2",
+      "verification": "verified"
+    },
+    {
+      "default_mode": "latency",
+      "engine": "vllm",
+      "files": [
+        {
+          "path": "twinspark/cookbook/recipes/glm-5.3-flash-nvfp4-dflash2-tp2.json",
+          "sha256": "2217c8f1e88a3a9ed6d19c98685b8c947aaf50cf3145f2d1981f55a112587e0c",
+          "size": 5714
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "RedHatAI/GLM-5.3-Flash-NVFP4",
+      "modes": [
+        "latency",
+        "throughput"
+      ],
+      "name": "glm-5.3-flash-nvfp4-dflash2-tp2",
+      "title": "GLM-5.3-Flash NVFP4 (RedHatAI) — TP2 + DFlash2 k=7",
+      "topology": "tp2",
+      "verification": "experimental"
+    },
+    {
+      "default_mode": "latency",
+      "engine": "vllm",
+      "files": [
+        {
+          "path": "twinspark/cookbook/recipes/glm-5.3-flash-nvfp4-tp2.json",
+          "sha256": "4671b0ee9116805822b330a149830cf637237e729b7a48db4a1741904109e950",
+          "size": 4253
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "RedHatAI/GLM-5.3-Flash-NVFP4",
+      "modes": [
+        "latency",
+        "throughput"
+      ],
+      "name": "glm-5.3-flash-nvfp4-tp2",
+      "title": "GLM-5.3-Flash NVFP4 (RedHatAI) — TP2 + MTP3",
+      "topology": "tp2",
+      "verification": "community"
+    },
+    {
+      "default_mode": null,
+      "engine": "vllm",
+      "files": [
+        {
+          "path": "twinspark/cookbook/recipes/mimo-v2.6-flash-tp2.json",
+          "sha256": "7de3524e2a1db3661e6cd9c355f8837919d57312ad93057d712f78a7dca2c3b2",
+          "size": 3103
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+      "modes": [],
+      "name": "mimo-v2.6-flash-tp2",
+      "title": "MiMo-V2.6-Flash-RL — TP2, 300K, fp8 KV",
+      "topology": "tp2",
+      "verification": "experimental"
+    },
+    {
+      "default_mode": null,
+      "engine": "vllm",
+      "files": [
+        {
+          "path": "twinspark/cookbook/recipes/qwen3.8-flash-next-nvfp4-tp2.json",
+          "sha256": "cc8b79f4954ef024242a93b8f7db0e02f1a730992ac8baf0f808087261005c8e",
+          "size": 1928
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "modes": [],
+      "name": "qwen3.8-flash-next-nvfp4-tp2",
+      "title": "Qwen3.8-Flash-Next NVFP4 — TP2+EP, MTP3",
+      "topology": "tp-ep",
+      "verification": "experimental"
+    },
+    {
+      "default_mode": null,
+      "engine": "vllm",
+      "files": [
+        {
+          "path": "twinspark/cookbook/recipes/smollm2-135m-smoke.json",
+          "sha256": "46f1378db346144b501bf28c169d4d5a581cf76e9fc6ae0690142f90ae287bb9",
+          "size": 1647
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "modes": [],
+      "name": "smollm2-135m-smoke",
+      "title": "SmolLM2-135M smoke test (single-a; duplicate as pp2 to test both nodes)",
+      "topology": "single-a",
+      "verification": "verified"
+    }
+  ],
+  "twinspark_version": "0.7.0"
+}

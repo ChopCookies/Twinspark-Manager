@@ -76,6 +76,20 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
 
+  catalog:
+    name: recipe catalog
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      # every recipe imports in each of its modes, and catalog/index.json matches the recipe folder
+      - run: python scripts/build_catalog.py --check
+      - name: PHP endpoint (community/strato) parses
+        run: for f in community/strato/*.php; do php -l "$f"; done
+
   package:
     name: wheel + install smoke test
     runs-on: ubuntu-24.04

@@ -955,12 +955,14 @@ async function viewProfile(name, tab) {
       <button class="btn ${last ? "" : "primary"}" data-act="pin">${icon("pin")}${last ? "Re-pin" : "Pin"}</button>
       <button class="btn" data-act="duplicate">Duplicate</button>
       ${d?.source?.receipt ? '<button class="btn" data-act="recipe-update">Check recipe updates</button>' : ''}
+      ${last && String(d?.source?.receipt?.ref || "").startsWith("builtin:") ? '<button class="btn" data-act="share-result">Share result…</button>' : ''}
       <button class="btn danger" data-act="delete" ${isActive ? "disabled" : ""}>Delete</button>
     </div></div>
     ${hasEdits ? `<div class="callout warn"><div><b>Your draft has unpinned changes.</b> Re-pin to run these settings. Switching to the latest revision uses the previously pinned settings.</div></div>` : ""}
     <div class="tabs">${tabs.map(([id, l]) => `<a href="#/profiles/${enc(name)}/${id}" class="${tab === id ? "active" : ""}">${esc(l)}</a>`).join("")}</div>`;
   const common = {
     'recipe-update': el => checkRecipeUpdate(name, el),
+    'share-result': el => shareResultFlow(name, el),
     prepare: async (el) => {
       if (!last || hasEdits) await automateRecipe(name, el);
       else await prepareFlow(name, el);
@@ -1613,7 +1615,9 @@ async function viewCookbook(tab) {
   const acts = {
     import: async (el) => {
       const name = el.dataset.name;
-      const pv = await busy(el, () => GET(`/api/v1/cookbook/recipes/${enc(name)}`));
+      const mode = await chooseRecipeMode(recipeIndex.get(name));
+      if (mode === null || !current(g)) return;
+      const pv = await busy(el, () => GET(`/api/v1/cookbook/recipes/${enc(name)}` + qs({ mode })));
       if (current(g)) await importDraft(pv, el.dataset.suggest || name);
     },
     details: async (el) => {
@@ -1621,6 +1625,12 @@ async function viewCookbook(tab) {
       await modal({ title: r.title || r.name, wide: true, body: reportHtml(r.report, r.draft) + `<div class="section-title">Recipe file · ${esc(r.file)}</div>${codeBlock(r.text)}` });
     },
     preview: (el) => busy(el, () => previewImport({ url: el.dataset.url })),
+    "catalog-refresh": async (el) => {
+      const r = await busy(el, () => POST("/api/v1/cookbook/catalog/refresh"));
+      const parts = ["added", "updated", "removed"].filter(k => r[k]?.length).map(k => `${r[k].length} ${k}`);
+      toast(parts.length ? "Recipe catalog: " + parts.join(", ") : "No new recipes", "good");
+      route();
+    },
     refresh: () => viewCookbookCommunity(g, head, true),
     "paste-preview": (el) => busy(el, () => previewImport(pasteBody(), $("#paste-name").value.trim())),
   };
@@ -1641,18 +1651,81 @@ async function viewCookbook(tab) {
     return;
   }
   const data = await GET("/api/v1/cookbook");
-  const card = (r) => r.error ? `<div class="card danger"><b>${esc(r.name)}</b><p class="small">${esc(r.error)}</p></div>` : `<div class="card recipe">
-    <div class="row between"><div class="row">${verifTag(r.verification)} ${tag(r.topology, "muted")} ${tag(r.quantization, "muted")} ${tag(r.format, "muted")}</div>${(r.imported_as || []).map(n => `<a href="#/profiles/${enc(n)}">${tag("→ " + n, "good")}</a>`).join(" ")}</div>
+  recipeIndex = new Map(data.recipes.map(r => [r.name, r]));
+  let stats = {};
+  const card = (r) => r.error ? `<div class="card ${r.needs_twinspark ? "" : "danger"}"><b>${esc(r.title || r.name)}</b> ${r.needs_twinspark ? tag("needs TwinSpark " + r.needs_twinspark, "warn") : ""}<p class="small">${esc(r.error)}</p></div>` : `<div class="card recipe">
+    <div class="row between"><div class="row">${verifTag(r.verification)} ${tag(r.topology, "muted")} ${tag(r.quantization, "muted")} ${tag(r.format, "muted")}${r.catalog === "new" ? " " + tag("new in catalog", "info") : r.catalog === "updated" ? " " + tag("updated in catalog", "info") : ""}</div>${(r.imported_as || []).map(n => `<a href="#/profiles/${enc(n)}">${tag("→ " + n, "good")}</a>`).join(" ")}</div>
     <h2 style="margin:10px 0 4px">${esc(r.title)}</h2><div class="mono small muted">${esc(r.model)}</div>
     <p class="small" style="color:var(--ink-2)">${esc(r.description)}</p>
     ${Object.keys(r.measured || {}).length ? `<div class="measured">${Object.entries(r.measured).slice(0, 5).map(([k, v]) => tag(`${k.replace(/_/g, " ")}: ${v}`, "muted")).join("")}</div>` : ""}
+    ${(r.modes || []).length > 1 ? `<div class="row small" style="gap:6px;margin-top:6px"><span class="muted">Modes</span>${r.modes.map(m => tag(m.title + (m.name === r.default_mode ? " · default" : ""), m.name === r.default_mode ? "info" : "muted")).join("")}</div>` : ""}
     ${(r.requirements || []).length ? `<details><summary>Needs (${r.requirements.length})</summary><ul class="plain">${r.requirements.map(x => `<li>${esc(x)}</li>`).join("")}</ul></details>` : ""}
     ${(r.notes || []).length ? `<details><summary>Notes (${r.notes.length})</summary><ul class="plain">${r.notes.map(x => `<li>${esc(x)}</li>`).join("")}</ul></details>` : ""}
+    ${r.catalog_note ? `<p class="small muted">${esc(r.catalog_note)}</p>` : ""}
+    <div data-community="${esc(r.name)}">${communityLine((stats.recipes || {})[r.name])}</div>
     <div class="row end" style="margin-top:12px">${webUrl(r.url) ? `<a class="btn sm ghost" href="${esc(r.url)}" target="_blank" rel="noopener">Source</a>` : ""}<button class="btn sm" data-act="details" data-name="${esc(r.name)}">Details</button><button class="btn sm primary" data-act="import" data-name="${esc(r.name)}" data-suggest="${esc((r.imported_as || []).length ? r.name + "-2" : r.name)}">Import</button></div></div>`;
   if (!render(g, `<div class="view">${head}
+    ${catalogLine(data.catalog)}
     ${libraryToolbar("recipes", "Search model, recipe or quantization…", [["all", "All topologies"], ...[...new Set(data.recipes.map(r => r.topology).filter(Boolean))].sort().map(t => [t, t])])}
     <div class="grid cols-2" id="recipes-items"></div></div>`)) return;
   bindLibrary("recipes", data.recipes, card, (r, filter) => filter === "all" || r.topology === filter, empty("No recipes available"));
+  if (data.community?.enabled) {
+    // totals come from the community server; the cards show them once they arrive (cached 30 min on node A)
+    GET("/api/v1/cookbook/community-stats").then(st => {
+      if (!current(g) || !st?.recipes) return;
+      stats = st;
+      $$("[data-community]").forEach(el => { el.innerHTML = communityLine(st.recipes[el.dataset.community]); });
+    }).catch(() => {});
+  }
+}
+let recipeIndex = new Map();
+/** Share how a Cookbook recipe went: choose, preview the exact document, then send (only when switched on). */
+async function shareResultFlow(name, el) {
+  const v = await formBox(`Share how ${name} went`, [
+    { id: "outcome", label: "How did it go?", type: "select", value: "", options: [["", "As the last switch went"], ["works", "Works as the recipe says"], ["works-with-changes", "Works with my changes"], ["fails", "Does not work"]] },
+    { id: "comment", label: "Note (optional)", type: "textarea", rows: 3, placeholder: "What you changed and why, what to watch out for", help: "Up to 500 characters. No addresses or paths." },
+    { id: "anonymous", label: "Without this installation's random id (a later report then counts again instead of replacing this one)", type: "check" },
+  ], { label: "Preview", intro: `<p class="small">The Cookbook's community totals come from results people share. You see exactly what would be sent before anything leaves node A.</p>` });
+  if (!v) return;
+  const pv = await busy(el, () => GET(`/api/v1/cookbook/report/${enc(name)}` + qs({ outcome: v.outcome, comment: v.comment.slice(0, 500), anonymous: v.anonymous ? "true" : "" })));
+  const { value } = await modal({
+    title: "Everything that would be sent", wide: true,
+    body: (pv.enabled ? `<p class="small">To <span class="mono">${esc(pv.url)}</span>. The recipe, its mode, how it went, the versions, benchmark numbers and the tuning settings you changed — no host names, addresses, paths, model names or keys.</p>`
+      : `<div class="callout warn"><div>Community reports are off. Set <span class="mono">cookbook.community_url</span> in controller.yaml to send results. This is what would be sent.</div></div>`) + codeBlock(JSON.stringify(pv.report, null, 2)),
+    actions: pv.enabled ? [{ label: "Cancel", value: null }, { label: "Send", value: "sent", cls: "primary", validate: async () => { await POST("/api/v1/cookbook/report", { report: pv.report }); return true; } }]
+      : [{ label: "Close", value: null }],
+  });
+  if (value === "sent") toast("Shared — thank you", "good");
+  return value;
+}
+function communityLine(st) {
+  if (!st || !st.reports) return "";
+  const rate = st.success_rate == null ? "" : ` · ${Math.round(st.success_rate * 100)} % work`;
+  const tok = st.median_tok_s ? ` · median ${num(Math.round(st.median_tok_s))} tok/s` : "";
+  const top = (st.top_changes || []).slice(0, 3).map(c => `${c.field.replace(/^advanced\.|^simple\.|^behaviour\./, "")} = ${c.value} (${c.count}×)`);
+  return `<div class="small muted community-line">Community: ${num(st.reports)} report${st.reports === 1 ? "" : "s"}${rate}${tok}${top.length ? `<br>Often changed: ${esc(top.join(", "))}` : ""}</div>`;
+}
+function catalogLine(cat) {
+  if (!cat || !cat.enabled) return `<p class="small muted">The recipe catalog is off (<span class="mono">cookbook.catalog_url</span>): recipes come with TwinSpark updates.</p>`;
+  const when = cat.fetched_at ? new Date(cat.fetched_at * 1000).toLocaleString() : "not yet";
+  const parts = [cat.new?.length ? `${cat.new.length} new` : "", cat.updated?.length ? `${cat.updated.length} updated` : ""].filter(Boolean).join(", ");
+  return `<div class="row between small catalog-line"><span class="muted">Recipe catalog: ${parts ? esc(parts) + " since this TwinSpark version" : "nothing newer than this TwinSpark's recipes"} · read ${esc(when)}${cat.last_error ? ` · <span class="warn-text">${esc(cat.last_error)}</span>` : ""}</span><button class="btn sm ghost" data-act="catalog-refresh">Check for new recipes</button></div>`;
+}
+/** the mode to import a recipe in: "" for a recipe without modes, null when cancelled */
+async function chooseRecipeMode(recipe) {
+  const modes = recipe?.modes || [];
+  if (modes.length < 2) return "";
+  const measured = (m) => Object.entries(m.measured || {}).slice(0, 4).map(([k, v]) => tag(`${k.replace(/_/g, " ")}: ${v}`, "muted")).join("");
+  const { value, root } = await modal({
+    title: `Import ${recipe.title || recipe.name}`,
+    body: `<p class="small">This recipe comes in ${modes.length} modes. Each one becomes a profile of its own; you can import the other later.</p>
+      <div class="mode-choice">${modes.map(m => `<label class="option"><input type="radio" name="recipe-mode" value="${esc(m.name)}" ${m.name === recipe.default_mode ? "checked" : ""}/>
+        <div><b>${esc(m.title)}</b>${m.name === recipe.default_mode ? " " + tag("default", "info") : ""}<p class="small muted" style="margin:2px 0">${esc(m.description)}</p>
+        ${Object.keys(m.measured || {}).length ? `<div class="measured">${measured(m)}</div>` : `<div class="small muted">Not measured yet — run a benchmark after the switch.</div>`}</div></label>`).join("")}</div>`,
+    actions: [{ label: "Cancel", value: null }, { label: "Continue", value: "go", cls: "primary" }],
+  });
+  if (value !== "go") return null;
+  return $('input[name="recipe-mode"]:checked', root)?.value || recipe.default_mode || "";
 }
 async function viewCookbookCommunity(g, head, refresh) {
   render(g, `<div class="view">${head}<div class="card"><div class="loading"><span class="spin"></span> reading GitHub…</div></div></div>`);

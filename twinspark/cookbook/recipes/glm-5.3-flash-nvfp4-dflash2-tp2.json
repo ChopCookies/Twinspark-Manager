@@ -96,5 +96,32 @@
     ],
     "launcher": "https://github.com/seanlinmt/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark/blob/main/launch-glm53-vllm-tp2-dflash2.sh",
     "image_digest": "sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6"
+  },
+  "default_mode": "latency",
+  "modes": {
+    "latency": {
+      "title": "Latency — DFlash2 k=7",
+      "description": "The DFlash2 block-diffusion drafter with 7 tokens: the fastest published lane for code and structured output. The recipe author's measurements.",
+      "patch": {},
+      "measured": {
+        "single_stream_tok_s": 46.9,
+        "structured_tok_s": "54-61 (temp 0)",
+        "aggregate_c6_tok_s": 56.2,
+        "kv_pool": "581,040 tokens at 262K",
+        "boot": "~15 min"
+      }
+    },
+    "throughput": {
+      "title": "Throughput — no drafter, 8 sequences",
+      "description": "The same checkpoint and image without the drafter (and without its weights): more parallel requests. Not measured on two Sparks yet.",
+      "patch": {
+        "advanced": {
+          "speculative_config": null,
+          "extra_models": [],
+          "max_num_seqs": 8
+        }
+      },
+      "measured": {}
+    }
   }
 }

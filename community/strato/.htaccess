@@ -1,0 +1,11 @@
+# Only the two endpoints answer; the shared code, the schema and any config are never served.
+Options -Indexes
+<FilesMatch "^(lib\.php|config.*\.php|schema\.sql|README\.md)$">
+    Require all denied
+</FilesMatch>
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer"
+</IfModule>
+# Uncomment to point lib.php at a config elsewhere than ../../twinspark-private/config.php:
+# SetEnv TWINSPARK_CONFIG /absolute/path/outside/the/web/folder/config.php

@@ -13,6 +13,7 @@ import re
 import secrets
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Optional
 
 from ..gateway.gateway import Gateway
@@ -118,6 +119,11 @@ class Controller:
         if self.keys.migrate(self.gateway.inference_api_key):
             self._audit("system", "keys.migrate", "keys/default", {"from": "inference_api_key"})
         self.gateway.set_keys(self.keys.records())
+        # the recipe catalog (master plan §4.1), cached next to the state database
+        from ..cookbook import make_catalog
+        cb = config.cookbook
+        self.catalog = make_catalog(Path(config.db_path).parent / "catalog", cb.catalog_url,
+                                    refresh_hours=cb.catalog_refresh_hours)
         self._audit("system", "controller.init", "controller", {})
 
     # ---- named keys and usage (master plan §4.1) ---------------------------------

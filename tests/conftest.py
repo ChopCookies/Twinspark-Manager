@@ -28,6 +28,20 @@ SHA = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 
 
+@pytest.fixture(autouse=True)
+def _no_catalog_network(monkeypatch):
+    """The recipe catalog never reaches GitHub from a test (tests pass a mock client), and a catalog one test
+    configured does not overlay the next test's Cookbook."""
+    from twinspark.cookbook import catalog
+
+    def offline():
+        raise catalog.CatalogError("no network in tests")
+
+    monkeypatch.setattr(catalog, "_client", offline)
+    yield
+    catalog.configure(None)
+
+
 @pytest.fixture
 def require_symlinks(tmp_path):
     """Probe permissions instead of silently replacing HF cache links with copies."""

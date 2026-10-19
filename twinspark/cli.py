@@ -616,19 +616,34 @@ def cmd_cookbook(args, api: Api):
         data = api("GET", "/api/v1/cookbook")
         if _out(api, data):
             return
+        marks = {"new": "NEW ", "updated": "UPD "}
         for r in data["recipes"]:
+            mark = marks.get(r.get("catalog") or "", "    ")
             if "error" in r:
-                print(f"{r['name']:36} ERROR {r['error']}")
+                print(f"{mark}{r['name']:36} ERROR {r['error']}")
                 continue
             imp = f"  → profile {', '.join(r['imported_as'])}" if r.get("imported_as") else ""
-            print(f"{r['name']:36} {r['verification']:12} {r['topology']:7} {r['model']}{imp}")
-            print(f"    {r['title']}")
-        print("\ncommunity sources: " + ", ".join(data.get("sources", [])) + "  (`tsm cookbook community`)")
+            modes = f"  modes: {', '.join(m['name'] for m in r['modes'])}" if len(r.get("modes") or []) > 1 else ""
+            print(f"{mark}{r['name']:36} {r['verification']:12} {r['topology']:7} {r['model']}{imp}")
+            print(f"        {r['title']}{modes}")
+            if r.get("catalog_note"):
+                print(f"        note: {r['catalog_note']}")
+        cat = data.get("catalog") or {}
+        if cat.get("enabled"):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(cat["fetched_at"])) if cat.get("fetched_at") \
+                else "not yet"
+            err = f" — {cat['last_error']}" if cat.get("last_error") else ""
+            print(f"\nrecipe catalog: {len(cat.get('new') or [])} new, {len(cat.get('updated') or [])} updated "
+                  f"(read {when}; `tsm cookbook refresh`){err}")
+        print("community sources: " + ", ".join(data.get("sources", [])) + "  (`tsm cookbook community`)")
     elif args.action == "show":
-        r = api("GET", f"/api/v1/cookbook/recipes/{args.name}")
+        r = api("GET", f"/api/v1/cookbook/recipes/{args.name}", params={"mode": args.mode} if args.mode else None)
         if _out(api, r):
             return
         print(f"{r['name']} — {r['title']}  [{r['verification']}]\n{r['description']}\n")
+        for m in r.get("modes") or []:
+            mark = "*" if m["name"] == r.get("mode") else " "
+            print(f"mode       {mark} {m['name']:12} {m.get('title') or ''} — {m.get('description') or ''}")
         for k in ("url", "author", "image_hint"):
             if r.get(k):
                 print(f"{k:12} {r[k]}")
@@ -645,10 +660,53 @@ def cmd_cookbook(args, api: Api):
             print(f"dropped      {', '.join(rep['dropped'])} (TwinSpark wires these itself)")
     elif args.action == "import":
         if not args.name:
-            sys.exit("usage: tsm cookbook import <recipe> [--as NAME]")
-        res = api("POST", f"/api/v1/cookbook/import/{args.name}",
-                  params={"profile_name": args.as_name} if args.as_name else None)
+            sys.exit("usage: tsm cookbook import <recipe> [--as NAME] [--mode MODE]")
+        params = {k: v for k, v in (("profile_name", args.as_name), ("mode", args.mode)) if v}
+        res = api("POST", f"/api/v1/cookbook/import/{args.name}", params=params or None)
         print(f"imported profile {res['profile']['name']} — next: `tsm pin {res['profile']['name']}`")
+    elif args.action == "refresh":
+        res = api("POST", "/api/v1/cookbook/catalog/refresh")
+        if _out(api, res):
+            return
+        parts = [f"{len(res[k])} {k}: {', '.join(res[k])}" for k in ("added", "updated", "removed") if res.get(k)]
+        print(f"recipe catalog: {res.get('recipes', 0)} recipes — " + ("; ".join(parts) or "nothing changed"))
+        for name, needs in (res.get("status") or {}).get("needs_newer", {}).items():
+            print(f"  {name} needs TwinSpark {needs} (update TwinSpark to import it)")
+    elif args.action == "stats":
+        data = api("GET", "/api/v1/cookbook/community-stats", params={"refresh": str(args.refresh).lower()})
+        if _out(api, data):
+            return
+        if not data:
+            sys.exit("no community server configured (cookbook.community_url in controller.yaml)")
+        if data.get("error"):
+            sys.exit(data["error"])
+        for name, st in sorted((data.get("recipes") or {}).items()):
+            rate = f"{st['success_rate']:.0%}" if st.get("success_rate") is not None else "—"
+            tok = f"  median {st['median_tok_s']:,.0f} tok/s" if st.get("median_tok_s") else ""
+            print(f"{name:40} {st['reports']:4} reports  {rate:>5} work{tok}")
+            for ch in st.get("top_changes") or []:
+                print(f"    {ch['count']}× {ch['field']} = {ch['value']}")
+    elif args.action == "report":
+        if not args.name:
+            sys.exit("usage: tsm cookbook report <profile> [--outcome works|works-with-changes|fails] [--comment …]")
+        params = {k: v for k, v in (("outcome", args.outcome), ("failure_stage", args.failure_stage),
+                                    ("comment", args.comment)) if v}
+        if args.anonymous:
+            params["anonymous"] = "true"
+        pv = api("GET", f"/api/v1/cookbook/report/{args.name}", params=params)
+        print("This is everything that would be sent:\n")
+        print(json.dumps(pv["report"], indent=2))
+        if not pv.get("enabled"):
+            print("\nCommunity reports are off: set cookbook.community_url in /etc/twinspark/controller.yaml "
+                  "to send it.")
+            return
+        print(f"\nto {pv['url']}")
+        if not args.yes and input("Send it? [y/N] ").strip().lower() != "y":
+            print("not sent")
+            return
+        res = api("POST", "/api/v1/cookbook/report", json={"report": pv["report"]})
+        print("sent — thank you" + (f" ({res['server'].get('message')})" if (res.get("server") or {}).get("message")
+                                    else ""))
     elif args.action == "community":
         data = api("GET", "/api/v1/cookbook/community", params={"refresh": str(args.refresh).lower()})
         if _out(api, data):
@@ -1246,13 +1304,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tail", type=int, default=200)
 
     s = cmd("cookbook", cmd_cookbook, "recipes: built-in, community (eugr), import")
-    s.add_argument("action", choices=["list", "show", "import", "community", "import-recipe"])
-    s.add_argument("name", nargs="?", help="recipe name, or a file/URL for import-recipe")
+    s.add_argument("action", choices=["list", "show", "import", "community", "import-recipe", "refresh", "report",
+                                      "stats"])
+    s.add_argument("name", nargs="?", help="recipe name, a file/URL for import-recipe, a profile for report")
     s.add_argument("--as", dest="as_name", help="profile name to create")
+    s.add_argument("--mode", help="show/import: one of the recipe's modes (e.g. latency, throughput)")
     s.add_argument("--preview", action="store_true", help="import-recipe: show the mapping only")
     s.add_argument("-e", "--set", action="append", metavar="KEY=VALUE",
                    help="import-recipe: override an eugr template default (like run-recipe -e)")
-    s.add_argument("--refresh", action="store_true", help="community: bypass the 10 min cache")
+    s.add_argument("--refresh", action="store_true", help="community/stats: bypass the cache")
+    s.add_argument("--outcome", choices=["works", "works-with-changes", "fails"],
+                   help="report: how it went (default: from the last activation)")
+    s.add_argument("--stage", dest="failure_stage",
+                   choices=["download", "pull", "plan", "start", "health", "smoke", "serving", "other"],
+                   help="report --outcome fails: where it failed")
+    s.add_argument("--comment", default="", help="report: a short note (500 characters; shown before sending)")
+    s.add_argument("--anonymous", action="store_true", help="report: without this installation's random id")
+    s.add_argument("-y", "--yes", action="store_true", help="report: send without asking (after the preview)")
 
     s = cmd("models", cmd_models, "model files on both nodes: ls, stage, rm")
     s.add_argument("action", choices=["ls", "stage", "rm"])

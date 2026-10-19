@@ -26,7 +26,7 @@ function page(responses = {}) {
     window: { addEventListener() {} },
     document: { addEventListener() {}, querySelector: element, title: "" },
   });
-  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "keys.js", "client.js"]) {
+  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "keys.js", "playground.js", "client.js"]) {
     vm.runInContext(fs.readFileSync(path.join(JS, file), "utf8"), context, { filename: file });
   }
   return { element, requests, run: code => vm.runInContext(code, context) };

@@ -60,7 +60,9 @@ async def check_updates(ctrl, profiles: list[Profile]) -> list[dict]:
             if not isinstance(receipt.get("overrides", {}), dict):
                 raise ValueError("recipe template overrides are invalid — re-import it to restore tracking")
             if ref.startswith("builtin:"):
-                upstream = build_draft(ref.removeprefix("builtin:").rsplit(".", 1)[0])
+                # the same mode the profile was imported in: another mode is not an upstream change
+                upstream = build_draft(ref.removeprefix("builtin:").rsplit(".", 1)[0],
+                                       mode=(draft.source or {}).get("mode"))
                 if upstream is None:
                     raise RemoteError("built-in recipe is no longer available")
                 report = {}
@@ -73,6 +75,10 @@ async def check_updates(ctrl, profiles: list[Profile]) -> list[dict]:
             if (incoming["sha256"], incoming.get("metadata_sha256")) == \
                     (receipt.get("sha256"), receipt.get("metadata_sha256")):
                 return {**row, "status": "current", "sha256": incoming["sha256"]}
+            if receipt.get("draft_sha256") and incoming.get("draft_sha256") == receipt["draft_sha256"]:
+                # the file changed, not what this profile took from it (another mode of the recipe)
+                return {**row, "status": "current", "sha256": incoming["sha256"],
+                        "message": "The recipe file changed, not the part this profile uses."}
             updated, preserved, conflicts = merge_update(draft, upstream)
             updated.name = _name(ctrl, profile.name)
             updated.source["updated_from"] = {"profile": profile.name, "sha256": receipt.get("sha256")}
