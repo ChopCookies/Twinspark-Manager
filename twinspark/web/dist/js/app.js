@@ -991,6 +991,21 @@ function planNodeHtml(node, p) {
   for (const n of p.notes || []) h += `<p class="small muted">${esc(n)}</p>`;
   return h;
 }
+/** which measurements back the forecast, per node: the KV size's source and the starts with these exact settings */
+function forecastBacking(fit) {
+  const nodes = [...new Set([...Object.keys(fit.kv_source || {}), ...Object.keys(fit.calibration || {})])].sort();
+  if (!nodes.length) return "";
+  const kvLabel = { measured: "measured", estimated: "estimated (formula)" };
+  const rows = nodes.map(n => {
+    const kv = (fit.kv_source || {})[n], cal = (fit.calibration || {})[n];
+    const kvText = kv ? `${tag(kvLabel[kv.source] || kv.source, kv.source === "measured" ? "good" : "warn")} <span class="muted">${esc(kv.note || "")}</span>` : "—";
+    const calText = cal && cal.samples
+      ? `${tag(`${cal.samples} start${cal.samples === 1 ? "" : "s"}`, cal.samples >= 3 ? "good" : "info")} worst ${gib(cal.worst_gib)}, median ${gib(cal.median_gib)}, spread ${gib(cal.spread_gib)}, safety margin ${gib(cal.margin_gib)}${cal.samples < 3 ? " <span class=\"muted\">(+0.5 GiB until 3 starts)</span>" : ""}`
+      : `${tag("not yet", "muted")} <span class="muted">no start with exactly these settings: the startup peak is estimated</span>`;
+    return `<b>Node ${esc(n)} · KV size</b><span>${kvText}</span><b>Node ${esc(n)} · startup</b><span>${calText}</span>`;
+  }).join("");
+  return `<div class="section-title">What backs this forecast</div><div class="kv small" data-key="forecast-backing">${rows}</div>${fit.fingerprinted === false ? `<p class="small muted">Not pinned yet: measurements are only matched to a pinned revision's exact settings.</p>` : ""}`;
+}
 function fitHtml(fit) {
   if (!fit) return empty("Unavailable");
   if (fit.nodes) return Object.entries(fit.nodes).map(([node, detail]) => `<div class="section-title">Node ${esc(node)} · ${esc(detail.model)}</div>${fitHtml(detail)}`).join('<hr class="sep">');
@@ -1000,7 +1015,8 @@ function fitHtml(fit) {
     const v = fit.verdicts || {};
     h += `<div class="row between small"><span>${tag(v.startup?.ok ? "starts" : "startup does not fit", v.startup?.ok ? "good" : "bad")} ${tag(v.one_context?.ok === false ? "one request does not fit" : "one request fits", v.one_context?.ok === false ? "bad" : "good")} ${v.full_concurrency?.ok === false ? tag("fewer parallel full-length sequences", "warn") : ""}</span><span class="muted">${esc(fit.confidence || "")}</span></div>`;
     h += Object.entries(fit.plan).map(([node, p]) => planNodeHtml(node, p)).join("");
-    h += `<p class="small muted">Every number is per node. The startup peak and the steady state are separate figures; a calibrated figure comes from this revision's last startup timeline.</p>`;
+    h += forecastBacking(fit);
+    h += `<p class="small muted">Every number is per node. The startup peak and the steady state are separate figures; a calibrated figure comes only from earlier starts with exactly these settings (model commit, image, KV format, context, concurrency, batch size, memory share).</p>`;
   } else {
     const pool = fit.kv_pool_gib_per_node, w = fit.weights_gib_per_node, total = fit.budget.mem_total;
     h += `<div class="row between small"><span>${fit.fits ? tag("fits", "good") : tag("does not fit", "bad")} ${fit.full_concurrency_fits ? "" : tag("fewer parallel full-length sequences", "warn")}</span><span class="muted">gpu_memory_utilization ${esc(fit.gpu_memory_utilization)}</span></div>
@@ -1493,7 +1509,7 @@ async function viewJobs() {
     const jobs = await GET("/api/v1/jobs" + qs({ limit: 60, kind }));
     if (!fresh()) return;
     renderLive(g, `<div class="view" data-live="jobs"><div class="view-head"><div><h1>Jobs</h1><p>Recipe preparation, connection checks and deployment changes — newest first.</p></div>
-      <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "compatibility", "evaluation", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
+      <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "compatibility", "evaluation", "benchmark", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
       <div class="card">${jobs.length ? `<div class="table-wrap"><table><thead><tr><th>Job</th><th>Kind</th><th>Target</th><th>State</th><th>Stage</th><th>Started</th><th>Took</th></tr></thead><tbody>
       ${jobs.map(j => `<tr class="clickable" data-key="job:${esc(j.job_id)}" data-act="open" data-id="${esc(j.job_id)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.kind)}</td><td>${esc(j.payload.alias || (j.payload.profile ? j.payload.profile + " " + (j.payload.label || "") : j.payload.repo || ""))}</td>
         <td>${tag(j.state, { completed: "good", failed: "bad", running: "info" }[j.state] || "muted")}${j.error ? `<div class="sub">${esc(j.error.slice(0, 120))}</div>` : ""}</td><td>${esc(j.stage || "")}</td><td>${esc(ago(j.created_at))}</td><td>${esc(dur(j.created_at, ["running", "pending"].includes(j.state) ? null : j.updated_at))}</td></tr>`).join("")}

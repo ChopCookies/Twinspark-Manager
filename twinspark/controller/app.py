@@ -42,10 +42,12 @@ _BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 LAZY_ROUTERS: dict[str, str] = {
     "/api/v1/cookbook": "twinspark.api.routes_cookbook",
     "/api/v1/integrations": "twinspark.api.routes_integrations",
+    "/api/v1/benchmarks": "twinspark.api.routes_benchmarks",
 }
 # what this node API offers, for the client's version/capability handshake
 CAPABILITIES = ("activation-request-id", "expected-active", "activation-journal", "startup-timeline",
-                "memory-plan-v2", "node-memory", "lazy-rich-routes", "socket-terminal")
+                "memory-plan-v2", "node-memory", "lazy-rich-routes", "socket-terminal",
+                "measurement-fingerprints", "drain-policy", "validation-record", "benchmarks")
 
 
 def _clean(value: object, limit: int) -> str:

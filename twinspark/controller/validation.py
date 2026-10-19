@@ -156,7 +156,8 @@ def build_record(ctrl: "Controller", name: str, ref: Optional[str] = None, job_i
             "created_at": job.created_at, "stages": _stages(job), "error": job.error,
             "rollback": job.rollback, "warnings": payload.get("warnings") or [],
         },
-        "results": None if job is None else {
+        # benchmarks and evaluations are evidence of their own: they show even before an activation job
+        "results": None if job is None and not benches and not evals else {
             "kv": payload.get("kv"), "models": payload.get("models"), "kv_sources": payload.get("kv_sources"),
             "startup": startup, "startup_classification": (payload.get("startup_evidence") or {}).get("classification"),
             "benchmarks": benches, "evaluations": evals,
@@ -192,11 +193,14 @@ def to_markdown(rec: dict) -> str:
         took = sum(s["seconds"] or 0 for s in proc["stages"])
         lines += ["", f"Procedure: job `{proc['job_id']}` ({proc['kind']}) {proc['state']} in {took:.0f} s"
                   + (f"; error: {proc['error']}" if proc.get("error") else "") + "."]
-        res = rec.get("results") or {}
-        kv = res.get("kv") or {}
-        if kv.get("kv_cache_tokens"):
-            lines.append(f"KV pool: {kv['kv_cache_tokens']:,} tokens"
-                         + (f" in {kv['kv_memory_gib']} GiB" if kv.get("kv_memory_gib") else "") + ".")
-        for b in res.get("benchmarks") or []:
-            lines.append(f"Benchmark `{b['job_id']}` ({b.get('preset')}): {b.get('summary')}")
+    res = rec.get("results") or {}
+    kv = res.get("kv") or {}
+    if kv.get("kv_cache_tokens"):
+        lines.append(f"KV pool: {kv['kv_cache_tokens']:,} tokens"
+                     + (f" in {kv['kv_memory_gib']} GiB" if kv.get("kv_memory_gib") else "") + ".")
+    for b in res.get("benchmarks") or []:
+        summary = b.get("summary")
+        text = summary.get("text") if isinstance(summary, dict) else summary
+        lines.append(f"Benchmark `{b['job_id']}` ({b.get('preset')}{'' if b.get('valid', True) else ', invalid'}, "
+                     f"measured by the client): {text}")
     return "\n".join(lines) + "\n"

@@ -217,6 +217,7 @@ tsm job <id>                   # what a job did; a failed start lists the saved 
 tsm job <id> --log FILE        # print one of those saved startup logs
 tsm headless status            # desktop, boot target and how you can reach each node remotely
 tsm headless headless-max      # stop the desktop session now, free its memory (asks first; -y skips)
+tsm bench run max-throughput   # peak tokens/s and the knee, through the gateway (docs/benchmarks.md)
 tsm link --mode rdma           # QSFP / NCCL link test (both nodes must be live, not dry-run)
 tsm rdma --apply               # write discovered RoCE devices into controller.yaml
 tsm qsfp status                # QSFP link on THIS node: both twins, addresses, MTU, RoCE (docs/qsfp-link.md)
@@ -311,6 +312,7 @@ before). Update the client with `pipx upgrade twinspark-manager` (a git install:
 - [Remote management: terminal, logs, power, Wake-on-LAN, network boot](docs/remote-management.md)
 - [The QSFP link: both interfaces, addresses, MTU, verification](docs/qsfp-link.md)
 - [Validation records and the hardware matrix](docs/validation.md)
+- [Benchmarks: throughput, latency targets, context and quality, compared per revision](docs/benchmarks.md)
 - [Development, testing and the demo harness](docs/development.md)
 - [Security model and known limits](docs/security.md) · [Reporting a vulnerability](SECURITY.md)
 - [Changelog](CHANGELOG.md)

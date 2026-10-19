@@ -13,7 +13,8 @@ DGX Sparks. This page keeps the two apart and lists what has really been run.
 | **none** | nothing has run | — |
 
 A recipe that "works externally" and a manager version that "ran it" are separate facts; a record never
-upgrades one into the other.
+upgrades one into the other. Benchmark results carry their own class, **measured by the client** (real
+requests through the gateway, reported by the client that sent them; see [benchmarks](benchmarks.md)).
 
 ## Exporting a record
 
