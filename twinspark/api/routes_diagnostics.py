@@ -107,6 +107,13 @@ def metrics_series(ctrl: Controller = Depends(controller_dep)):
     return ctrl.sampler.series()
 
 
+@router.get("/metrics/history")
+def metrics_history(hours: float = 24.0, ctrl: Controller = Depends(controller_dep)):
+    """Minute averages of the serving metrics and each node's memory, swap, pressure and GPU power, up to
+    24 hours back; they survive a controller restart."""
+    return ctrl.history.series(hours=max(0.1, min(hours, 24.0)))
+
+
 class HeadlessApply(BaseModel):
     mode: Literal["desktop", "headless-safe", "headless-max"]
     now: bool = False      # also stop the display manager right away (not just at next boot)

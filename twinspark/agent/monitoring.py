@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from .sysinfo import memory_snapshot
+from .sysinfo import memory_snapshot, read_psi
 
 
 def read(path: Path) -> str:
@@ -116,8 +116,10 @@ class HostSampler:
             if not memory["mem_total_gib"]:
                 memory = dict.fromkeys(memory)
             load = read(self.proc / "loadavg").split()
+            psi = read_psi(str(self.proc / "pressure" / "memory")) or {}     # None without PSI support
             sample = {
                 **memory,
+                "psi_some_avg10": psi.get("some_avg10"), "psi_full_avg10": psi.get("full_avg10"),
                 "at": time.time(),
                 "cpu_pct": cpu_pct,
                 "load_1m": number(load[0]) if load else None,

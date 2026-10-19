@@ -279,11 +279,13 @@ async def prepare(name: str, revision: str = "latest", ctrl: Controller = Depend
 
 class ActivateRequest(BaseModel):
     """Optional body. ``expected_active``: the revision id the caller saw as active (null = nothing).
-    ``drain_policy``: what to do with requests still running (abort the switch, wait, or force)."""
+    ``drain_policy``: what to do with requests still running (abort the switch, wait, or force).
+    ``nodes``: restart only these halves of the active split revision (the other half keeps serving)."""
     request_id: Optional[str] = None
     expected_active: Optional[str] = None
     drain_policy: Optional[Literal["abort", "wait", "force"]] = None
     drain_timeout_s: Optional[int] = Field(None, ge=0, le=86400)
+    nodes: Optional[list[Literal["A", "B"]]] = Field(None, min_length=1, max_length=2)
 
 
 @router.post("/{name}/activate", response_model=Job, status_code=202)
@@ -296,6 +298,8 @@ async def activate(name: str, revision: str = "latest", req: Optional[ActivateRe
             kw["drain"] = {"policy": req.drain_policy, "timeout_s": req.drain_timeout_s}
         if "expected_active" in req.model_fields_set:
             kw["expected_active"] = req.expected_active
+        if req.nodes:
+            kw["nodes"] = list(req.nodes)
     try:
         return await ctrl.activate(name, revision, **kw)
     except (BusyError, StaleViewError) as e:

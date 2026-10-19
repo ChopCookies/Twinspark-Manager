@@ -115,3 +115,25 @@ test("the plan says which measurements back the forecast", () => {
   assert.match(html, /no start with exactly these settings/);
   assert.equal(p.run("forecastBacking({})"), "");
 });
+
+test("a split deployment shows each half with its own restart", () => {
+  const p = page();
+  const html = p.run(`halvesHtml({ busy: false, active: { profile: "duo", revision_id: "rev-2" }, halves: [
+    { node: "A", name: "duo-a", model: "org/a", model_revision: "a".repeat(40), aliases: ["chat"], revision_id: "rev-1", label: "r1", since: 0, state: "serving", metrics: { ok: true, decode_tok_s: 42, kv_cache_usage_pct: 12, "requests-running": 1, "requests-waiting": 0 } },
+    { node: "B", name: "duo-b", model: "org/<b>", model_revision: "b".repeat(40), aliases: ["code"], revision_id: "rev-2", label: "r2", since: 0, state: "down", reason: "switch failed: <oom>" }] })`);
+  assert.match(html, /kept across later revisions/);
+  assert.match(html, /data-act="half-restart" data-node="A" data-aliases="chat"/);
+  assert.match(html, /Start this half/);
+  assert.match(html, /org\/&lt;b&gt;/);
+  assert.match(html, /switch failed: &lt;oom&gt;/);
+  assert.equal(p.run("halvesHtml({ active: null, halves: [] })"), "");
+});
+
+test("the System page shows the last day from node A's history", () => {
+  const p = page();
+  const html = p.run(`historyCard({ ts: [0, 3600, 7200], decode_tok_s: [10, 50, 30], kv_cache_usage_pct: [5, 9, 7], ttft_p95_ms: [null, 400, 300], "A.mem_available_gib": [60, 40.5, 55] }, ["A"])`);
+  assert.match(html, /Last 2 h/);
+  assert.match(html, /Decode \(peak 50\)/);
+  assert.match(html, /Node A MemAvailable \(low 40.5 GiB\)/);
+  assert.equal(p.run("historyCard({ ts: [] }, [])"), "");
+});

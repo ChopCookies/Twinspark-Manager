@@ -1,0 +1,41 @@
+# Prometheus and Grafana on your workstation, scraping node A through the TwinSpark client's forward.
+# Nothing here runs on the Sparks. See docs/metrics.md.
+#
+#   1. on node A:        sudo tsm prometheus key            -> copy the key into ./twinspark.key (one line)
+#   2. on this computer: tsm client                      (keeps the forward to node A's API on 127.0.0.1:8443)
+#   3. here:             docker compose up -d            -> Grafana on http://127.0.0.1:3000 (admin / admin)
+#
+# network_mode: host lets the containers reach the client's 127.0.0.1 forward (Linux; Docker Desktop 4.34+
+# with host networking turned on). Otherwise remove both network_mode lines, publish the ports and set the
+# target in prometheus.yml to host.docker.internal:8443.
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=90d
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./twinspark.key:/etc/prometheus/twinspark.key:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

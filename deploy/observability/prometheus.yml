@@ -1,0 +1,14 @@
+# One scrape job for the whole cluster: node A's controller exports both nodes, the gateway and the engine.
+# `tsm prometheus config` prints the same job with other settings.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: twinspark
+    scheme: http                      # https if node A's management listener has a certificate
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/twinspark.key   # the output of `sudo tsm prometheus key` on node A
+    static_configs:
+      - targets: ["127.0.0.1:8443"]   # the TwinSpark client's forward to node A's management API

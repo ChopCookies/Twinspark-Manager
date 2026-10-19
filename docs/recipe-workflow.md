@@ -97,6 +97,30 @@ only on B; A's files only on A. A source cache on the other node may still be
 reused through QSFP. Both APIs must become healthy. A failure after the previous
 deployment is stopped removes the partial deployment and invokes normal rollback.
 
+### Each half on its own
+
+The two halves of a split are independent models, and TwinSpark treats them that way:
+
+- **A new revision touches only what changed.** Edit node B's half, pin, and activate: only B's model is
+  drained, stopped and started. Node A's container keeps running, its alias stays open, and requests that
+  are streaming from it are not waited for or cut off. The job says *only node B's half changes*; the
+  dashboard shows which revision started each half (*kept across later revisions*). This needs the same
+  profile and an identical half (same settings, model commit and image) that is serving; anything else
+  switches both halves.
+- **Restart one half:** the dashboard's *Restart this half*, or `tsm activate dual-model --half B`. Activating
+  the same revision without `--half` restarts both.
+- **The watchdog recovers only the half that failed.** If node B's model crashes, only `code` goes down and
+  only B is restarted; `chat` keeps serving.
+- **A failed switch of one half leaves the other serving.** With `auto_rollback` the previous version of that
+  half is started again (again without touching the other). Without it the half stays **down** (shown with
+  the reason on the dashboard and in `tsm status`) until you start it with *Start this half* or switch.
+- **After a controller restart** a half that still runs is adopted; one that did not survive (node B rebooted)
+  is restarted alone when `autostart` is on.
+- **Metrics per half:** the dashboard, `tsm status` and `/metrics` ([metrics](metrics.md)) show each half's
+  throughput, KV cache and latency with its own alias, node and revision.
+
+TP2, PP2 and TP-EP are one model on two nodes: they always switch, fail and recover as one unit.
+
 ## One model distributed across both nodes
 
 Use `tp2` (tensor parallel), `pp2` (pipeline parallel), or `tp-ep` (TP with expert

@@ -69,7 +69,9 @@ def options_from(args) -> Options:
     return Options(**kw)
 
 
-def _status_reader(api):
+def _status_reader(api, alias: str):
+    from .client.bench_local import switch_touches
+
     async def status() -> dict:
         try:
             st = await asyncio.to_thread(api, "GET", "/api/v1/status", ok=tuple(range(400, 600)), timeout=10)
@@ -83,8 +85,7 @@ def _status_reader(api):
                 for n, t in tel.items() if isinstance(t, dict)}
 
     async def busy() -> bool:
-        st = await status()
-        return bool(st.get("busy") or st.get("current_job"))
+        return switch_touches(await status(), alias)
     return sample, busy
 
 
@@ -112,7 +113,7 @@ async def _run(args, api) -> dict[str, Any]:
     loopback = host in ("127.0.0.1", "::1", "localhost")
     http = httpx.AsyncClient(timeout=httpx.Timeout(900, connect=15), trust_env=False, verify=not loopback,
                              limits=httpx.Limits(max_connections=top + 8))
-    sample, busy = _status_reader(api) if api is not None else (None, None)
+    sample, busy = _status_reader(api, args.alias) if api is not None else (None, None)
     run = Run(Target(base, _inference_key(args), args.alias, http=http), opts, sampler=sample, busy=busy)
     task = asyncio.create_task(run.execute())
     shown = 0

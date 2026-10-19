@@ -89,13 +89,13 @@ class Benchmarks:
         return {n: {"mem_available_gib": t.get("mem_available_gib"), "power_w": (t.get("gpu") or {}).get("power_w")}
                 for n, t in tel.items() if isinstance(t, dict)}
 
-    async def _busy(self) -> bool:
+    async def _busy(self, alias: str) -> bool:
         try:
             r = await self.session.node_request("GET", "/api/v1/status", timeout=10)
             st = r.json() or {}
         except Exception:  # noqa: BLE001 - unknown is not "busy": the revision guard still applies
             return False
-        return bool(st.get("busy") or st.get("current_job"))
+        return switch_touches(st, alias)
 
     def _target(self, alias: str, concurrency: int) -> Target:
         c = self.session.current
@@ -113,7 +113,7 @@ class Benchmarks:
     def start(self, req: BenchIn) -> dict[str, Any]:
         opts = req.options()
         top = max([opts.max_concurrency, *opts.levels, *opts.context_concurrency])
-        run = Run(self._target(req.alias, top), opts, sampler=self._sample, busy=self._busy)
+        run = Run(self._target(req.alias, top), opts, sampler=self._sample, busy=lambda: self._busy(req.alias))
         item: dict[str, Any] = {"run": run, "uploaded": None, "upload_error": None, "kind": "run"}
 
         async def go() -> None:
@@ -201,7 +201,8 @@ class Benchmarks:
                     job = await self._switch(side, item)
                     opts = Options(preset="fixed", levels=tuple(req.levels), input_tokens=req.input_tokens,
                                    output_tokens=req.output_tokens)
-                    run = Run(self._target(req.alias, max(req.levels)), opts, sampler=self._sample, busy=self._busy)
+                    run = Run(self._target(req.alias, max(req.levels)), opts, sampler=self._sample,
+                              busy=lambda: self._busy(req.alias))
                     item["current"] = run
                     item["message"] = f"measuring {side.profile} {side.revision}"
                     try:
@@ -231,6 +232,15 @@ class Benchmarks:
         self.items[cid] = item
         self._keep()
         return self.view(cid)
+
+
+def switch_touches(status: dict, alias: str) -> bool:
+    """Whether the switch node A is running affects ``alias``: a switch of one split half leaves the other
+    half's alias alone, so a benchmark of that alias stays valid."""
+    if not (status.get("busy") or status.get("current_job")):
+        return False
+    aliases = (status.get("switch") or {}).get("aliases")
+    return aliases is None or alias in aliases
 
 
 def _compare_table(sides: list[dict[str, Any]]) -> list[dict[str, Any]]:

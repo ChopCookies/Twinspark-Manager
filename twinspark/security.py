@@ -21,6 +21,7 @@ SECRET_SLOTS = {
     "backend_api_key",        # gateway -> vLLM (never leaves the cluster)
     "agent_token",            # controller -> agents (same value on both nodes)
     "plug_token",             # optional: referenced as ${secret:plug_token} in smart-plug requests
+    "metrics_api_key",        # Prometheus -> /metrics only (read-only; created by `tsm prometheus key`)
 }
 
 

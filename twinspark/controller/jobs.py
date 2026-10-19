@@ -99,6 +99,8 @@ class ActivationCoordinator:
         self.store = store if store is not None else getattr(getattr(persist, "__self__", None), "store", None)
         self.measurements = Measurements(self.store) if self.store is not None else None
         self.timeline: Optional[StartupTimeline] = None
+        # a switch that touches only some halves of a split deployment (controller.halves.decide_scope)
+        self.scope: Optional[dict] = None
 
     def agent(self, node: str) -> AgentClient:
         if node not in self.agents:
@@ -107,6 +109,7 @@ class ActivationCoordinator:
 
     async def handle(self, job: Job, stage: ActivationStage, step: JobStep) -> Optional[str]:
         rev: ProfileRevision = job.payload["_revision"]
+        self.scope = job.payload.get("scope") or None
         handler = {
             ActivationStage.VALIDATING: self._validate,
             ActivationStage.RESOLVING: self._resolve,
@@ -142,6 +145,8 @@ class ActivationCoordinator:
         try:
             for part in rev.parts():
                 nodes = part.required_nodes()
+                if self.scope and not set(nodes) & set(self.scope["nodes"]):
+                    continue                   # a half that kept running: this start measured nothing of it
                 model = (self.plan.route_models or {}).get(part.draft.simple.api_alias) if self.plan else None
                 kv = (((job.payload.get("models") or {}).get(model) or {}).get("kv")
                       or (job.payload.get("kv") if not rev.draft.secondary else None) or {})
@@ -278,6 +283,12 @@ class ActivationCoordinator:
         except LaunchError as exc:
             raise RuntimeError(str(exc)) from exc
         job.payload["launch_plan"] = self.plan.model_dump(mode="json")
+        if self.scope:
+            # only these halves are drained, stopped and started; the others keep serving untouched
+            from .halves import scoped_plan
+            self.plan = scoped_plan(self.plan, self.scope["nodes"])
+            notes.append(f"only node {', '.join(self.scope['nodes'])}'s half changes; node "
+                         f"{', '.join(self.scope['kept'])}'s half keeps serving")
         job.payload["warnings"] = ([n for n in self.plan.notes if n.startswith("WARNING")]
                                    + list(job.payload.get("startup_warnings") or []))
         return "plan ready (" + ", ".join(f"{n}: gpu_memory_utilization={u:.2f}"
@@ -441,6 +452,8 @@ class ActivationCoordinator:
         # alias, so every serving alias is drained.
         aliases = [a for a, st in self.gateway.routes.items() if st.backends]
         aliases = sorted(set(aliases) | set(rev.draft.aliases))
+        if self.scope:
+            aliases = list(self.scope["aliases"])          # the kept half's requests are not waited for
         for a in aliases:
             self.gateway.begin_drain(a, retry_after=30)
         self.drained = aliases
@@ -480,7 +493,7 @@ class ActivationCoordinator:
     async def _stop(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         stopped = []
         skipped = []
-        for n in sorted(self.agents):
+        for n in sorted(self.scope["nodes"] if self.scope else self.agents):
             try:
                 res = await self.agent(n).call("containers_stop_owned", timeout=180)
             except AgentActionError:
@@ -671,4 +684,8 @@ class ActivationCoordinator:
         return "routing " + ", ".join(self.plan.routes)
 
     async def _healthy(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
+        if self.scope:
+            served = ", ".join(f"'{a}'" for a in self.plan.routes)
+            return (f"{rev.profile_name} {rev.label}: node {', '.join(self.scope['nodes'])}'s half serving as "
+                    f"{served}; node {', '.join(self.scope['kept'])}'s half kept serving throughout")
         return f"{rev.profile_name} {rev.label} serving as '{rev.draft.simple.api_alias}'"

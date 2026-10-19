@@ -184,6 +184,13 @@ def cmd_status(args, api: Api):
             print(f"kv pool   {kv['kv_cache_tokens']:,} tokens{conc}")
         if obs.get("max_model_len"):
             print(f"context   {obs['max_model_len']:,} tokens")
+        for h in st.get("halves") or []:
+            m = h.get("metrics") or {}
+            perf = (f", decode {m.get('decode_tok_s', '-')} tok/s, KV {m.get('kv_cache_usage_pct', '-')}%"
+                    if m.get("ok") else "")
+            reason = f" — {h['reason']}" if h.get("reason") else ""
+            print(f"half {h['node']}    {h['state']:9} {h['model']} as {', '.join(h['aliases'])}, started by "
+                  f"{h.get('label') or h['revision_id']} {_ago(h.get('since'))}{perf}{reason}")
     else:
         print("active    -")
     if st.get("current_job"):
@@ -517,6 +524,8 @@ def cmd_activate(args, api: Api):
         body["drain_policy"] = args.drain
     if args.drain_timeout is not None:
         body["drain_timeout_s"] = args.drain_timeout
+    if getattr(args, "half", None):
+        body["nodes"] = [args.half]
     job = api("POST", f"/api/v1/profiles/{args.profile}/activate", params={"revision": args.revision}, json=body)
     print(f"job {job['job_id']}  (Ctrl-C stops watching, not the switch; `tsm cancel {job['job_id']}`)")
     if args.no_wait:
@@ -980,6 +989,8 @@ def cmd_metrics(args, api: Api):
                   f"running {r.get('requests-running', 0):.0f}  waiting {r.get('requests-waiting', 0):.0f}  "
                   f"KV {r.get('kv_cache_usage_pct', '-')}%  TTFT {r.get('avg_ttft_ms', '-')} ms  "
                   f"ITL {r.get('avg_itl_ms', '-')} ms"
+                  + (f"  (last interval: TTFT p95 {r['ttft_p95_ms']} ms, ITL p95 {r.get('itl_p95_ms', '-')} ms)"
+                     if r.get("ttft_p95_ms") is not None else "")
                   + (f"  accept {r['spec_mean_accept_len']}" if r.get("spec_mean_accept_len") else "")
                   + (f"  prefix-hit {r['prefix_hit_rate_pct']}%" if r.get("prefix_hit_rate_pct") else ""))
         if not args.watch:
@@ -1199,6 +1210,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="requests still running when the switch starts: abort the switch (default: keep the old "
                         "model), wait for them, or force (end them)")
     s.add_argument("--drain-timeout", type=int, metavar="S", help="seconds before abort/force (default 30)")
+    s.add_argument("--half", type=str.upper, choices=["A", "B"],
+                   help="split profiles: restart only this node's half of the active revision; the other keeps "
+                        "serving (a switch to a new revision touches only the halves that changed by itself)")
     s = cmd("prepare", cmd_prepare, "check images/patches and stage a recipe without switching")
     s.add_argument("profile")
     s.add_argument("revision", nargs="?", default="latest")
@@ -1282,8 +1296,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_bench, cli_client, cli_qsfp, cli_remote, cli_setup
+    from . import cli_bench, cli_client, cli_metrics, cli_qsfp, cli_remote, cli_setup
     cli_bench.add_parsers(sub, cmd)
+    cli_metrics.add_parsers(sub, cmd)
     cli_client.add_parsers(sub, cmd)
     cli_setup.add_parsers(sub, cmd)
     cli_remote.add_parsers(sub, cmd)

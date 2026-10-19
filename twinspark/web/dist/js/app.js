@@ -69,10 +69,11 @@ async function api(method, path, body) {
 }
 /** Body for an activation: an id that makes a retried request harmless, and the deployment we decided on. */
 /** Requests still running when a switch starts: ask what to do with them. null = do not switch. */
-async function drainChoice() {
+async function drainChoice(aliases = null) {
   let st;
   try { st = await GET("/api/v1/status"); } catch (e) { return {}; }
-  const routes = (st.routes || []).filter(r => r.inflight > 0);
+  // restarting one half of a split: only that half's requests are in the way
+  const routes = (st.routes || []).filter(r => r.inflight > 0 && (!aliases || aliases.includes(r.alias)));
   const busy = routes.reduce((n, r) => n + r.inflight, 0);
   if (!busy) return {};
   const longest = Math.max(...routes.map(r => r.oldest_inflight_s || 0));
@@ -507,9 +508,31 @@ async function viewDashboard() {
     },
     stop: async (el) => { if (await stopFlow(el)) draw().catch(() => { }); },
     cancel: async (el) => { const r = await POST(`/api/v1/jobs/${enc(el.dataset.id)}/cancel`); toast(r.note); },
+    "half-restart": async (el) => {
+      const node = el.dataset.node, aliases = (el.dataset.aliases || "").split(",").filter(Boolean);
+      if (!await confirmBox(`Restart node ${node}'s model?`, `Only this half is drained, stopped and started again: ${esc(aliases.join(", "))} answers 503 meanwhile. The other half keeps serving and its running requests are not touched.`, { label: "Restart this half" })) return;
+      const drain = await drainChoice(aliases); if (drain === null) return;
+      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(el.dataset.profile)}/activate${qs({ revision: el.dataset.revision })}`, activationBody({ ...drain, nodes: [node] })));
+      toast(`restarting node ${node}'s half`); go("#/jobs/" + enc(job.job_id));
+    },
   });
   await draw();
   poll(draw, 5000);
+}
+/** a split deployment: each half on its own — what runs, since when, how it is doing, and a restart */
+function halvesHtml(st) {
+  const act = st.active, halves = st.halves || [];
+  if (!act || !halves.length) return "";
+  const cls = { serving: "good", starting: "info", switching: "warn", unhealthy: "bad", down: "bad" };
+  return `<div class="grid cols-2" style="margin-top:14px">${halves.map(h => {
+    const m = h.metrics || {};
+    return `<div class="card" data-key="half:${esc(h.node)}"><div class="card-head"><h2>Node ${esc(h.node)} · ${h.aliases.map(a => tag(a, "info")).join(" ")}</h2>${tag(h.state, cls[h.state] || "muted")}</div>
+      <div class="model mono small">${esc(h.model)}@${esc(sha(h.model_revision, 12))}</div>
+      <p class="small muted">started by ${esc(h.label || h.revision_id)}${h.revision_id !== act.revision_id ? " (kept across later revisions)" : ""} · ${esc(ago(h.since))}</p>
+      ${h.reason ? `<p class="small err">${esc(h.reason)}</p>` : ""}
+      ${m.ok ? `<div class="kv small"><b>Decode</b><span>${num(m.decode_tok_s, 1)} tok/s</span><b>KV cache</b><span>${num(m.kv_cache_usage_pct, 1)} %</span><b>Running / waiting</b><span>${num(m["requests-running"])} / ${num(m["requests-waiting"])}</span></div>` : ""}
+      <div class="row end"><button class="btn sm" data-act="half-restart" data-node="${esc(h.node)}" data-aliases="${esc(h.aliases.join(","))}" data-profile="${esc(act.profile)}" data-revision="${esc(act.revision_id)}" ${st.busy ? "disabled" : ""}>${h.state === "down" ? "Start this half" : "Restart this half"}</button></div></div>`;
+  }).join("")}</div>`;
 }
 /** Drain and stop the active model (dashboard, profile list and profile page share this). */
 async function stopFlow(el) {
@@ -557,13 +580,13 @@ function dashboardHtml(st, series, profs, job) {
         ${tile("Prefill", m.prefill_tok_s, "tok/s", series.prefill_tok_s, "#9d7bff", 0)}
         ${tile("Running / waiting", m.ok ? `${num(m["requests-running"])} / ${num(m["requests-waiting"])}` : null, "", series["requests-running"], "#4ade80")}
         ${tile("KV cache used", m.kv_cache_usage_pct, "%", series.kv_cache_usage_pct, "#fbbf24", 1)}
-        ${tile("TTFT (avg)", m.avg_ttft_ms, "ms", null)}
-        ${tile("Inter-token (avg)", m.avg_itl_ms, "ms", null)}
+        ${m.ttft_p95_ms != null ? tile("TTFT p95 (last interval)", m.ttft_p95_ms, "ms", series.ttft_p95_ms) : tile("TTFT (avg)", m.avg_ttft_ms, "ms", null)}
+        ${m.itl_p95_ms != null ? tile("Inter-token p95 (last interval)", m.itl_p95_ms, "ms", null, "", 1) : tile("Inter-token (avg)", m.avg_itl_ms, "ms", null)}
         ${m.spec_mean_accept_len ? tile("Spec. acceptance", m.spec_accept_len_now ?? m.spec_mean_accept_len, "tok/step", null) : ""}
         ${m.prefix_hit_rate_pct != null ? tile("Prefix-cache hits", m.prefix_hit_rate_pct, "%", null) : ""}
       </div>
       ${m.ok === false || !st.metrics ? `<p class="small muted" style="margin:10px 0 0">Serving metrics appear after the first scrape (every ${esc(10)} s).</p>` : ""}
-    </div>`;
+    </div>${halvesHtml(st)}`;
   } else {
     html += `<div class="card"><div class="empty"><b>Nothing is serving</b>${pinned.length ? "Pick a profile above and switch." : "Import a recipe from the Cookbook, pin it, then switch."}</div>
       <div class="row" style="justify-content:center">${pinned.length ? "" : `<a class="btn primary" href="#/cookbook">Open the cookbook</a>`}</div></div>`;
@@ -651,14 +674,30 @@ async function viewSystem() {
   const draw = async () => {
     if (loading) return; loading = true;
     try {
-      const [data, status] = await Promise.all([GET("/api/v1/system/telemetry"), GET("/api/v1/status")]);
+      const [data, status, hist] = await Promise.all([GET("/api/v1/system/telemetry"), GET("/api/v1/status"),
+        GET("/api/v1/system/metrics/history?hours=24").catch(() => null)]);
       if (!current(g)) return;
       const names = [...new Set([...Object.keys(status.nodes || {}), ...Object.keys(data.nodes)])].sort();
-      $("#system-content").innerHTML = `<p class="small muted">Sampled every ${num(data.interval_s)} s · recent history stays in memory · — means unavailable, not zero.</p>` + (names.length ? `<div class="grid cols-2">${names.map(n => systemNode(n, data.nodes[n] || {}, data.history[n] || [], data.interval_s)).join("")}</div>` : empty("No nodes connected", "Configure node A and B to see their system readings."));
+      $("#system-content").innerHTML = `<p class="small muted">Sampled every ${num(data.interval_s)} s · recent history stays in memory · — means unavailable, not zero.</p>` + (names.length ? `<div class="grid cols-2">${names.map(n => systemNode(n, data.nodes[n] || {}, data.history[n] || [], data.interval_s)).join("")}</div>` : empty("No nodes connected", "Configure node A and B to see their system readings.")) + historyCard(hist, names);
     } catch (e) { if (current(g)) $("#system-content").innerHTML = `<div class="callout warn">${esc(e.message)} · Retrying automatically.</div>`; }
     finally { loading = false; }
   };
   await draw(); every(draw, 5000);
+}
+/** the last 24 hours as minute averages (kept on node A across restarts); Prometheus keeps more (docs/metrics.md) */
+function historyCard(h, nodes) {
+  if (!h || !(h.ts || []).length) return "";
+  const last = (k) => { const v = (h[k] || []).filter(x => x != null); return v.length ? v[v.length - 1] : null; };
+  const peak = (k) => { const v = (h[k] || []).filter(x => x != null); return v.length ? Math.max(...v) : null; };
+  const low = (k) => { const v = (h[k] || []).filter(x => x != null); return v.length ? Math.min(...v) : null; };
+  const hours = Math.max(1, Math.round((h.ts[h.ts.length - 1] - h.ts[0]) / 3600));
+  const tiles = [
+    tile("Decode (peak " + num(peak("decode_tok_s")) + ")", last("decode_tok_s"), "tok/s", h.decode_tok_s, "#6aa7ff", 1),
+    tile("KV cache (peak " + num(peak("kv_cache_usage_pct"), 1) + " %)", last("kv_cache_usage_pct"), "%", h.kv_cache_usage_pct, "#fbbf24", 1),
+    tile("TTFT p95", last("ttft_p95_ms"), "ms", h.ttft_p95_ms, "#9d7bff"),
+    ...nodes.map(n => tile(`Node ${n} MemAvailable (low ${gib(low(n + ".mem_available_gib"))})`, last(n + ".mem_available_gib"), "GiB", h[n + ".mem_available_gib"], "#4ade80", 1)),
+  ];
+  return `<div class="card" style="margin-top:14px"><div class="card-head"><h2>Last ${esc(hours)} h</h2><span class="small muted">minute averages, kept on node A across restarts · longer history: Prometheus (/metrics)</span></div><div class="tiles">${tiles.join("")}</div></div>`;
 }
 function maintenanceProgress(s) {
   if (s.state === "idle") return empty("No maintenance running", "Check the nodes to review available package updates and their permissions.");

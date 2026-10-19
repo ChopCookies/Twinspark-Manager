@@ -218,6 +218,8 @@ tsm job <id> --log FILE        # print one of those saved startup logs
 tsm headless status            # desktop, boot target and how you can reach each node remotely
 tsm headless headless-max      # stop the desktop session now, free its memory (asks first; -y skips)
 tsm bench run max-throughput   # peak tokens/s and the knee, through the gateway (docs/benchmarks.md)
+sudo tsm prometheus key        # read-only scrape key for /metrics (docs/metrics.md)
+tsm activate duo --half B      # split profiles: restart only node B's model; A keeps serving
 tsm link --mode rdma           # QSFP / NCCL link test (both nodes must be live, not dry-run)
 tsm rdma --apply               # write discovered RoCE devices into controller.yaml
 tsm qsfp status                # QSFP link on THIS node: both twins, addresses, MTU, RoCE (docs/qsfp-link.md)
@@ -313,6 +315,7 @@ before). Update the client with `pipx upgrade twinspark-manager` (a git install:
 - [The QSFP link: both interfaces, addresses, MTU, verification](docs/qsfp-link.md)
 - [Validation records and the hardware matrix](docs/validation.md)
 - [Benchmarks: throughput, latency targets, context and quality, compared per revision](docs/benchmarks.md)
+- [Metrics: Prometheus export, Grafana dashboard, 24-hour history](docs/metrics.md)
 - [Development, testing and the demo harness](docs/development.md)
 - [Security model and known limits](docs/security.md) · [Reporting a vulnerability](SECURITY.md)
 - [Changelog](CHANGELOG.md)

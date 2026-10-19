@@ -39,10 +39,14 @@ jobs:
         # no hardware: dry-run agents, loopback servers, fake host tools; browser tests skip without Chromium
         run: |
           set -o pipefail
-          PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rs --junitxml=pytest.xml 2>&1 | tee pytest.log
+          # -v and unbuffered: if the run ends abruptly, the end of the log names the test that was running
+          PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -v -p no:cacheprovider -rs \
+            --junitxml=pytest.xml 2>&1 | tee pytest.log
       - name: Failures as annotations
         if: failure()
-        run: python scripts/ci_annotate.py pytest.xml pytest.log
+        run: |
+          pip freeze > pip-freeze.txt
+          python scripts/ci_annotate.py pytest.xml pytest.log pip-freeze.txt
 
   web:
     name: GUI tests
