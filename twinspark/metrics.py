@@ -3,7 +3,8 @@
 vLLM exposes Prometheus text where every sample carries labels
 (``vllm:num_requests_running{engine="0",model_name="x"} 2``). Samples are summed
 across label sets (engines / ranks), histogram ``_bucket`` series are skipped,
-and both the v0 and v1 metric names are understood.
+and both the v0 and v1 metric names are understood, as are SGLang's (``sglang:*``, with
+``--enable-metrics``).
 
 ``MetricsSampler`` keeps a short history so the dashboard can show *rates*:
 decode tok/s, prefill tok/s, requests/s, speculative-decoding acceptance.
@@ -52,6 +53,12 @@ _METRICS = {
     "spec_decode_num_drafts_total": "spec-drafts-total",
     "spec_decode_num_draft_tokens_total": "spec-draft-tokens-total",
     "spec_decode_num_accepted_tokens_total": "spec-accepted-tokens-total",
+    # SGLang
+    "num_running_reqs": "requests-running",
+    "num_queue_reqs": "requests-waiting",
+    "token_usage": "kv-cache-usage",
+    "cache_hit_rate": "prefix-hit-rate",
+    "num_requests_total": "requests-total",
 }
 _SAMPLE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-+0-9.eEinfINFNa]+)(\s+\d+)?\s*$")
 _LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
@@ -89,6 +96,12 @@ EXPORT: dict[str, tuple[str, str, str]] = {
                                    "Time a request waited before the engine took it"),
     "request_prefill_time_seconds": ("twinspark:request_prefill_time_seconds", "histogram", "Prefill time"),
     "request_decode_time_seconds": ("twinspark:request_decode_time_seconds", "histogram", "Decode time"),
+    # SGLang's names for the same things
+    "num_running_reqs": ("twinspark:requests_running", "gauge", "Requests the engine is processing"),
+    "num_queue_reqs": ("twinspark:requests_waiting", "gauge", "Requests waiting for the engine"),
+    "token_usage": ("twinspark:kv_cache_usage_ratio", "gauge", "Share of the KV cache in use (0-1)"),
+    "cache_hit_rate": ("twinspark:prefix_cache_hit_ratio", "gauge", "Prefix cache hit rate (SGLang, 0-1)"),
+    "num_requests_total": ("twinspark:requests_finished_total", "counter", "Requests finished, by reason"),
 }
 _HIST_PARTS = ("_bucket", "_sum", "_count")
 # windowed percentiles the dashboard and the history show: key prefix -> TwinSpark histogram
@@ -97,13 +110,13 @@ WINDOWED = {"ttft": "twinspark:time_to_first_token_seconds", "itl": "twinspark:i
 
 
 def _suffix(name: str) -> str:
-    for pre in ("vllm:", "vllm_"):
+    for pre in ("vllm:", "vllm_", "sglang:", "sglang_"):
         if name.startswith(pre):
             return name[len(pre):]
     return name
 
 
-_AVERAGED = {"kv-cache-usage"}      # fractions reported once per engine/rank
+_AVERAGED = {"kv-cache-usage", "prefix-hit-rate"}      # fractions reported once per engine/rank
 
 
 def _parse_text(text: str) -> dict[str, float]:
@@ -241,6 +254,8 @@ def derive(values: dict[str, float]) -> dict[str, Optional[float]]:
         out[key] = round(sv / cv * 1000, 1) if sv is not None and cv else None
     hits, q = values.get("prefix-hits-total"), values.get("prefix-queries-total")
     out["prefix_hit_rate_pct"] = round(100 * hits / q, 1) if hits is not None and q else None
+    if out["prefix_hit_rate_pct"] is None and values.get("prefix-hit-rate") is not None:
+        out["prefix_hit_rate_pct"] = round(100 * values["prefix-hit-rate"], 1)      # SGLang reports the ratio
     drafts = values.get("spec-drafts-total")
     acc = values.get("spec-accepted-tokens-total")
     dtok = values.get("spec-draft-tokens-total")

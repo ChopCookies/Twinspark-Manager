@@ -170,6 +170,9 @@ class RuntimeSettings(BaseModel):
     # model keeps serving), wait for them (up to drain_wait_max_s), or force (end them)
     drain_policy: Literal["abort", "wait", "force"] = "abort"
     drain_wait_max_s: int = Field(default=3600, ge=1)
+    # before the old model is stopped, ask the pinned image whether it knows the profile's flags, parsers,
+    # speculative method and architecture (agent.probe): enforce = refuse the switch, warn = note it, off
+    image_check: Literal["enforce", "warn", "off"] = "enforce"
     max_download_gib: Optional[float] = Field(default=None, gt=0)
     min_disk_free_gib: float = Field(default=2.0, ge=0)
     allow_image_pull: bool = True
@@ -221,6 +224,61 @@ class WatchdogSettings(BaseModel):
     max_recoveries_per_hour: int = Field(default=3, ge=0)
 
 
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,62}$")
+
+
+class FallbackTarget(BaseModel):
+    """Where an alias's requests go while it is switching or down: another alias of this gateway, or an
+    external OpenAI-compatible endpoint (its key in the vault slot ``fallback_api_key``)."""
+    model_config = ConfigDict(extra="forbid")
+
+    alias: Optional[str] = None
+    url: Optional[str] = None              # ``https://host/v1``
+    model: Optional[str] = Field(None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> "FallbackTarget":
+        if bool(self.alias) == bool(self.url):
+            raise ValueError("a fallback is either another alias or an external url")
+        if self.alias and not _ALIAS_RE.match(self.alias):
+            raise ValueError("fallback alias: letters, digits and . _ : - (up to 63)")
+        if self.url:
+            parts = urlsplit(self.url)
+            if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password \
+                    or parts.query or parts.fragment or any(ord(c) < 33 for c in self.url) or len(self.url) > 2048:
+                raise ValueError("fallback url: http(s)://host[:port]/path without credentials, query or fragment")
+            if not self.model:
+                raise ValueError("an external fallback needs the model name to ask it for")
+        return self
+
+
+class GatewaySettings(BaseModel):
+    """How the gateway picks a backend (master plan §3.3). Editable at runtime (GUI, `tsm gateway set`)."""
+    model_config = ConfigDict(extra="forbid")
+
+    affinity: bool = True                  # replicated: a session (session-id / prompt_cache_key) stays on a node
+    balance: Literal["least-inflight", "round-robin"] = "least-inflight"
+    weights: dict[Literal["A", "B"], float] = Field(default_factory=dict)   # replicated: share per node
+    fallbacks: dict[str, FallbackTarget] = Field(default_factory=dict, max_length=32)
+
+    @field_validator("weights")
+    @classmethod
+    def _weights(cls, v: dict) -> dict:
+        for node, w in v.items():
+            if not (0 <= w <= 100) or w != w:
+                raise ValueError(f"weight of node {node} must be between 0 and 100")
+        return v
+
+    @model_validator(mode="after")
+    def _no_loops(self) -> "GatewaySettings":
+        for alias, fb in self.fallbacks.items():
+            if not _ALIAS_RE.match(alias):
+                raise ValueError(f"invalid alias {alias!r}")
+            if fb.alias == alias:
+                raise ValueError(f"{alias} cannot fall back to itself")
+        return self
+
+
 class ControllerConfig(BaseModel):
     node: "NodeIdentity"
     db_path: str = "/var/lib/twinspark/state.db"
@@ -236,6 +294,7 @@ class ControllerConfig(BaseModel):
     startup_wait_s: int = Field(default=180, ge=0, le=1800)
     auto_rollback: bool = True              # restart previous known-good on failure
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
+    gateway: GatewaySettings = Field(default_factory=GatewaySettings)
     metrics_interval_s: float = Field(default=10.0, gt=0)
     # which node downloads from the Hub when no node has the weights yet
     download_node: Literal["A", "B"] = "A"

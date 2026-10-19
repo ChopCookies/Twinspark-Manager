@@ -1296,8 +1296,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_bench, cli_client, cli_metrics, cli_qsfp, cli_remote, cli_setup
+    from . import cli_bench, cli_client, cli_gateway, cli_metrics, cli_qsfp, cli_remote, cli_setup
     cli_bench.add_parsers(sub, cmd)
+    cli_gateway.add_parsers(sub, cmd)
     cli_metrics.add_parsers(sub, cmd)
     cli_client.add_parsers(sub, cmd)
     cli_setup.add_parsers(sub, cmd)

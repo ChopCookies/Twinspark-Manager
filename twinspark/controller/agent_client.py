@@ -11,7 +11,7 @@ import httpx
 ALLOWED_AGENT_ACTIONS = {
     "system_telemetry", "maintenance_probe", "maintenance_quiet", "maintenance_start",
     "maintenance_status", "maintenance_reboot", "maintenance_verify",
-    "hardware_facts", "memory_telemetry", "preflight", "image_ensure", "image_inspect",
+    "hardware_facts", "memory_telemetry", "preflight", "image_ensure", "image_inspect", "image_probe",
     "container_start", "containers_stop_owned", "container_state", "container_logs", "container_evidence",
     "containers_list", "health_probe", "foreign_list", "foreign_stop",
     "weights_present", "weights_inventory", "weights_delete", "download", "verify", "sync",

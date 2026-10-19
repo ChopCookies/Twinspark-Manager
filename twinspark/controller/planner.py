@@ -71,6 +71,8 @@ class ModelSpec:
     # config.json's num_hidden_layers; ``layers`` carries the same number for the KV formula. Kept as
     # its own field so specs registered before 0.6 (which lack it) still load.
     num_hidden_layers: int = 0
+    # config.json's "architectures" (e.g. ["Qwen3MoeForCausalLM"]): checked against what the image can serve
+    architectures: tuple = ()
 
     def __post_init__(self) -> None:
         if not self.num_hidden_layers:
@@ -887,4 +889,5 @@ def make_spec_from_hf(config: dict, weight_bytes: Optional[int] = None) -> Model
         kv_lora_rank=_cfg_int(cfg, "kv_lora_rank"),
         qk_rope_head_dim=_cfg_int(cfg, "qk_rope_head_dim"),
         hidden_size=hidden, num_hidden_layers=layers,
+        architectures=tuple(str(a)[:120] for a in (config.get("architectures") or [])[:8] if isinstance(a, str)),
     )

@@ -96,6 +96,7 @@ class AgentActions:
             "preflight": self.preflight,
             "image_ensure": self.image_ensure,
             "image_inspect": self.image_inspect,
+            "image_probe": self.image_probe,
             "container_start": self.container_start,
             "containers_stop_owned": self.containers_stop_owned,
             "container_state": self.container_state,
@@ -297,6 +298,23 @@ class AgentActions:
         self.runtime.pull(ref)
         return {"present": True, "pulled": True}
 
+    async def image_probe(self, params: dict) -> dict:
+        """What the pinned image's engine knows (flags, parsers, speculative methods, architectures): the
+        fixed script of agent.probe runs inside it. Never a command from the caller."""
+        from . import probe
+        ref, engine = str(params.get("image_ref", "")), str(params.get("engine", "vllm"))
+        if not immutable_image_ref(ref):
+            raise ActionError("image_ref must be pinned by digest")
+        if engine not in probe.SCRIPTS:
+            raise ActionError(f"unknown engine {engine!r}")
+        try:
+            output = await asyncio.to_thread(self.runtime.probe, ref, probe.SCRIPTS[engine])
+        except Exception as exc:  # noqa: BLE001 - a probe that cannot run is an answer, not a failure
+            return {"error": str(exc)[:300]}
+        if '"simulated": true' in output:
+            return {"simulated": True}
+        return probe.parse(output)
+
     def image_inspect(self, params: dict) -> dict:
         ref = str(params.get("ref", ""))
         if not _IMAGE_REF_RE.match(ref):
@@ -492,8 +510,9 @@ class AgentActions:
         if self.dry_run:
             return {"status": st.status, "healthy": True, "exited": False}
         try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                r = await c.get(f"{url}/health")
+            key = self.vault.get("backend_api_key")
+            async with httpx.AsyncClient(timeout=5) as c:      # vLLM's /health is open; some engines want the key
+                r = await c.get(f"{url}/health", headers={"authorization": f"Bearer {key}"} if key else None)
             return {"status": st.status, "healthy": r.status_code == 200, "exited": False}
         except httpx.HTTPError:
             return {"status": st.status, "healthy": False, "exited": False}

@@ -184,9 +184,14 @@ def hf_cache_candidates(home: Optional[str] = None, env: Optional[dict[str, str]
             continue
         seen.add(p)
         hub = Path(p) / "hub"
-        models = [d.name for d in hub.glob("models--*")] if hub.is_dir() else []
-        out.append({"path": p, "exists": Path(p).is_dir(), "models": len(models),
-                    "writable": os.access(p, os.W_OK) if Path(p).exists() else None})
+        try:
+            models = [d.name for d in hub.glob("models--*")] if hub.is_dir() else []
+            exists = Path(p).is_dir()
+        except OSError:              # a home this user may not read (e.g. the service user's): not usable here
+            out.append({"path": p, "exists": None, "models": 0, "writable": False, "readable": False})
+            continue
+        out.append({"path": p, "exists": exists, "models": len(models),
+                    "writable": os.access(p, os.W_OK) if exists or Path(p).exists() else None})
     return out
 
 

@@ -137,3 +137,13 @@ test("the System page shows the last day from node A's history", () => {
   assert.match(html, /Node A MemAvailable \(low 40.5 GiB\)/);
   assert.equal(p.run("historyCard({ ts: [] }, [])"), "");
 });
+
+test("the dashboard says how requests are routed and what answers while switching", () => {
+  const p = page();
+  const html = p.run(`routingHtml({ balance: "least-inflight", affinity: true, weights: { A: 2 }, fallbacks: { default: { alias: "coder" }, chat: { url: "https://x.example/v1", model: "<m>" } } })`);
+  assert.match(html, /least-inflight · node A × 2 · session affinity on/);
+  assert.match(html, /alias <span class="mono">coder<\/span>/);
+  assert.match(html, /\(&lt;m&gt;\)/);
+  assert.match(html, /data-act="routing"/);
+  assert.equal(p.run("routingHtml(undefined)"), "");
+});

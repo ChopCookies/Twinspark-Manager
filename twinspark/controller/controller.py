@@ -25,7 +25,7 @@ from ..metrics import (
     scrape_metrics,
     windowed,
 )
-from ..schemas.config import ControllerConfig
+from ..schemas.config import ControllerConfig, GatewaySettings
 from ..schemas.enums import JobState
 from ..schemas.job import AuditEntry, Job
 from ..schemas.profile import _NAME_RE, ImmutableIdentity, Profile, ProfileDraft, ProfileRevision, _now
@@ -110,7 +110,40 @@ class Controller:
         self.maintenance = Maintenance(self)
         self.remote = RemoteService(self)
         self.watch_state: dict[str, Any] = {"unhealthy_streak": 0, "recoveries": [], "last": None}
+        self._apply_gateway_settings()
         self._audit("system", "controller.init", "controller", {})
+
+    # ---- gateway routing settings (master plan §3.3) ------------------------------
+    def gateway_settings(self) -> GatewaySettings:
+        """controller.yaml's ``gateway:`` unless changed at runtime (GUI, `tsm gateway set`)."""
+        saved = self.store.kv_get("gateway_settings")
+        if saved:
+            try:
+                return GatewaySettings.model_validate(saved)
+            except ValueError:
+                log.warning("stored gateway settings are invalid; using controller.yaml's")
+        return self.config.gateway
+
+    def set_gateway_settings(self, settings: GatewaySettings) -> GatewaySettings:
+        self.store.kv_set("gateway_settings", settings.model_dump(mode="json"))
+        self._apply_gateway_settings()
+        self._audit("user", "gateway.settings", "gateway", settings.model_dump(mode="json"))
+        return settings
+
+    def set_fallback_key(self, key: str) -> None:
+        from ..security import SecretsVault
+        SecretsVault(self.config.secrets_dir).set("fallback_api_key", key)
+        self._apply_gateway_settings()
+        self._audit("user", "gateway.fallback_key", "gateway", {"set": bool(key)})
+
+    def _apply_gateway_settings(self) -> None:
+        key = ""
+        try:
+            from ..security import SecretsVault
+            key = SecretsVault(self.config.secrets_dir).get("fallback_api_key")
+        except Exception:  # noqa: BLE001 - an unreadable vault only means no key for the external fallback
+            log.debug("fallback key not readable", exc_info=True)
+        self.gateway.configure(self.gateway_settings().model_dump(mode="json"), fallback_api_key=key)
 
     # ---- audit ---------------------------------------------------------------
     def _audit(self, actor: str, action: str, resource: str, detail: dict) -> None:
@@ -469,6 +502,7 @@ class Controller:
             "maintenance": self.maintenance.state(),
             "routes": [st.to_payload() for st in self.gateway.routes.values()],
             "halves": self.halves_status(),
+            "gateway": {k: self.gateway.settings.get(k) for k in ("balance", "affinity", "weights", "fallbacks")},
             # what the running switch touches: a client measuring another half's alias is not disturbed
             "switch": None if not (self.busy() and self.current_job) else {
                 "job": self.current_job, "nodes": (self.current_scope or {}).get("nodes"),
@@ -1045,7 +1079,7 @@ class Controller:
             served_by = started.get(next((node_of[b] for b in backends if b in node_of), ""), rev.revision_id)
             self.gateway.set_route(alias, backends, model, served_by,
                                    max_model_len=(observed.get("models") or {}).get(model, {}).get(
-                                       "max_model_len", observed.get("max_model_len")))
+                                       "max_model_len", observed.get("max_model_len")), nodes=node_of)
         self._audit("controller", "deployment.adopt", f"profile/{rev.profile_name}",
                     {"halves_missing": sorted(bad)} if bad else {})
         return True

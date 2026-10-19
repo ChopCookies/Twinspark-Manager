@@ -238,7 +238,17 @@ class LaunchPlanner:
             raise LaunchError("tool calling is enabled but no tool_call_parser is set")
 
         served = rev.profile_name
-        base_args = self._vllm_args(rev, served, gpu_memory_utilization, notes)
+        sglang = rev.draft.engine == "sglang"
+        if sglang:
+            # master plan §3.1: the second engine. Its own launcher handles two nodes; mods patch vLLM only.
+            if adv.mods:
+                raise LaunchError("mods patch vLLM: a profile served by SGLang cannot use them")
+            if multi and backend == DistributedBackend.RAY:
+                raise LaunchError("SGLang starts both nodes with its own launcher: use the native backend, not Ray")
+            base_args = self._sglang_args(rev, served, gpu_memory_utilization, notes)
+            notes.append("engine: SGLang (python3 -m sglang.launch_server); experimental in TwinSpark")
+        else:
+            base_args = self._vllm_args(rev, served, gpu_memory_utilization, notes)
         short = rev.revision_id.rsplit("-", 1)[-1]
         labels = {
             OWNER_LABEL: "true",
@@ -272,6 +282,9 @@ class LaunchPlanner:
         def make(node: str, role: str, name: str, argv: list[str], health: Optional[str],
                  rdma: bool) -> ContainerSpec:
             command = mods_wrapper(adv.mods, argv) if adv.mods else argv
+            if sglang and health and backend_api_key_set:
+                # the agent injects the backend key only as VLLM_API_KEY; SGLang takes it as a flag
+                command = ["bash", "-c", "exec " + shlex.join(argv) + ' --api-key "$VLLM_API_KEY"']
             return ContainerSpec(
                 node=node, role=role, name=name, image_ref=rev.identity.image_ref,
                 labels={**labels, "org.twinspark.role": role},
@@ -287,8 +300,8 @@ class LaunchPlanner:
             nodes = ["A", "B"] if topo == Topology.REPLICATED else rev.required_nodes()
             for n in nodes:
                 name = f"tsm-{rev.profile_name}-{n.lower()}-{short}"
-                containers.append(make(n, "single", name,
-                                       serve_args(n) + ["--tensor-parallel-size", "1"],
+                one = ["--tp-size", "1"] if sglang else ["--tensor-parallel-size", "1"]
+                containers.append(make(n, "single", name, serve_args(n) + one,
                                        f"http://{api_host(n)}:{rt.vllm_port}", rdma=False))
             order.append([c.name for c in containers])
             delays.append(0.0)
@@ -306,7 +319,16 @@ class LaunchPlanner:
             worker_name = f"tsm-{rev.profile_name}-b-{short}"
             head_url = f"http://{api_host('A')}:{rt.vllm_port}"
 
-            if backend == DistributedBackend.NATIVE:
+            if sglang:
+                par = ["--tp-size", str(tp), "--pp-size", str(pp)]
+                if topo == Topology.TP_EP:
+                    par += ["--ep-size", "2"]
+                dist = ["--nnodes", "2", "--dist-init-addr", f"{a_ip}:{rt.master_port}"]
+                head_cmd = serve_args("A") + par + dist + ["--node-rank", "0"]
+                worker_cmd = base_args + par + dist + ["--node-rank", "1"]      # rank 1 serves no HTTP API
+                order += [[worker_name], [head_name]]
+                delays += [max(2.0, adv.head_start_delay_s), 0.0]
+            elif backend == DistributedBackend.NATIVE:
                 dist = ["--distributed-executor-backend", "mp", "--nnodes", "2",
                         "--master-addr", a_ip, "--master-port", str(rt.master_port)]
                 head_cmd = serve_args("A") + par + dist + ["--node-rank", "0"]
@@ -425,6 +447,75 @@ class LaunchPlanner:
         if name in a.extra_vllm_flags:
             return True
         return any(t.startswith("-") and flag_base(t) == name for t in a.extra_vllm_args)
+
+    # vLLM's speculative "method" -> SGLang's --speculative-algorithm
+    _SGLANG_SPEC = {"eagle": "EAGLE", "eagle3": "EAGLE3", "mtp": "NEXTN", "deepseek_mtp": "NEXTN",
+                    "qwen3_next_mtp": "NEXTN", "glm4_moe_mtp": "NEXTN", "ernie_mtp": "NEXTN", "nextn": "NEXTN",
+                    "ngram": "NGRAM"}
+
+    def _sglang_args(self, rev: ProfileRevision, served: str, util: float, notes: list[str]) -> list[str]:
+        """The same profile settings as SGLang's flags. What SGLang has no equivalent for is named in the plan
+        notes instead of being dropped silently."""
+        s, b, a, ident = rev.draft.simple, rev.draft.behaviour, rev.draft.advanced, rev.identity
+        raw_bases = {flag_base(t) for t in a.extra_vllm_args if t.startswith("-")}
+        argv = ["python3", "-m", "sglang.launch_server", "--model-path", ident.model_repo,
+                "--revision", ident.model_revision, "--served-model-name", served, "--enable-metrics"]
+
+        def put(name: str, value: Any) -> None:
+            if value is None:
+                return
+            if name in raw_bases or name in a.extra_vllm_flags:
+                notes.append(f"--{name} comes from the raw recipe arguments; structured value ignored")
+                return
+            _flag(argv, name, value)
+
+        put("context-length", s.context_length if isinstance(s.context_length, int) else None)
+        _flag(argv, "mem-fraction-static", str(util))
+        if a.max_num_seqs or not a.max_num_seqs_vllm_default:
+            put("max-running-requests", a.max_num_seqs or s.concurrency)
+        put("chunked-prefill-size", a.max_num_batched_tokens)
+        put("dtype", a.dtype)
+        if a.kv_dtype and a.kv_dtype != "auto":
+            put("kv-cache-dtype", {"fp8": "fp8_e4m3"}.get(a.kv_dtype, a.kv_dtype))
+        put("page-size", a.block_size)
+        put("attention-backend", a.attention_backend)
+        put("load-format", a.weight_loader)
+        put("tokenizer-mode", a.tokenizer_mode)
+        if a.prefix_cache is False:
+            put("disable-radix-cache", True)
+        if a.eager_mode:
+            put("disable-cuda-graph", True)
+        if a.trust_remote_code:
+            put("trust-remote-code", True)
+        spec = a.speculative_config or {}
+        if spec:
+            method = str(spec.get("method") or "").lower()
+            algo = self._SGLANG_SPEC.get(method)
+            if algo is None:
+                raise LaunchError(f"speculative method {method or '?'!r} has no SGLang equivalent "
+                                  f"({', '.join(sorted(self._SGLANG_SPEC))})")
+            put("speculative-algorithm", algo)
+            if spec.get("model"):
+                put("speculative-draft-model-path", spec["model"])
+            n = spec.get("num_speculative_tokens")
+            if isinstance(n, int) and n > 0:
+                put("speculative-num-steps", n)
+                put("speculative-eagle-topk", 1)
+                put("speculative-num-draft-tokens", n + 1)
+        put("reasoning-parser", b.reasoning_parser)
+        if s.tool_calling:
+            put("tool-call-parser", b.tool_call_parser)
+        put("chat-template", b.chat_template)
+        for what, value in (("compilation_config", a.compilation_config),
+                            ("chat_template_kwargs", b.chat_template_kwargs),
+                            ("generation overrides", b.generation_overrides()),
+                            ("chunked_prefill", a.chunked_prefill)):
+            if value:
+                notes.append(f"{what} is not passed to SGLang (no equivalent flag)")
+        for name, value in a.extra_vllm_flags.items():
+            _flag(argv, name, value)
+        argv += list(a.extra_vllm_args)        # engine arguments, passed as written
+        return argv
 
     def _vllm_args(self, rev: ProfileRevision, served: str, util: float,
                    notes: list[str]) -> list[str]:

@@ -114,11 +114,11 @@ def startup_settings(draft: Any) -> dict[str, Any]:
     }
 
 
-def _identity_part(identity: Any) -> dict[str, Any]:
+def _identity_part(identity: Any, engine: str = "vllm") -> dict[str, Any]:
     if identity is None:
-        return {"model_revision": None, "image_digest": None, "engine": "vllm"}
+        return {"model_revision": None, "image_digest": None, "engine": engine}
     return {"model_revision": identity.model_revision, "image_digest": identity.image_digest,
-            "engine": "vllm", "vllm_version": getattr(identity, "vllm_version", None)}
+            "engine": engine, "vllm_version": getattr(identity, "vllm_version", None)}
 
 
 def _digest(prefix: str, doc: dict[str, Any]) -> str:
@@ -130,13 +130,15 @@ def kv_fingerprint(draft: Any, identity: Any, node: str) -> Optional[str]:
     """None for an unpinned draft: without a model commit and an image digest nothing can match."""
     if identity is None:
         return None
-    return _digest("kv", {**kv_settings(draft), **_identity_part(identity), "node": node})
+    engine = getattr(draft, "engine", "vllm")
+    return _digest("kv", {**kv_settings(draft), **_identity_part(identity, engine), "node": node})
 
 
 def startup_fingerprint(draft: Any, identity: Any, node: str) -> Optional[str]:
     if identity is None:
         return None
-    return _digest("st", {**startup_settings(draft), **_identity_part(identity), "node": node})
+    engine = getattr(draft, "engine", "vllm")
+    return _digest("st", {**startup_settings(draft), **_identity_part(identity, engine), "node": node})
 
 
 # ---- reading vLLM's boot log -------------------------------------------------------------------

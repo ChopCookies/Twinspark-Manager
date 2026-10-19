@@ -44,6 +44,10 @@ _PHASES = [
 ]
 _KV_TOKENS = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens", re.I)
 _MAX_CONC = re.compile(r"Maximum concurrency for\s*([\d,]+)\s*tokens per request:\s*([\d.]+)x", re.I)
+# SGLang: "KV Cache is allocated. #tokens: 123456, K size: 9.42 GB, V size: 9.42 GB" / "max_total_num_tokens=123456"
+_SGL_KV = re.compile(r"KV Cache is allocated\.\s*#tokens:\s*([\d,]+),\s*K size:\s*([\d.]+)\s*GB,"
+                     r"\s*V size:\s*([\d.]+)\s*GB")
+_SGL_TOKENS = re.compile(r"max_total_num_tokens=(\d+)")
 
 
 def phase_from_log(tail: str) -> Optional[str]:
@@ -67,6 +71,16 @@ def kv_facts_from_log(text: str) -> dict:
     pool = kv_memory_from_log(text)
     if pool is not None:
         out["kv_memory_gib"] = pool          # with the token count: the KV bytes per token as served
+    if "kv_cache_tokens" not in out:
+        found = _SGL_KV.findall(text or "")
+        if found:
+            tokens, k, v = found[-1]
+            out["kv_cache_tokens"] = int(tokens.replace(",", ""))
+            out["kv_memory_gib"] = round((float(k) + float(v)) * 1e9 / 1024 ** 3, 2)    # SGLang logs GB
+        else:
+            m = _SGL_TOKENS.findall(text or "")
+            if m:
+                out["kv_cache_tokens"] = int(m[-1])
     return out
 
 
@@ -386,6 +400,8 @@ class ActivationCoordinator:
             phase(job, key, kind="image", label=label, state="done" if pulled else "reused",
                   detail="pulled from the registry" if pulled else "already on the node")
         self.persist(job)
+        from .imagecheck import check_plan
+        warnings += await check_plan(self, job, rev, step)      # before anything is stopped
         if rev.identity.image_source == "local" and len(nodes) > 1 and not rev.draft.secondary:
             ids = {n: (await self.agent(n).call("image_inspect", ref=rev.identity.image_ref)).get("id")
                    for n in nodes}
@@ -667,11 +683,12 @@ class ActivationCoordinator:
         return "test completion ok (" + ", ".join(out) + ")"
 
     async def _route(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
+        node_of = {c.health_url: c.node for c in self.plan.containers if c.health_url}   # for per-node weights
         for alias, backends in self.plan.routes.items():
             model = self.plan.route_models.get(alias, self.plan.served_model_name)
             self.gateway.set_route(alias, backends, model, rev.revision_id,
                                    max_model_len=(job.payload.get("models") or {}).get(model, {}).get(
-                                       "max_model_len", job.payload.get("max_model_len")))
+                                       "max_model_len", job.payload.get("max_model_len")), nodes=node_of)
         # Aliases the previous deployment had but this one does not use: reopen them (so they do
         # not stay "switching" forever) and forget idle ones, so clients get a clean 404.
         stale = [a for a in self.drained if a not in self.plan.routes]

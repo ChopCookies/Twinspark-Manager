@@ -484,3 +484,19 @@ def test_modules_do_not_leave_the_sandbox(tmp_path):
         assert Layout().sandbox  # a host-native Windows path cannot be a live Linux install
     for p in (lay.etc, lay.secrets, lay.systemd, lay.state, lay.cache, lay.home, lay.run, lay.ssh_dir):
         assert str(p).startswith(str(tmp_path / "x"))
+
+
+def test_a_hugging_face_home_this_user_cannot_read_is_skipped_not_a_crash(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from twinspark import hostprobe
+    locked = tmp_path / "service-home"
+    real = Path.is_dir
+
+    def is_dir(self):
+        if str(self).startswith(str(locked)):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    (out,) = hostprobe.hf_cache_candidates(home=str(locked), env={})
+    assert out["exists"] is None and out["readable"] is False

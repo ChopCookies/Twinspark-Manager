@@ -508,6 +508,7 @@ async function viewDashboard() {
     },
     stop: async (el) => { if (await stopFlow(el)) draw().catch(() => { }); },
     cancel: async (el) => { const r = await POST(`/api/v1/jobs/${enc(el.dataset.id)}/cancel`); toast(r.note); },
+    routing: async () => { await routingFlow(); draw().catch(() => { }); },
     "half-restart": async (el) => {
       const node = el.dataset.node, aliases = (el.dataset.aliases || "").split(",").filter(Boolean);
       if (!await confirmBox(`Restart node ${node}'s model?`, `Only this half is drained, stopped and started again: ${esc(aliases.join(", "))} answers 503 meanwhile. The other half keeps serving and its running requests are not touched.`, { label: "Restart this half" })) return;
@@ -607,9 +608,41 @@ function dashboardHtml(st, series, profs, job) {
       <td>${esc(r.model || "—")}</td><td class="num">${num(r.inflight)}${r.oldest_inflight_s ? `<div class="sub">longest ${esc(Math.round(r.oldest_inflight_s))} s</div>` : ""}</td><td class="num">${num(r.requests)}</td>
       <td class="num">${num(r.errors)}${r.last_error ? `<div class="sub">${esc(r.last_error)}</div>` : ""}</td><td class="num">${num(r.max_model_len)}</td></tr>`).join("")}
     </tbody></table></div>` : empty("No routes", "The gateway returns 404 until a model is activated.");
-  html += `</div>`;
+  html += routingHtml(st.gateway) + `</div>`;
   if (st.staging && st.staging.length) html += `<div class="callout info">Staging weights in the background: ${st.staging.map(s => `<span class="mono">${esc(s)}</span>`).join(", ")} — <a href="#/jobs">jobs</a></div>`;
   return html + `</div>`;
+}
+/** how the gateway picks a backend and what answers while an alias switches (master plan §3.3) */
+function routingHtml(g) {
+  if (!g) return "";
+  const w = Object.entries(g.weights || {}).map(([n, v]) => `node ${n} × ${v}`).join(", ");
+  const fb = Object.entries(g.fallbacks || {}).map(([a, f]) => `${tag(a, "info")} → ${f.alias ? `alias <span class="mono">${esc(f.alias)}</span>` : `<span class="mono">${esc(f.url)}</span> (${esc(f.model)})`}`).join(" · ");
+  return `<div class="row between small" style="margin-top:10px"><span class="muted">Routing: ${esc(g.balance)}${w ? " · " + esc(w) : ""} · session affinity ${g.affinity ? "on" : "off"} · fallback while switching: ${fb || "none (503)"}</span><button class="btn sm" data-act="routing">Routing…</button></div>`;
+}
+async function routingFlow() {
+  const v = await GET("/api/v1/gateway"), s = v.settings;
+  const fbText = Object.entries(s.fallbacks || {}).map(([a, f]) => f.alias ? `${a}=alias:${f.alias}` : `${a}=url:${f.url},model:${f.model}`).join("\n");
+  const vals = await formBox("Gateway routing", [
+    { id: "balance", label: "Replicated models: which copy gets a request", type: "select", value: s.balance, options: [["least-inflight", "the one with fewer requests in flight"], ["round-robin", "in turn"]] },
+    { id: "wa", label: "Share of node A (weight)", value: String((s.weights || {}).A ?? 1) },
+    { id: "wb", label: "Share of node B (weight)", value: String((s.weights || {}).B ?? 1) },
+    { id: "affinity", label: "Keep a session on one copy (session-id header or prompt_cache_key): its prefix cache stays warm", type: "check", value: s.affinity },
+    { id: "fallbacks", label: "While an alias is switching or down, answer from (one per line)", type: "textarea", rows: 3, value: fbText, placeholder: "default=alias:secondary\ndefault=url:https://api.example.com/v1,model:small-model", help: "Responses from a fallback carry the header X-TwinSpark-Fallback. An external endpoint gets the key set with `tsm gateway fallback-key`, never the cluster's own keys." },
+  ], { label: "Save", wide: true, intro: `<p class="small muted">Applies to the next request; requests in flight keep their backend. Settings from ${esc(v.source)}.</p>`,
+    validate: (x) => {
+      const weight = (t, n) => { const f = Number(t); if (!isFinite(f) || f < 0 || f > 100) throw new Error(`weight of node ${n}: 0 to 100`); return f; };
+      const fallbacks = {};
+      for (const line of x.fallbacks.split("\n").map(l => l.trim()).filter(Boolean)) {
+        const m = line.match(/^([^=\s]+)=(alias:(\S+)|url:([^,\s]+),model:(\S+))$/);
+        if (!m) throw new Error(`"${line}": use ALIAS=alias:OTHER or ALIAS=url:URL,model:NAME`);
+        fallbacks[m[1]] = m[3] ? { alias: m[3] } : { url: m[4], model: m[5] };
+      }
+      x.body = { balance: x.balance, affinity: x.affinity, weights: { A: weight(x.wa, "A"), B: weight(x.wb, "B") }, fallbacks };
+      return true;
+    } });
+  if (!vals) return;
+  await PUT("/api/v1/gateway", vals.body);
+  toast("routing saved", "good");
 }
 function tile(k, v, unit, series, color, digits = 0) {
   return `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${v == null ? "—" : (typeof v === "number" ? num(v, digits) : esc(v))}${v != null && unit ? `<small>${esc(unit)}</small>` : ""}</div>${series ? spark(series, color) : ""}</div>`;
@@ -969,7 +1002,7 @@ async function profileOverview(name, p, d) {
   html += `<div class="grid cols-2"><div class="card"><h2>What gets served</h2><div class="kv">
     <b>Model</b><span class="mono">${esc(s.model)}${d.identity ? "@" + esc(sha(d.identity.model_revision, 12)) : ""}</span>
     <b>Image</b><span class="mono">${esc(d.identity ? d.identity.image + " @ " + sha(d.identity.image_digest, 12) + " (" + d.identity.image_source + ")" : (d.image_hint || "—"))}</span>
-    <b>Topology</b><span>${esc(s.topology)} · ${esc(d.distributed_backend)} · ${esc(s.quantization)}</span>
+    <b>Topology</b><span>${esc(s.topology)} · ${esc(d.distributed_backend)} · ${esc(s.quantization)}${d.engine === "sglang" ? " · SGLang" : ""}</span>
     <b>Context</b><span>${esc(s.context_length)} ${s.context_length === "auto" ? '<span class="muted">(vLLM picks the largest that fits)</span>' : "tokens"}</span>
     <b>Parallel seqs</b><span>${esc(a.max_num_seqs || s.concurrency)}</span>
     <b>Model names</b><span>${[s.api_alias, ...(s.extra_aliases || [])].map(x => tag(x, "info")).join(" ")}</span>
@@ -1090,6 +1123,7 @@ function profileSettings(name, p, d) {
       ${f("spec", "Speculative tokens", spec.num_speculative_tokens ?? "", spec.method ? `method ${spec.method}` : "no speculative config", "—")}
       ${f("aliases", "Extra model names", (s.extra_aliases || []).join(", "), `primary: ${s.api_alias}`)}
       ${f("temp", "Temperature", b.temperature ?? "", "", "model default")}
+      <label class="field"><span>Engine</span><select id="q-engine">${[["vllm", "vLLM"], ["sglang", "SGLang (experimental)"]].map(([v, l]) => `<option value="${v}" ${(d.engine || "vllm") === v ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">what the container serves with; the same settings become its flags. Before a switch the image is asked whether it knows them.</span></label>
     </div>
     <div class="row" style="margin-top:14px">
       <label class="check"><input type="checkbox" id="q-think" ${s.thinking ? "checked" : ""}/> thinking</label>
@@ -1160,6 +1194,7 @@ function profileActions(name, p, d) {
     x.behaviour.temperature = v("temp") ? parseFloat(v("temp")) : null;
     x.simple.thinking = $("#q-think").checked; x.simple.tool_calling = $("#q-tools").checked;
     x.advanced.eager_mode = $("#q-eager").checked; x.advanced.prefix_cache = $("#q-prefix").checked;
+    x.engine = $("#q-engine").value || "vllm";
     return x;
   };
   return {
