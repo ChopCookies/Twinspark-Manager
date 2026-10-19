@@ -118,7 +118,7 @@ class Controller:
         self.keys, self.usage = KeyStore(self.store), Usage(self.store)
         if self.keys.migrate(self.gateway.inference_api_key):
             self._audit("system", "keys.migrate", "keys/default", {"from": "inference_api_key"})
-        self.gateway.set_keys(self.keys.records())
+        self._publish_keys()
         # the recipe catalog (master plan §4.1), cached next to the state database
         from ..cookbook import make_catalog
         cb = config.cookbook
@@ -127,23 +127,26 @@ class Controller:
         self._audit("system", "controller.init", "controller", {})
 
     # ---- named keys and usage (master plan §4.1) ---------------------------------
+    def _publish_keys(self) -> None:
+        self.gateway.set_keys(self.keys.records(), managed=self.keys.managed())
+
     def create_key(self, name: str, *, aliases: Optional[list[str]] = None, expires_in_days: Optional[int] = None,
                    app: Optional[str] = None) -> tuple[str, dict]:
         token, rec = self.keys.create(name, aliases=aliases, expires_in_days=expires_in_days, app=app)
-        self.gateway.set_keys(self.keys.records())
+        self._publish_keys()
         self._audit("user", "keys.create", f"keys/{rec['id']}", {"name": rec["name"], "aliases": rec["aliases"],
                                                                "app": rec["app"], "expires_at": rec["expires_at"]})
         return token, rec
 
     def revoke_key(self, key_id: str) -> dict:
         rec = self.keys.revoke(key_id)
-        self.gateway.set_keys(self.keys.records())
+        self._publish_keys()
         self._audit("user", "keys.revoke", f"keys/{key_id}", {"name": rec["name"]})
         return rec
 
     def delete_key(self, key_id: str) -> None:
         self.keys.delete(key_id)
-        self.gateway.set_keys(self.keys.records())
+        self._publish_keys()
         self._audit("user", "keys.delete", f"keys/{key_id}", {})
 
     def flush_usage(self) -> None:
@@ -152,7 +155,7 @@ class Controller:
         if u["rows"]:
             self.usage.add(u["rows"])
         if u["last_used"] and self.keys.touch(u["last_used"]):
-            self.gateway.set_keys(self.keys.records())
+            self._publish_keys()
 
     # ---- gateway routing settings (master plan §3.3) ------------------------------
     def gateway_settings(self) -> GatewaySettings:

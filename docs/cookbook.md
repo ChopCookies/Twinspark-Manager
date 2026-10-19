@@ -51,9 +51,10 @@ Node A and the workstation client read it:
 - **When.** Nothing is fetched while nobody looks: opening the Cookbook refreshes a copy older than
   `cookbook.catalog_refresh_hours` (24 h) in the background; *Check for new recipes* or
   `tsm cookbook refresh` fetch it now and say what changed.
-- **What is checked.** Only https, at most 1 MiB for the index and 512 KiB for a recipe; a file is only used
-  when its SHA-256 matches the index — at download and every time the cached copy is read. A refresh that
-  fails leaves the previous copy in use, and nothing half-downloaded is ever read.
+- **What is checked.** Only https (redirects only within the same host), at most 1 MiB for the index and
+  512 KiB for a recipe; a file is only used when its SHA-256 matches the index — at download, and again
+  whenever a cached file changes. A refresh that fails leaves the previous copy in use, and nothing
+  half-downloaded is ever read. With `catalog_url` switched off or changed, the old copy is not used.
 - **What it changes.** The Cookbook marks recipes *new in catalog* or *updated in catalog*. A recipe that
   needs a newer TwinSpark (`min_twinspark`) is listed with that note and not offered. **Profiles you
   imported are never changed**: a newer version of their recipe shows under *Recipe updates* as an update to

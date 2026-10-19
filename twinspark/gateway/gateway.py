@@ -58,7 +58,8 @@ class RouteState:
     draining: bool = False
     down_reason: Optional[str] = None
     retry_after: int = 10
-    inflight: int = 0
+    inflight: int = 0              # requests this process carries
+    remote_inflight: int = 0       # what a standalone gateway process reports (state.GatewayLink.poll)
     requests: int = 0
     errors: int = 0
     last_error: Optional[str] = None
@@ -151,20 +152,31 @@ class RouteState:
             self._idle.set()
 
     def oldest_inflight_s(self) -> Optional[float]:
-        if not self._active:
-            return (self._remote or {}).get("oldest")
-        return round(time.monotonic() - min(self._active.values()), 1)
+        local = round(time.monotonic() - min(self._active.values()), 1) if self._active else None
+        found = [v for v in (local, (self._remote or {}).get("oldest")) if v is not None]
+        return max(found) if found else None
+
+    @property
+    def busy(self) -> int:
+        """Requests in flight on this alias: the gateway process's and this process's own (the playground)."""
+        return self.inflight + self.remote_inflight
 
     def to_payload(self) -> dict:
         return {"alias": self.alias, "status": self.status, "model": self.served_model,
-                "revision": self.revision_id, "inflight": self.inflight,
+                "revision": self.revision_id, "inflight": self.busy,
                 "oldest_inflight_s": self.oldest_inflight_s(),
                 "retry_after": self.retry_after, "requests": self.requests,
                 "errors": self.errors, "last_error": self.last_error,
                 "max_model_len": self.max_model_len, "down_reason": self.down_reason,
                 "backends": len(self.backends), "since": self.since,
                 "backend_inflight": (self._remote or {}).get("backend_inflight") or
-                {self.backend_nodes.get(b) or b: n for b, n in self._per_backend.items()}}
+                {self._backend_label(b): n for b, n in self._per_backend.items()}}
+
+    def _backend_label(self, backend: str) -> str:
+        """The node a backend runs on; never its URL (a QSFP address) in what the API shows."""
+        if self.backend_nodes.get(backend):
+            return str(self.backend_nodes[backend])
+        return f"backend-{self.backends.index(backend) + 1}" if backend in self.backends else "backend"
 
 
 class Gateway:
@@ -182,8 +194,10 @@ class Gateway:
                                          "fallbacks": {}}
         self.fallback_api_key: Optional[str] = None
         self.fallback_routes: dict[str, RouteState] = {}     # external fallbacks, one per alias
-        # named keys by SHA-256 of the token; while there are none, inference_api_key alone is accepted
+        # named keys by SHA-256 of the token. Before the controller migrated 0.6's key (keys_managed False),
+        # inference_api_key alone is accepted; after it, only named keys — also once none is left.
         self.keys: dict[str, dict[str, Any]] = {}
+        self.keys_managed = False
         # TwinSpark's own checks through the in-process gateway (compatibility, smoke): never leaves the process
         self.internal_token = _secrets.token_urlsafe(32)
         self.usage: dict[tuple[str, str, str], dict[str, int]] = {}   # (day, key id, alias) -> counters
@@ -271,7 +285,7 @@ class Gateway:
         sts = [self.routes[a] for a in aliases if a in self.routes]
         oldest = [s.oldest_inflight_s() for s in sts]
         oldest = [o for o in oldest if o is not None]
-        busy = sum(s.inflight for s in sts)
+        busy = sum(s.busy for s in sts)
         if self._unacknowledged():
             busy = max(busy, 1)
         return busy, (max(oldest) if oldest else None)
@@ -308,15 +322,20 @@ class Gateway:
         return [a for a, st in self.routes.items() if st.served_model == profile_name]
 
     # ---- keys and usage (master plan §4.1) ------------------------------------
-    def set_keys(self, records: list[dict[str, Any]]) -> None:
+    def set_keys(self, records: list[dict[str, Any]], managed: Optional[bool] = None) -> None:
         """The named keys (``{id, sha256, aliases, expires_at, revoked_at, …}``; never a secret)."""
         self.keys = {r["sha256"]: dict(r) for r in records if r.get("sha256")}
+        if managed is not None:
+            self.keys_managed = bool(managed)
         self._changed()
 
+    def requires_key(self) -> bool:
+        return self.keys_managed or bool(self.keys) or self.inference_api_key is not None
+
     def authenticate(self, authorization: Optional[str]) -> Optional[dict[str, Any]]:
-        """The key a request uses, or None (401). Without any key configured the gateway is open (only allowed
-        on a loopback listener; serve.py refuses otherwise)."""
-        if self.inference_api_key is None and not self.keys:
+        """The key a request uses, or None (401). Without any key ever configured the gateway is open (only
+        allowed on a loopback listener; serve.py refuses otherwise)."""
+        if not self.requires_key():
             return {"id": "open", "aliases": []}
         scheme, _, token = (authorization or "").partition(" ")
         token = token.strip()
@@ -330,7 +349,8 @@ class Gateway:
             if rec.get("revoked_at") or (rec.get("expires_at") and rec["expires_at"] <= now):
                 return None
             return rec
-        if not self.keys and self.inference_api_key and tokens_equal(token, self.inference_api_key):
+        if not self.keys_managed and not self.keys and self.inference_api_key \
+                and tokens_equal(token, self.inference_api_key):
             return {"id": "default", "aliases": []}
         return None
 

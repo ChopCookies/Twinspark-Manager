@@ -116,11 +116,13 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
         return JSONResponse(_model_entry(st))
 
     async def status(request: Request):
-        if not gateway.check_key(request.headers.get("authorization")):
+        key = gateway.authenticate(request.headers.get("authorization"))
+        if key is None:
             return _error(401, "invalid api key", "invalid_api_key")
+        # a key limited to some aliases sees only those
         return JSONResponse({"routes": [
             {k: v for k, v in st.to_payload().items() if k not in ("last_error",)}
-            for st in gateway.routes.values()]})
+            for st in gateway.routes.values() if gateway.allows(key, st.alias)]})
 
     async def health(request: Request):
         serving = any(st.status == "serving" for st in gateway.routes.values())

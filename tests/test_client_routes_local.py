@@ -209,3 +209,25 @@ async def test_hermes_gets_a_key_of_its_own_and_a_new_one_after_a_revoke(tmp_pat
         return Resp(404, {"detail": "Not Found"})
     monkeypatch.setattr(session, "node_request", old_node)
     assert await integrations_local.app_key(session, "workstation") == "shared-key"
+
+
+async def test_the_client_keeps_its_own_catalog_copy_and_reads_community_totals(tmp_path, monkeypatch):
+    from twinspark.cookbook import community
+    monkeypatch.setenv("TSM_CLIENT_KEYRING", "off")
+    session = ClientSession(home=tmp_path / "client")
+    async with client_for(create_client_app(session, LOCAL)) as c:
+        r = await c.get("/api/v1/cookbook/community-stats")
+        assert r.status_code == 200 and r.json() == {}                 # no community server configured
+        session.node_cfg["cookbook"] = {"catalog_url": None, "catalog_refresh_hours": 24,
+                                        "community_url": "https://reports.example/ts"}
+        seen = []
+        monkeypatch.setattr(community, "community_stats",
+                            lambda url, client=None, refresh=False: seen.append(url) or {"recipes": {}})
+        r = await c.get("/api/v1/cookbook/community-stats")
+        assert r.status_code == 200 and seen == ["https://reports.example/ts"]
+        r = await c.get("/api/v1/cookbook/catalog")
+        assert r.status_code == 200 and r.json()["enabled"] is False     # node A switched it off
+        session.node_cfg["cookbook"]["catalog_url"] = "https://raw.githubusercontent.com/o/r/main/catalog/index.json"
+        r = await c.post("/api/v1/cookbook/catalog/refresh")
+        assert r.status_code == 502 and "no network in tests" in r.json()["detail"]
+    await session.aclose()

@@ -146,8 +146,7 @@ def test_a_file_that_does_not_match_its_sha256_is_not_used(repo, cat):
     assert cookbook.build_draft(SMOKE).simple.context_length == 4096
     cached = cat.snapshot()["files"][SMOKE][0]
     cached.write_text(cached.read_text().replace("4096", "8192"))
-    cat._loaded = None
-    assert SMOKE in cat.snapshot()["bad"]
+    assert SMOKE in cat.snapshot()["bad"]                              # noticed without being told
     assert cookbook.build_draft(SMOKE).simple.context_length != 8192
 
 
@@ -167,6 +166,21 @@ def test_a_recipe_for_a_newer_twinspark_is_listed_not_offered(repo, cat):
     assert row["needs_twinspark"] == "9.0.0" and "update TwinSpark" in row["error"]
     assert cookbook.build_draft("future") is None
     assert cat.status()["needs_newer"] == {"future": "9.0.0"}
+
+
+def test_a_switched_off_or_changed_catalog_is_not_used(repo, cat, tmp_path):
+    repo.edit(SMOKE, lambda d: d["simple"].update(context_length=4096))
+    with repo.client() as client:
+        cat.refresh(client)
+    assert cookbook.build_draft(SMOKE).simple.context_length == 4096
+    off = cookbook.make_catalog(cat.cache, None)                    # catalog_url: "" — the copy stays unused
+    catalog.configure(off)
+    assert cookbook.build_draft(SMOKE).simple.context_length != 4096 and off.status()["updated"] == []
+    other = cookbook.make_catalog(cat.cache, "https://raw.githubusercontent.com/someone/fork/main/catalog/index.json")
+    catalog.configure(other)
+    assert cookbook.build_draft(SMOKE).simple.context_length != 4096 and other.stale()
+    catalog.configure(cat)
+    assert cookbook.build_draft(SMOKE).simple.context_length == 4096
 
 
 def test_an_unreleased_build_keeps_its_own_recipes(repo, tmp_path):
@@ -212,6 +226,12 @@ def test_size_limits_https_and_the_switch(tmp_path):
         big.refresh(client)
     with pytest.raises(CatalogError, match="https"):
         Catalog(tmp_path / "c", "http://example.com/catalog/index.json")
+
+    def elsewhere(request):
+        return httpx.Response(302, headers={"location": "https://evil.example/catalog/index.json"})
+    with httpx.Client(transport=httpx.MockTransport(elsewhere)) as client, \
+            pytest.raises(CatalogError, match="another host"):
+        big.refresh(client)
     off = Catalog(tmp_path / "c", None)
     assert not off.stale() and off.status()["enabled"] is False
     with pytest.raises(CatalogError, match="switched off"):

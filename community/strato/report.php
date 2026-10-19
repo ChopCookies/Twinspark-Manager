@@ -27,7 +27,7 @@ try {
 $db = ts_db();
 $today = gmdate('Y-m-d');
 $now = gmdate('Y-m-d H:i:s');
-$ip = ts_hash((string)($_SERVER['REMOTE_ADDR'] ?? '') . '|' . $today);
+$ip = ts_hash(ts_client_bucket((string)($_SERVER['REMOTE_ADDR'] ?? '')) . '|' . $today);
 $limit = (int)(ts_config()['max_reports_per_day'] ?? 30);
 
 $db->beginTransaction();

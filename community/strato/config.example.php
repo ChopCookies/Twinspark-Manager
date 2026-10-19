@@ -5,7 +5,7 @@
 // to), name it config.php and fill it in there. lib.php looks for it in this order:
 //   1. the path in the environment variable TWINSPARK_CONFIG (e.g. SetEnv in .htaccess)
 //   2. ../../twinspark-private/config.php   (API in <docroot>/twinspark/, config next to <docroot>)
-//   3. ../twinspark-private/config.php
+// The endpoint writes its cached totals (stats-cache.json) into the same folder.
 // Never commit the filled-in file, and never put it into the web folder.
 
 return [

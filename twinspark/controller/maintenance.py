@@ -153,11 +153,12 @@ class Maintenance:
                 or current.get("state") != "running" or current.get("phase") != "restoring"):
             return False
         observed = c.store.kv_get(f"observed:{revision.revision_id}") or {}
+        node_of = {x.health_url: x.node for x in plan.containers if x.health_url}   # weights and labels per node
         for alias, backends in plan.routes.items():
             model = plan.route_models.get(alias, plan.served_model_name)
             c.gateway.set_route(alias, backends, model, revision.revision_id,
                                 max_model_len=(observed.get("models") or {}).get(model, {}).get(
-                                    "max_model_len", observed.get("max_model_len")))
+                                    "max_model_len", observed.get("max_model_len")), nodes=node_of)
         return True
 
     async def tick(self, state):

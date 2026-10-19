@@ -125,7 +125,7 @@ def _gateway(ctrl: "Controller", f: _Families) -> None:
         f.add("twinspark_gateway_route_up", "gauge", "The alias routes to a backend and is not down or switching",
               int(st.status == "serving"), lab)
         f.add("twinspark_gateway_inflight_requests", "gauge", "Requests in flight through the gateway",
-              st.inflight, {"alias": st.alias})
+              st.busy, {"alias": st.alias})
         f.add("twinspark_gateway_oldest_inflight_seconds", "gauge", "Age of the oldest request in flight",
               st.oldest_inflight_s(), {"alias": st.alias})
         f.add("twinspark_gateway_requests_total", "counter", "Requests through the gateway (since the controller "

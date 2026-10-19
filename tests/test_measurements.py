@@ -242,3 +242,8 @@ def test_records_leave_out_addresses_and_user_names():
     assert _scrub("/home/alice/.cache/hf") == "/home/<user>/.cache/hf"
     assert _scrub("fd00:1:2::5") != "" and "<address>" in _scrub("fe80:0:0:0:1:2:3:4")
     assert _scrub("--tensor-parallel-size 2") == "--tensor-parallel-size 2"
+    assert _scrub("connect to [fe80::1]:9443 failed") == "connect to [<address>]:9443 failed"
+    assert _scrub("::1 refused") == "<address> refused" and _scrub("at 12:30:45") == "at 12:30:45"
+    from twinspark.controller.validation import _scrub_doc
+    doc = _scrub_doc({"error": "agent http://10.0.0.2:9443 timed out", "w": ["/home/bob/x"], "n": 3})
+    assert doc == {"error": "agent http://<address>:9443 timed out", "w": ["/home/<user>/x"], "n": 3}

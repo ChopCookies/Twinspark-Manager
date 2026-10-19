@@ -24,6 +24,7 @@ from ..cookbook import (
     make_catalog,
     recipe_detail,
 )
+from ..cookbook import community as reports
 from ..cookbook.remote import RemoteError, fetch_text, list_source
 from .app import ImportIn  # module level: FastAPI resolves the (string) annotation from here
 from .session import ClientSession
@@ -100,7 +101,7 @@ def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callabl
 
     @app.get("/api/v1/cookbook/community-stats")
     async def stats(refresh: bool = False) -> dict:
-        return await asyncio.to_thread(community.community_stats, _settings(session).get("community_url"), None,
+        return await asyncio.to_thread(reports.community_stats, _settings(session).get("community_url"), None,
                                        refresh)
 
     @app.get("/api/v1/cookbook/recipes/{name}")

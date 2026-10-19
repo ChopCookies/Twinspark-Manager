@@ -4,6 +4,10 @@
 
 declare(strict_types=1);
 
+// never show PHP's own messages (they would name server paths and break the JSON answer); log them instead
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
 if (basename($_SERVER['SCRIPT_FILENAME'] ?? '') === 'lib.php') {
     http_response_code(404);
     exit;
@@ -12,6 +16,7 @@ if (basename($_SERVER['SCRIPT_FILENAME'] ?? '') === 'lib.php') {
 const TS_FORMAT = 'twinspark-report/1';
 const TS_OUTCOMES = ['works', 'works-with-changes', 'fails'];
 const TS_STAGES = ['download', 'pull', 'plan', 'start', 'health', 'smoke', 'serving', 'other'];
+const TS_PRESETS = ['max-throughput', 'latency-slo', 'context', 'quality', 'fixed'];
 const TS_BENCH_FIELDS = ['peak_output_tok_s', 'at_concurrency', 'knee_output_tok_s', 'ttft_p95_ms', 'tpot_p95_ms',
     'max_concurrency', 'output_tok_s', 'longest', 'needle_score_min', 'needle_score', 'tools_ok'];
 const TS_TUNING = ['simple.context_length', 'simple.memory_strategy', 'simple.concurrency', 'simple.thinking',
@@ -24,7 +29,18 @@ const TS_TUNING = ['simple.context_length', 'simple.memory_strategy', 'simple.co
     'advanced.gpu_memory_utilization', 'advanced.head_start_delay_s',
     'advanced.speculative_config.method', 'advanced.speculative_config.num_speculative_tokens',
     'engine', 'distributed_backend'];
-const TS_TUNING_PREFIXES = ['advanced.extra_vllm_flags.', 'advanced.compilation_config.'];
+// fields whose words come from a fixed list (the same lists as ENUMS in community.py)
+const TS_ENUMS = [
+    'simple.topology' => ['single-a', 'single-b', 'tp2', 'pp2', 'tp-ep', 'replicated', 'split'],
+    'simple.quantization' => ['bf16', 'fp8', 'nvfp4', 'mxfp4', 'int4', 'awq', 'gptq', 'autoround'],
+    'simple.memory_strategy' => ['balanced', 'max-context', 'max-quality', 'max-throughput', 'max-model-size'],
+    'distributed_backend' => ['auto', 'native', 'mp', 'ray'],
+    'engine' => ['vllm', 'sglang'],
+    'simple.context_length' => ['auto'],
+];
+// exactly one more segment after the prefix, starting with a letter
+const TS_PREFIXED_FIELD = '/^(?:advanced\.extra_vllm_flags\.[a-z][a-z0-9_-]{0,47}|advanced\.compilation_config\.[a-z][a-z0-9_]{0,47})$/';
+const TS_VERSION = '/^\d{1,3}(?:\.\d{1,4}){1,2}$/';
 const TS_MAX_BODY = 16384;
 
 function ts_config(): array
@@ -33,15 +49,16 @@ function ts_config(): array
     if ($config !== null) {
         return $config;
     }
+    // never inside the web folder: the environment, or next to the folder the domain points to
     $candidates = array_filter([
         getenv('TWINSPARK_CONFIG') ?: null,
         dirname(__DIR__, 2) . '/twinspark-private/config.php',
-        dirname(__DIR__) . '/twinspark-private/config.php',
     ]);
     foreach ($candidates as $path) {
         if (is_file($path)) {
             $config = require $path;
-            if (is_array($config) && !empty($config['secret']) && strlen((string)$config['secret']) >= 32) {
+            if (is_array($config) && is_string($config['secret'] ?? null) && strlen($config['secret']) >= 32) {
+                $config['_dir'] = dirname($path);
                 return $config;
             }
             ts_fail(500, 'the server configuration is incomplete');
@@ -74,13 +91,23 @@ function ts_db(): PDO
 /** A keyed hash: the stored value cannot be turned back into the address or the reporter id. */
 function ts_hash(string $value): string
 {
-    return hash_hmac('sha256', $value, (string)ts_config()['secret']);
+    return hash_hmac('sha256', $value, ts_config()['secret']);
 }
 
-/** The cached full listing of stats.php; report.php removes it when a report changes the totals. */
+/** The address a rate limit counts: an IPv6 address by its /64 (one connection usually has a whole /64). */
+function ts_client_bucket(string $addr): string
+{
+    $bin = @inet_pton($addr);
+    if ($bin !== false && strlen($bin) === 16) {
+        return inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8)) . '/64';
+    }
+    return $addr;
+}
+
+/** The cached full listing of stats.php, in the private folder; report.php removes it on every report. */
 function ts_stats_cache(): string
 {
-    return sys_get_temp_dir() . '/twinspark-stats-' . substr(ts_hash('stats'), 0, 16) . '.json';
+    return ts_config()['_dir'] . '/stats-cache.json';
 }
 
 function ts_json(int $status, array $body): never
@@ -98,14 +125,25 @@ function ts_fail(int $status, string $message): never
     ts_json($status, ['ok' => false, 'error' => $message]);
 }
 
+/** An IPv4 or IPv6 address anywhere in the text (also compressed forms like fe80::1). */
+function ts_address(string $v): bool
+{
+    if (preg_match('/(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d)/', $v) === 1) {
+        return true;
+    }
+    foreach (preg_split('/[\s,;()\[\]<>"\'`=\/|]+/', $v) ?: [] as $tok) {
+        $tok = trim($tok, '.');
+        if (substr_count($tok, ':') >= 2
+            && filter_var(explode('%', $tok, 2)[0], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function ts_word($v): bool
 {
     return is_string($v) && preg_match('/^[A-Za-z0-9_.:+-]{1,48}$/', $v) === 1 && !ts_address($v);
-}
-
-function ts_address(string $v): bool
-{
-    return preg_match('/(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9a-fA-F]{1,4}:){2,}/', $v) === 1;
 }
 
 function ts_plain($v): bool
@@ -119,27 +157,24 @@ function ts_plain($v): bool
     return ts_word($v);
 }
 
-function ts_tuning(string $field): bool
+/**
+ * A named tuning field takes a number, a boolean, a word from its fixed list or a short name word (no dots or
+ * hyphens); a free-form flag (extra_vllm_flags.<flag>, compilation options) only a number or a boolean.
+ */
+function ts_reportable($field, $value): bool
 {
-    if (in_array($field, TS_TUNING, true)) {
-        return true;
-    }
-    foreach (TS_TUNING_PREFIXES as $p) {
-        if (str_starts_with($field, $p)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/** A named tuning field takes a plain value; a free-form flag only a number or a boolean. */
-function ts_reportable(string $field, $value): bool
-{
-    if (!preg_match('/^[a-z_][a-z0-9_.-]{0,95}$/', $field) || !ts_tuning($field) || !ts_plain($value)) {
+    if (!is_string($field) || !preg_match('/^[a-z_][a-z0-9_.-]{0,95}$/', $field) || !ts_plain($value)) {
         return false;
     }
-    return in_array($field, TS_TUNING, true) || $value === null || is_bool($value) || is_int($value)
-        || is_float($value);
+    if (in_array($field, TS_TUNING, true)) {
+        if (is_string($value)) {
+            return isset(TS_ENUMS[$field]) ? in_array($value, TS_ENUMS[$field], true)
+                : preg_match('/^[A-Za-z][A-Za-z0-9_]{0,23}$/', $value) === 1;
+        }
+        return true;
+    }
+    return preg_match(TS_PREFIXED_FIELD, $field) === 1
+        && ($value === null || is_bool($value) || is_int($value) || is_float($value));
 }
 
 /** The report, checked field by field; throws InvalidArgumentException with the reason. */
@@ -148,6 +183,7 @@ function ts_check_report($doc): array
     $bad = static function (string $why): never {
         throw new InvalidArgumentException($why);
     };
+    $str = static fn($v): string => is_string($v) ? $v : '';
     if (!is_array($doc) || ($doc['format'] ?? null) !== TS_FORMAT) {
         $bad('not a ' . TS_FORMAT . ' document');
     }
@@ -155,14 +191,14 @@ function ts_check_report($doc): array
         'engine_version', 'topology', 'hardware', 'benchmarks', 'changes', 'comment', 'reporter'];
     $extra = array_diff(array_keys($doc), $allowed);
     if ($extra) {
-        $bad('unexpected fields: ' . implode(', ', array_slice($extra, 0, 5)));
+        $bad('unexpected fields: ' . implode(', ', array_map('strval', array_slice($extra, 0, 5))));
     }
-    if (!preg_match('/^[a-z0-9][a-z0-9._-]{0,80}$/', (string)($doc['recipe'] ?? ''))
-        || !preg_match('/^[0-9a-f]{64}$/', (string)($doc['recipe_sha256'] ?? ''))) {
+    if (!preg_match('/^[a-z0-9][a-z0-9._-]{0,80}$/', $str($doc['recipe'] ?? null))
+        || !preg_match('/^[0-9a-f]{64}$/', $str($doc['recipe_sha256'] ?? null))) {
         $bad('recipe and recipe_sha256 are required');
     }
     $mode = $doc['mode'] ?? null;
-    if ($mode !== null && !preg_match('/^[a-z][a-z0-9-]{0,30}$/', (string)$mode)) {
+    if ($mode !== null && !preg_match('/^[a-z][a-z0-9-]{0,30}$/', $str($mode))) {
         $bad('invalid mode');
     }
     if (!in_array($doc['outcome'] ?? null, TS_OUTCOMES, true)) {
@@ -174,17 +210,17 @@ function ts_check_report($doc): array
     }
     foreach (['twinspark', 'engine_version'] as $k) {
         $v = $doc[$k] ?? null;
-        if ($v !== null && !preg_match('/^[0-9][0-9A-Za-z.+-]{0,31}$/', (string)$v)) {
+        if ($v !== null && !preg_match(TS_VERSION, $str($v))) {
             $bad("invalid $k");
         }
     }
     if (!isset($doc['twinspark'])) {
         $bad('twinspark version is required');
     }
-    if (!in_array($doc['engine'] ?? null, ['vllm', 'sglang'], true)) {
+    if (!in_array($doc['engine'] ?? null, TS_ENUMS['engine'], true)) {
         $bad('invalid engine');
     }
-    if (isset($doc['topology']) && !ts_word($doc['topology'])) {
+    if (isset($doc['topology']) && !in_array($doc['topology'], TS_ENUMS['simple.topology'], true)) {
         $bad('invalid topology');
     }
     if (($doc['hardware'] ?? null) !== '2x DGX Spark') {
@@ -195,7 +231,7 @@ function ts_check_report($doc): array
         $bad('invalid benchmarks');
     }
     foreach ($benches as $preset => $nums) {
-        if (!ts_word((string)$preset) || !is_array($nums) || array_diff(array_keys($nums), TS_BENCH_FIELDS)) {
+        if (!in_array($preset, TS_PRESETS, true) || !is_array($nums) || array_diff(array_keys($nums), TS_BENCH_FIELDS)) {
             $bad('invalid benchmark numbers');
         }
         foreach ($nums as $v) {
@@ -209,10 +245,10 @@ function ts_check_report($doc): array
         $bad('invalid changes');
     }
     foreach ($changes as $c) {
-        if (!is_array($c) || array_keys($c) != ['field', 'value'] && array_keys($c) != ['value', 'field']) {
+        if (!is_array($c) || count($c) !== 2 || !array_key_exists('field', $c) || !array_key_exists('value', $c)) {
             $bad('a changed setting is malformed');
         }
-        if (!ts_reportable((string)$c['field'], $c['value'])) {
+        if (!ts_reportable($c['field'], $c['value'])) {
             $bad('a changed setting is not reportable');
         }
     }
@@ -224,7 +260,7 @@ function ts_check_report($doc): array
         $bad('the comment contains an address or a path');
     }
     $reporter = $doc['reporter'] ?? null;
-    if ($reporter !== null && !preg_match('/^[0-9a-f]{32}$/', (string)$reporter)) {
+    if ($reporter !== null && !preg_match('/^[0-9a-f]{32}$/', $str($reporter))) {
         $bad('invalid reporter id');
     }
     return $doc;

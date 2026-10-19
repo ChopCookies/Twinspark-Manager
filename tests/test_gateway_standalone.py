@@ -218,3 +218,61 @@ def test_a_standalone_install_publishes_instead_of_serving_the_gateway(tmp_path)
         assert controller.status()["gateway_process"]["mode"] == "standalone"
     finally:
         asyncio.run(controller.aclose())
+
+
+def test_two_threads_publishing_at_once_get_two_versions_and_the_gateway_applies_both(paths):
+    """The review's race: two publishes computed the same version and the gateway skipped the second
+    (a revoked key stayed valid in the gateway process)."""
+    import threading
+
+    from twinspark.gateway import state as state_mod
+    state_path, _ = paths
+    gw, link = controller_side(paths)
+    remote = Gateway(None, None)
+    follower = StateFollower(remote, state_path)
+    follower.check()
+    real = state_mod.write_atomic
+    first_written, release_first = threading.Event(), threading.Event()
+
+    def slow_write(path, doc):
+        real(path, doc)
+        if threading.current_thread().name == "T1":
+            first_written.set()
+            release_first.wait(5)
+    state_mod.write_atomic = slow_write
+    try:
+        t1 = threading.Thread(name="T1", target=lambda: gw.set_route("default", ["http://127.0.0.1:9"], "m"))
+        t1.start()
+        assert first_written.wait(5)
+        follower.check()                                                  # the gateway applies T1's file
+        t2 = threading.Thread(name="T2", target=lambda: gw.set_keys(
+            [{"id": "key-1", "sha256": digest(KEY), "aliases": [], "revoked_at": time.time()}], managed=True))
+        t2.start()
+        time.sleep(0.2)
+        release_first.set()
+        t1.join(5)
+        t2.join(5)
+    finally:
+        state_mod.write_atomic = real
+    assert read_state(state_path)["version"] == gw.published_version
+    assert follower.check() and follower.version == gw.published_version
+    assert remote.authenticate(f"Bearer {KEY}") is None                   # the revocation reached the gateway
+
+
+async def test_a_playground_request_in_the_controller_does_not_hide_the_gateways_requests(paths, backend):
+    gw, link = controller_side(paths)
+    gw.set_route("default", [backend], "m", "rev-1")
+    async with Process(*paths) as proc:
+        await until(lambda: "default" in proc.gw.routes)
+        stream = asyncio.create_task(proc.client.post("/v1/chat/completions",
+                                                      json={"model": "default", "stream": True}))
+        await until(lambda: proc.gw.routes["default"].inflight == 1)
+        st = gw.routes["default"]
+        tok = st.acquire()                                               # a playground request in this process
+        await link.poll()                                                # the gateway reports its own request
+        assert gw.inflight(["default"])[0] == 2
+        st.release(tok)                                                  # the playground answer ends
+        assert gw.inflight(["default"])[0] == 1                          # the gateway's request still counts
+        assert (await stream).status_code == 200
+        await link.poll()
+        assert gw.inflight(["default"])[0] == 0

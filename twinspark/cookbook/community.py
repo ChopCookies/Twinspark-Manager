@@ -21,6 +21,7 @@ a document with anything else, on both ends. The server side lives in ``communit
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import secrets
 import time
@@ -36,6 +37,7 @@ from .tracking import settings
 FORMAT = "twinspark-report/1"
 OUTCOMES = ("works", "works-with-changes", "fails")
 STAGES = ("download", "pull", "plan", "start", "health", "smoke", "serving", "other")
+PRESETS = ("max-throughput", "latency-slo", "context", "quality", "fixed")
 MAX_COMMENT = 500
 MAX_CHANGES = 40
 STATS_TTL = 1800.0
@@ -54,14 +56,29 @@ _TUNING = {
     "engine", "distributed_backend",
 }
 _TUNING_PREFIXES = ("advanced.extra_vllm_flags.", "advanced.compilation_config.")
+# exactly one more segment after a prefix: a flag or option name (starts with a letter: never an address)
+_PREFIXED_FIELD = re.compile(r"^(?:advanced\.extra_vllm_flags\.[a-z][a-z0-9_-]{0,47}"
+                             r"|advanced\.compilation_config\.[a-z][a-z0-9_]{0,47})$")
+# fields whose words come from a fixed list (the same lists are in community/strato/lib.php)
+ENUMS = {
+    "simple.topology": ("single-a", "single-b", "tp2", "pp2", "tp-ep", "replicated", "split"),
+    "simple.quantization": ("bf16", "fp8", "nvfp4", "mxfp4", "int4", "awq", "gptq", "autoround"),
+    "simple.memory_strategy": ("balanced", "max-context", "max-quality", "max-throughput", "max-model-size"),
+    "distributed_backend": ("auto", "native", "mp", "ray"),
+    "engine": ("vllm", "sglang"),
+    "simple.context_length": ("auto",),
+}
+# any other word: a parser, dtype or backend name — letters, digits and _, no dots or hyphens (host names)
+_NAME_WORD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,23}$")
 _BENCH_FIELDS = ("peak_output_tok_s", "at_concurrency", "knee_output_tok_s", "ttft_p95_ms", "tpot_p95_ms",
                  "max_concurrency", "output_tok_s", "longest", "needle_score_min", "needle_score", "tools_ok")
 _WORD = re.compile(r"^[A-Za-z0-9_.:+-]{1,48}$")
-_LOOKS_LIKE_ADDRESS = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9a-fA-F]{1,4}:){2,}")
+_IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d])")
+_RELEASE = re.compile(r"^\d{1,3}(?:\.\d{1,4}){1,2}")
 _NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _REPORTER = re.compile(r"^[0-9a-f]{32}$")
-_VERSION = re.compile(r"^[0-9][0-9A-Za-z.+-]{0,31}$")
+_VERSION = re.compile(r"^\d{1,3}(?:\.\d{1,4}){1,2}$")
 _FIELD = re.compile(r"^[a-z_][a-z0-9_.-]{0,95}$")
 
 
@@ -69,12 +86,34 @@ class ReportError(ValueError):
     pass
 
 
+def has_address(text: str) -> bool:
+    """An IPv4 or IPv6 address anywhere in the text (also compressed forms like ``fe80::1``)."""
+    if _IPV4.search(text):
+        return True
+    for tok in re.split(r"[\s,;()\[\]<>\"'`=/|]+", text):
+        tok = tok.strip(".")
+        if tok.count(":") >= 2:
+            try:
+                ipaddress.ip_address(tok.split("%", 1)[0])
+                return True
+            except ValueError:
+                continue
+    return False
+
+
+def release(version: Any) -> Optional[str]:
+    """``0.11.2`` from ``0.11.2rc1.dev12+gabc`` — only the release numbers leave; ``unknown`` becomes None."""
+    text = str(version or "")
+    m = _RELEASE.match(text)
+    return m.group(0) if m and not has_address(text) else None
+
+
 def _plain(value: Any) -> bool:
     if value is None or isinstance(value, bool):
         return True
     if isinstance(value, (int, float)):
         return abs(value) < 1e12
-    return isinstance(value, str) and bool(_WORD.match(value)) and not _LOOKS_LIKE_ADDRESS.search(value)
+    return isinstance(value, str) and bool(_WORD.match(value)) and not has_address(value)
 
 
 def _flatten(doc: Any, path: str = "") -> dict[str, Any]:
@@ -87,13 +126,16 @@ def _flatten(doc: Any, path: str = "") -> dict[str, Any]:
 
 
 def _reportable(field: str, value: Any) -> bool:
-    """A named tuning field takes a plain value; a free-form flag (``extra_vllm_flags.*``, compilation
-    options) only a number or a boolean — a word there could be a name someone chose."""
-    if not _FIELD.match(field) or not _plain(value):
+    """A named tuning field takes a number, a boolean, a word from its fixed list or a short name word
+    (no dots or hyphens); a free-form flag (``extra_vllm_flags.<flag>``, compilation options) only a number or
+    a boolean — a word there could be a name someone chose."""
+    if not isinstance(field, str) or not _FIELD.match(field) or not _plain(value):
         return False
     if field in _TUNING:
+        if isinstance(value, str):
+            return value in ENUMS[field] if field in ENUMS else bool(_NAME_WORD.match(value))
         return True
-    return field.startswith(_TUNING_PREFIXES) and (value is None or isinstance(value, (bool, int, float)))
+    return bool(_PREFIXED_FIELD.match(field)) and (value is None or isinstance(value, (bool, int, float)))
 
 
 def tuning_changes(baseline: Optional[dict], current: dict) -> list[dict[str, Any]]:
@@ -115,7 +157,7 @@ def _bench_numbers(benchmarks: list[dict]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for b in sorted(benchmarks, key=lambda x: str(x.get("at") or ""), reverse=True):
         preset = b.get("preset")
-        if not b.get("valid") or not isinstance(preset, str) or not _WORD.match(preset) or preset in out:
+        if not b.get("valid") or preset not in PRESETS or preset in out:
             continue
         s = b.get("summary") if isinstance(b.get("summary"), dict) else {}
         nums = {k: s[k] for k in _BENCH_FIELDS if isinstance(s.get(k), (int, float, bool)) and _plain(s[k])}
@@ -151,8 +193,8 @@ def build_report(record: dict, *, outcome: Optional[str] = None, failure_stage: 
     doc: dict[str, Any] = {
         "format": FORMAT, "recipe": recipe, "recipe_sha256": sha, "mode": record.get("mode"),
         "outcome": outcome, "failure_stage": failure_stage if outcome == "fails" else None,
-        "twinspark": __version__, "engine": record.get("engine") or "vllm",
-        "engine_version": first.get("vllm_version"), "topology": first.get("topology"),
+        "twinspark": release(__version__), "engine": record.get("engine") or "vllm",
+        "engine_version": release(first.get("vllm_version")), "topology": first.get("topology"),
         "hardware": "2x DGX Spark",
         "benchmarks": _bench_numbers(((record.get("results") or {}).get("benchmarks")) or []),
         "changes": record.get("changes") or [],
@@ -195,7 +237,7 @@ def check_report(doc: Any) -> dict[str, Any]:
             raise ReportError(f"invalid {key}")
     if doc.get("engine") not in ("vllm", "sglang"):
         raise ReportError("invalid engine")
-    if doc.get("topology") is not None and not _WORD.match(str(doc["topology"])):
+    if doc.get("topology") is not None and doc["topology"] not in ENUMS["simple.topology"]:
         raise ReportError("invalid topology")
     if doc.get("hardware") != "2x DGX Spark":
         raise ReportError("invalid hardware")
@@ -203,7 +245,7 @@ def check_report(doc: Any) -> dict[str, Any]:
     if not isinstance(benches, dict) or len(benches) > 8:
         raise ReportError("invalid benchmarks")
     for preset, nums in benches.items():
-        if not _WORD.match(str(preset)) or not isinstance(nums, dict) or set(nums) - set(_BENCH_FIELDS) \
+        if preset not in PRESETS or not isinstance(nums, dict) or set(nums) - set(_BENCH_FIELDS) \
                 or not all(isinstance(v, (int, float, bool)) and _plain(v) for v in nums.values()):
             raise ReportError(f"invalid benchmark numbers for {preset!r}")
     changes = doc.get("changes")
@@ -215,7 +257,7 @@ def check_report(doc: Any) -> dict[str, Any]:
     comment = doc.get("comment")
     if not isinstance(comment, str) or len(comment) > MAX_COMMENT:
         raise ReportError(f"comment: text up to {MAX_COMMENT} characters")
-    if _LOOKS_LIKE_ADDRESS.search(comment) or re.search(r"(?:^|\s)(?:/home/|/Users/|~/|[A-Za-z]:\\)", comment):
+    if has_address(comment) or re.search(r"(?:^|\s)(?:/home/|/Users/|~/|[A-Za-z]:\\)", comment):
         raise ReportError("the comment contains an address or a path — leave those out")
     if doc.get("reporter") is not None and not _REPORTER.match(str(doc["reporter"])):
         raise ReportError("invalid reporter id")

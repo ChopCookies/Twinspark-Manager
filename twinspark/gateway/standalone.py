@@ -68,7 +68,7 @@ def build(config_path: str, *, interval: float = 0.5) -> tuple[dict, Gateway, St
 
     follower = StateFollower(gw, Path(cfg["state_path"]), interval=interval, on_apply=before_apply)
     follower.check()
-    if cfg["bind"] not in _LOCAL and not gw.inference_api_key and not gw.keys:
+    if cfg["bind"] not in _LOCAL and not gw.requires_key():
         raise SystemExit("the gateway listens on a non-local address but has no inference key — run `tsm init` "
                          "and start the controller once")
     return cfg, gw, follower

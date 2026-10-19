@@ -64,6 +64,19 @@ def test_a_report_holds_only_the_allowlisted_facts():
     assert failed["outcome"] == "fails" and failed["failure_stage"] == "health" and "reporter" not in failed
 
 
+def test_plain_tuning_words_times_and_versions_still_pass():
+    doc = build_report(record(changes=[{"field": "behaviour.tool_call_parser", "value": "qwen3_coder"},
+                                       {"field": "advanced.kv_dtype", "value": "fp8_e4m3"},
+                                       {"field": "simple.context_length", "value": "auto"},
+                                       {"field": "advanced.extra_vllm_flags.swap-space", "value": 4}]),
+                       comment="Started at 12:30:45, stable for a day; 0.11.2 image.")
+    assert check_report(doc) is doc
+    assert community.release("0.11.2rc1.dev12+g1234abc") == "0.11.2" and community.release("unknown") is None
+    assert community.release("100.101.102.103") is None
+    unknown = build_report(record(deployment={"parts": [{"topology": "tp2", "vllm_version": "unknown"}]}))
+    assert unknown["engine_version"] is None                            # an image without a version label
+
+
 def test_dry_runs_and_profiles_without_a_cookbook_recipe_are_not_reported():
     with pytest.raises(ReportError, match="dry run"):
         build_report(record(procedure={"state": "completed", "dry_run": True}))
@@ -105,6 +118,20 @@ def test_only_tuning_settings_with_plain_values_count_as_changes():
     (lambda d: d["changes"].append({"field": "advanced.extra_vllm_flags.tokenizer", "value": "my-private-tok"}),
      "not reportable"),
     (lambda d: d["benchmarks"].update(context={"text": "free text"}), "benchmark"),
+    (lambda d: d["benchmarks"].update({"spark-a": {"output_tok_s": 1}}), "benchmark"),
+    # counterexamples from the review: addresses and names hidden in field names, versions and words
+    (lambda d: d["changes"].append({"field": "advanced.extra_vllm_flags.kv-transfer-config.192.168.1.20",
+                                    "value": 5557}), "not reportable"),
+    (lambda d: d["changes"].append({"field": "behaviour.tool_call_parser", "value": "spark-a.tail1234.ts.net"}),
+     "not reportable"),
+    (lambda d: d["changes"].append({"field": "advanced.weight_loader", "value": "hf_" + "a" * 34}),
+     "not reportable"),
+    (lambda d: d["changes"].append({"field": "simple.topology", "value": "my-own"}), "not reportable"),
+    (lambda d: d.update(engine_version="100.101.102.103"), "engine_version"),
+    (lambda d: d.update(engine_version="20251019-spark-a1b2"), "engine_version"),
+    (lambda d: d.update(comment="the backend at fe80::1 answers"), "address or a path"),
+    (lambda d: d.update(comment="try ::1 first"), "address or a path"),
+    (lambda d: d.update(topology="spark-a"), "topology"),
     (lambda d: d.update(outcome="great"), "outcome"),
     (lambda d: d.update(reporter="spark-a"), "reporter"),
     (lambda d: d.update(recipe="../etc"), "recipe"),
@@ -257,6 +284,12 @@ def test_the_endpoint_limits_reports_per_address_and_size(strato):
     assert httpx.post(strato.base + "/report.php", content=b"x", headers={"content-type": "text/plain"},
                       timeout=10).status_code == 415
     assert httpx.get(strato.base + "/lib.php", timeout=10).status_code == 404
+    # wrong types where words are expected: a clean JSON refusal, never PHP's warnings (server paths)
+    odd = {**doc, "recipe": ["x"], "mode": {"a": 1}, "reporter": 5}
+    r = strato.post(odd)
+    assert r.status_code == 422 and r.json()["ok"] is False and "Warning" not in r.text and "/" not in r.json()["error"]
+    r = httpx.get(strato.base + "/stats.php", params={"recipe[]": "x"}, timeout=10)
+    assert r.status_code == 422 and r.headers["content-type"].startswith("application/json")
 
 
 def test_the_strato_files_carry_no_credentials():

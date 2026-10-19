@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -39,7 +40,7 @@ _ROUTE_FIELDS = ("backends", "served_model", "revision_id", "max_model_len", "dr
 def export_state(gw: Gateway, version: int) -> dict[str, Any]:
     return {"format": FORMAT, "version": version, "written_at": time.time(),
             "routes": {a: {f: getattr(st, f) for f in _ROUTE_FIELDS} for a, st in gw.routes.items()},
-            "settings": gw.settings, "keys": list(gw.keys.values())}
+            "settings": gw.settings, "keys": list(gw.keys.values()), "keys_managed": gw.keys_managed}
 
 
 def apply_state(gw: Gateway, doc: dict[str, Any]) -> None:
@@ -63,7 +64,7 @@ def apply_state(gw: Gateway, doc: dict[str, Any]) -> None:
     try:
         gw.routes = routes
         gw.configure(doc.get("settings") or {})
-        gw.set_keys(keys)
+        gw.set_keys(keys, managed=bool(doc.get("keys_managed")))
     finally:
         gw.on_change = on_change
 
@@ -122,8 +123,7 @@ class StateFollower:
         if doc is None:
             return False
         self._stamp = stamp
-        if int(doc.get("version") or 0) == self.version and self.version:
-            return False
+        # a changed file is applied even with the version it had before: never skip what the controller wrote
         if self.on_apply is not None:
             self.on_apply(doc)
         apply_state(self.gw, doc)
@@ -146,6 +146,9 @@ class GatewayLink:
                  transport: Optional[httpx.AsyncBaseTransport] = None):
         self.gw, self.path, self.socket = gw, Path(state_path), str(socket_path)
         self.interval = interval
+        # publish() runs on the event loop and in API worker threads: one writer at a time, so every
+        # write gets its own version and the gateway never takes a later state for one it applied
+        self._publishing = threading.Lock()
         self._transport = transport
         self._task: Optional[asyncio.Task] = None
         self.last_error: Optional[str] = None
@@ -159,7 +162,7 @@ class GatewayLink:
             try:
                 routes = {a: r for a, r in (doc.get("routes") or {}).items()}
                 apply_state(self.gw, {"routes": routes, "settings": self.gw.settings,
-                                      "keys": list(self.gw.keys.values())})
+                                      "keys": list(self.gw.keys.values()), "keys_managed": self.gw.keys_managed})
             finally:
                 self.gw.on_change = on_change
             self.gw.published_version = int(doc.get("version") or 0)
@@ -168,13 +171,14 @@ class GatewayLink:
         self.publish()
 
     def publish(self) -> None:
-        version = self.gw.published_version + 1
-        try:
-            write_atomic(self.path, export_state(self.gw, version))
-            self.gw.published_version = version
-        except OSError as exc:
-            self.last_error = f"could not write {self.path}: {exc}"
-            log.error("%s", self.last_error)
+        with self._publishing:
+            version = self.gw.published_version + 1
+            try:
+                write_atomic(self.path, export_state(self.gw, version))
+                self.gw.published_version = version
+            except OSError as exc:
+                self.last_error = f"could not write {self.path}: {exc}"
+                log.error("%s", self.last_error)
 
     def _client(self) -> httpx.AsyncClient:
         transport = self._transport or httpx.AsyncHTTPTransport(uds=self.socket)
@@ -190,7 +194,7 @@ class GatewayLink:
             self.gw.remote_ok = False
             self.last_error = f"the gateway process does not answer ({type(exc).__name__})"
             for st in self.gw.routes.values():
-                st.inflight, st._remote = 0, None
+                st.remote_inflight, st._remote = 0, None
             return False
         self.gw.remote_ok, self.last_seen, self.last_error = True, time.time(), None
         self.gw.remote_version = int(doc.get("version") or 0)
@@ -198,8 +202,9 @@ class GatewayLink:
             st = self.gw.routes.get(alias)
             if st is None:
                 continue
-            st.inflight, st.requests, st.errors = int(s.get("inflight") or 0), int(s.get("requests") or 0), \
-                int(s.get("errors") or 0)
+            # the process's requests go to remote_inflight: the controller's own (the playground) stay counted
+            st.remote_inflight, st.requests, st.errors = int(s.get("inflight") or 0), \
+                int(s.get("requests") or 0), int(s.get("errors") or 0)
             st.last_error = s.get("last_error")
             st._remote = {"oldest": s.get("oldest_inflight_s"), "backend_inflight": s.get("backend_inflight") or {}}
         for row in (doc.get("usage") or {}).get("rows") or []:

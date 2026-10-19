@@ -47,7 +47,8 @@ hosts differ only in where things are in the panel.
      <domain folder>/twinspark/.htaccess
    ```
 
-   If the config has to live elsewhere, set its path in `.htaccess` (`SetEnv TWINSPARK_CONFIG …`).
+   `lib.php` looks for the config only there (two folders up from itself) or at the path in
+   `TWINSPARK_CONFIG` (`SetEnv TWINSPARK_CONFIG …` in `.htaccess`) — never inside the web folder.
 5. **Check it.** `https://<your-domain>/twinspark/stats.php` answers `{"ok":true,…,"recipes":{}}`;
    `https://<your-domain>/twinspark/lib.php` and `…/schema.sql` answer 403 or 404. Use https: the
    TwinSpark side refuses plain http.
@@ -70,9 +71,12 @@ hosts differ only in where things are in the panel.
   UPDATE reports SET hidden = 1 WHERE id = 123;
   ```
 
-- **Limits.** 30 reports per address and day (`max_reports_per_day`); a later report from the same
-  installation for the same recipe file and mode replaces its earlier one, so one setup counts once.
-  Anonymous reports (`--anonymous`) count each time.
+- **Limits.** 30 reports per address and day (`max_reports_per_day`; an IPv6 address counts by its /64); a
+  later report from the same installation for the same recipe file and mode replaces its earlier one, so
+  one setup counts once. Anonymous reports (`--anonymous`) and new installations count each time — the
+  totals are a guide, not a vote; hide what looks like stuffing.
+- **Files the endpoint writes:** only `stats-cache.json` (the totals, cached five minutes) next to
+  `config.php` in `twinspark-private`, so that folder must be writable by PHP.
 - **What is stored.** The report's fields, a keyed hash (HMAC with `secret`) of the random reporter id, and
   for the rate limit a keyed hash of address and day, deleted after two days. No addresses, host names or
   user names. Changing `secret` makes earlier reporter ids unrecognisable (their next report counts anew).

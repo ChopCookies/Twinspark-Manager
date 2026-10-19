@@ -9,7 +9,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') {
     header('Allow: GET');
     ts_fail(405, 'GET the totals');
 }
-$only = isset($_GET['recipe']) ? (string)$_GET['recipe'] : null;
+$only = isset($_GET['recipe']) ? (is_string($_GET['recipe']) ? $_GET['recipe'] : '') : null;
 if ($only !== null && !preg_match('/^[a-z0-9][a-z0-9._-]{0,80}$/', $only)) {
     ts_fail(422, 'invalid recipe name');
 }
@@ -111,7 +111,7 @@ foreach ($out as $name => $s) {
 $body = json_encode(['ok' => true, 'generated_at' => gmdate('Y-m-d\TH:i:s\Z'), 'recipes' => (object)$recipes],
     JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 if ($cache !== null) {
-    @file_put_contents($cache, $body, LOCK_EX);
+    @file_put_contents($cache, $body, LOCK_EX);    // in the private folder
 }
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: public, max-age=300');

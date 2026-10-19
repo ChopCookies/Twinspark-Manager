@@ -247,6 +247,9 @@ class FallbackTarget(BaseModel):
             if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password \
                     or parts.query or parts.fragment or any(ord(c) < 33 for c in self.url) or len(self.url) > 2048:
                 raise ValueError("fallback url: http(s)://host[:port]/path without credentials, query or fragment")
+            # its key and the prompts travel there: plain http only to this machine (a local proxy)
+            if parts.scheme == "http" and parts.hostname not in ("localhost", "127.0.0.1", "::1"):
+                raise ValueError("an external fallback must use https:// (plain http only to localhost)")
             if not self.model:
                 raise ValueError("an external fallback needs the model name to ask it for")
         return self

@@ -16,6 +16,7 @@ Evidence classes keep "the recipe works" apart from "this manager version ran it
 from __future__ import annotations
 
 import datetime as _dt
+import ipaddress
 import re
 import sys
 from pathlib import Path
@@ -56,13 +57,34 @@ def source_commit() -> Optional[str]:
 
 
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_IPV6 = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b")
+_IPV6 = re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?![\w:])")
 _HOME = re.compile(r"/home/[^/\s]+")
 
 
+def _v6(m: re.Match) -> str:
+    try:
+        ipaddress.IPv6Address(m.group(0))
+        return "<address>"
+    except ValueError:
+        return m.group(0)
+
+
 def _scrub(arg: str) -> str:
-    """No addresses or user names in a record that is meant to be published."""
-    return _HOME.sub("/home/<user>", _IPV6.sub("<address>", _IPV4.sub("<address>", str(arg))))
+    """No addresses or user names in a record that is meant to be published (``fe80::1`` included)."""
+    return _HOME.sub("/home/<user>", _IPV6.sub(_v6, _IPV4.sub("<address>", str(arg))))
+
+
+def _scrub_doc(doc: Any, depth: int = 0) -> Any:
+    """:func:`_scrub` on every string of a nested document (errors, warnings, results)."""
+    if depth > 12:
+        return None
+    if isinstance(doc, str):
+        return _scrub(doc)
+    if isinstance(doc, dict):
+        return {_scrub(k) if isinstance(k, str) else k: _scrub_doc(v, depth + 1) for k, v in doc.items()}
+    if isinstance(doc, (list, tuple)):
+        return [_scrub_doc(v, depth + 1) for v in doc]
+    return doc
 
 
 def _stages(job) -> list[dict[str, Any]]:
@@ -153,15 +175,15 @@ def build_record(ctrl: "Controller", name: str, ref: Optional[str] = None, job_i
                        "commands": commands, "model_identity": ident.model_dump(mode="json")},
         "procedure": None if job is None else {
             "job_id": job.job_id, "kind": job.kind, "state": job.state.value, "dry_run": dry,
-            "created_at": job.created_at, "stages": _stages(job), "error": job.error,
-            "rollback": job.rollback, "warnings": payload.get("warnings") or [],
+            "created_at": job.created_at, "stages": _stages(job), "error": _scrub_doc(job.error),
+            "rollback": _scrub_doc(job.rollback), "warnings": _scrub_doc(payload.get("warnings") or []),
         },
         # benchmarks and evaluations are evidence of their own: they show even before an activation job
-        "results": None if job is None and not benches and not evals else {
+        "results": None if job is None and not benches and not evals else _scrub_doc({
             "kv": payload.get("kv"), "models": payload.get("models"), "kv_sources": payload.get("kv_sources"),
             "startup": startup, "startup_classification": (payload.get("startup_evidence") or {}).get("classification"),
             "benchmarks": benches, "evaluations": evals,
-        },
+        }),
     }
 
 

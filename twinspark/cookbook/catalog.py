@@ -208,7 +208,12 @@ def _get(client: httpx.Client, url: str, limit: int) -> bytes:
         try:
             with client.stream("GET", url, follow_redirects=False) as r:
                 if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
-                    url = urljoin(url, r.headers["location"])
+                    target = urljoin(url, r.headers["location"])
+                    if urlsplit(target).scheme != "https":
+                        raise CatalogError("the catalog is only read over https://")
+                    if urlsplit(target).hostname != urlsplit(url).hostname:
+                        raise CatalogError(f"{urlsplit(url).hostname} redirected to another host — not followed")
+                    url = target
                     continue
                 if r.status_code != 200:
                     raise CatalogError(f"{urlsplit(url).hostname} answered HTTP {r.status_code} for {url}")
@@ -263,20 +268,37 @@ class Catalog:
             return None
         return doc if isinstance(doc, dict) and isinstance(doc.get("set"), str) else None
 
+    def _stamp(self) -> Any:
+        """What a snapshot depends on: the pointer, and every cached recipe file's size and mtime — an edited
+        cache file is checked against the index again before it is used."""
+        try:
+            pointer = (self.cache / "current.json").stat().st_mtime_ns
+        except OSError:
+            return None
+        files = []
+        for p in sorted((self.cache / "sets").glob("*/recipes/*")):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            files.append((str(p), st.st_mtime_ns, st.st_size, st.st_ino))
+        return (pointer, self.url, tuple(files))
+
     def snapshot(self) -> dict[str, Any]:
         """The catalog in use: ``{"index", "fetched_at", "url", "dir", "files": {name: [Path]}, "bad": {...}}``,
-        or an empty dict when there is none. Files are re-checked against the index once per change."""
-        pointer_path = self.cache / "current.json"
-        try:
-            stamp: Any = pointer_path.stat().st_mtime_ns
-        except OSError:
+        or an empty dict when there is none — also when the catalog is switched off or the copy came from
+        another ``catalog_url``. Files are checked against the index whenever one of them changed."""
+        if not self.url:
+            return {}
+        stamp = self._stamp()
+        if stamp is None:
             return {}
         with self._lock:
             if self._loaded and self._loaded[0] == stamp:
                 return self._loaded[1]
             pointer = self._pointer()
             snap: dict[str, Any] = {}
-            if pointer and _SEGMENT.match(pointer["set"]):
+            if pointer and _SEGMENT.match(pointer["set"]) and pointer.get("url") == self.url:
                 folder = self.cache / "sets" / pointer["set"]
                 try:
                     index = check_index(json.loads((folder / "index.json").read_text(encoding="utf-8")))

@@ -3,7 +3,8 @@
 One key per app (Hermes, OpenClaw, a friend's laptop): each limited to aliases, expirable, revocable,
 shown once at creation. The controller keeps only SHA-256 hashes and a short prefix to tell keys apart.
 0.6's single ``inference_api_key`` becomes the first named key ("default") on the first start, so apps
-configured with it keep working.
+configured with it keep working. From then on only named keys open the gateway: revoking or deleting
+"default" retires 0.6's key for good.
 
 Usage: the gateway counts requests, prompt and completion tokens per key and alias (gateway.Gateway
 .take_usage); the controller adds them to daily totals in its store (``usage:<day>``), kept 90 days.
@@ -17,10 +18,14 @@ import hashlib
 import io
 import re
 import secrets
+import threading
 import time
 from typing import Any, Optional
 
 KEYS = "inference_keys"
+# set once named keys rule (0.6's key migrated, or a key created): from then on neither 0.6's single key
+# nor the keyless loopback mode comes back, even when every named key was deleted
+MANAGED = "inference_keys_managed"
 KEEP_DAYS = 90
 _NAME_RE = re.compile(r"^[\w .@()+:/-]{1,64}$")
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,62}$")
@@ -41,23 +46,35 @@ def public(rec: dict[str, Any], now: Optional[float] = None) -> dict[str, Any]:
 
 
 class KeyStore:
+    """Every change is a read-modify-write of one list: one lock for all of them, so a usage flush cannot
+    write back a key that was revoked a moment earlier."""
+
     def __init__(self, store: Any):
         self.store = store
+        self._lock = threading.RLock()
 
     def records(self) -> list[dict[str, Any]]:
         return list(self.store.kv_get(KEYS) or [])
 
     def _save(self, records: list[dict[str, Any]]) -> None:
         self.store.kv_set(KEYS, records)
+        self.store.kv_set(MANAGED, True)
+
+    def managed(self) -> bool:
+        return bool(self.store.kv_get(MANAGED)) or bool(self.records())
 
     def migrate(self, legacy_key: Optional[str]) -> bool:
-        """0.6's single key becomes the named key "default" (once; only while there are no named keys)."""
-        if self.records() or not legacy_key:
-            return False
-        self._save([{"id": "default", "name": "default", "app": None, "prefix": legacy_key[:6],
-                     "sha256": digest(legacy_key), "aliases": [], "created_at": time.time(),
-                     "expires_at": None, "revoked_at": None, "last_used_at": None, "migrated": True}])
-        return True
+        """0.6's single key becomes the named key "default" — once. A deleted "default" never returns."""
+        with self._lock:
+            if self.managed():
+                self.store.kv_set(MANAGED, True)
+                return False
+            if not legacy_key:
+                return False
+            self._save([{"id": "default", "name": "default", "app": None, "prefix": legacy_key[:6],
+                         "sha256": digest(legacy_key), "aliases": [], "created_at": time.time(),
+                         "expires_at": None, "revoked_at": None, "last_used_at": None, "migrated": True}])
+            return True
 
     def create(self, name: str, *, aliases: Optional[list[str]] = None, expires_in_days: Optional[int] = None,
                app: Optional[str] = None) -> tuple[str, dict[str, Any]]:
@@ -69,49 +86,54 @@ class KeyStore:
             raise ValueError("aliases: letters, digits and . _ : - (up to 63)")
         if expires_in_days is not None and not 1 <= expires_in_days <= 3650:
             raise ValueError("expires_in_days must be between 1 and 3650")
-        records = self.records()
-        if len([r for r in records if not r.get("revoked_at")]) >= 200:
-            raise ValueError("200 active keys at most: revoke some first")
-        token = PREFIX + secrets.token_urlsafe(32)
-        now = time.time()
-        rec = {"id": "key-" + secrets.token_hex(5), "name": name.strip(), "app": (app or None) and str(app)[:40],
-               "prefix": token[:10], "sha256": digest(token), "aliases": aliases, "created_at": now,
-               "expires_at": now + expires_in_days * 86400 if expires_in_days else None,
-               "revoked_at": None, "last_used_at": None}
-        self._save(records + [rec])
-        return token, rec
+        with self._lock:
+            records = self.records()
+            if len([r for r in records if not r.get("revoked_at")]) >= 200:
+                raise ValueError("200 active keys at most: revoke some first")
+            token = PREFIX + secrets.token_urlsafe(32)
+            now = time.time()
+            rec = {"id": "key-" + secrets.token_hex(5), "name": name.strip(),
+                   "app": (app or None) and str(app)[:40], "prefix": token[:10], "sha256": digest(token),
+                   "aliases": aliases, "created_at": now,
+                   "expires_at": now + expires_in_days * 86400 if expires_in_days else None,
+                   "revoked_at": None, "last_used_at": None}
+            self._save(records + [rec])
+            return token, rec
 
     def revoke(self, key_id: str) -> dict[str, Any]:
-        records = self.records()
-        for r in records:
-            if r["id"] == key_id:
-                if not r.get("revoked_at"):
-                    r["revoked_at"] = time.time()
-                    self._save(records)
-                return r
-        raise KeyError(key_id)
+        with self._lock:
+            records = self.records()
+            for r in records:
+                if r["id"] == key_id:
+                    if not r.get("revoked_at"):
+                        r["revoked_at"] = time.time()
+                        self._save(records)
+                    return r
+            raise KeyError(key_id)
 
     def delete(self, key_id: str) -> None:
         """Only a revoked or expired key can be deleted (its usage stays in the totals)."""
-        records = self.records()
-        rec = next((r for r in records if r["id"] == key_id), None)
-        if rec is None:
-            raise KeyError(key_id)
-        if public(rec)["state"] == "active":
-            raise ValueError("revoke the key before deleting it")
-        self._save([r for r in records if r["id"] != key_id])
+        with self._lock:
+            records = self.records()
+            rec = next((r for r in records if r["id"] == key_id), None)
+            if rec is None:
+                raise KeyError(key_id)
+            if public(rec)["state"] == "active":
+                raise ValueError("revoke the key before deleting it")
+            self._save([r for r in records if r["id"] != key_id])
 
     def touch(self, last_used: dict[str, float]) -> bool:
         """Remember when keys were last used; written at most once a minute per key."""
-        records, changed = self.records(), False
-        for r in records:
-            t = last_used.get(r["id"])
-            if t and (not r.get("last_used_at") or t - r["last_used_at"] >= 60):
-                r["last_used_at"] = t
-                changed = True
-        if changed:
-            self._save(records)
-        return changed
+        with self._lock:
+            records, changed = self.records(), False
+            for r in records:
+                t = last_used.get(r["id"])
+                if t and (not r.get("last_used_at") or t - r["last_used_at"] >= 60):
+                    r["last_used_at"] = t
+                    changed = True
+            if changed:
+                self._save(records)
+            return changed
 
 
 class Usage:

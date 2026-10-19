@@ -173,3 +173,63 @@ def test_tsm_keys_and_usage(monkeypatch, capsys):
     assert "revoked" in capsys.readouterr().out
     cli.main(["usage", "--days", "7"])
     assert "laptop" in capsys.readouterr().out
+
+
+async def test_a_revoked_and_deleted_default_key_never_comes_back(cluster, controller_config):
+    """The review's case: revoke the migrated key (it leaked), delete it, restart — 0.6's key stays dead and
+    the gateway does not fall back to its keyless loopback mode either."""
+    from twinspark.controller.controller import Controller
+    c = cluster.controller
+    assert c.gateway.authenticate("Bearer client-key")["id"] == "default"
+    c.revoke_key("default")
+    assert c.gateway.authenticate("Bearer client-key") is None
+    c.delete_key("default")
+    assert c.keys.records() == []
+    assert c.gateway.authenticate("Bearer client-key") is None              # straight after the delete
+    assert c.gateway.authenticate(None) is None and c.gateway.requires_key()   # and not open
+    again = Controller(controller_config, Gateway("client-key", "backend-key"), store=c.store)
+    assert again.keys.records() == []                                     # a restart does not re-migrate
+    assert again.gateway.authenticate("Bearer client-key") is None and again.gateway.authenticate(None) is None
+
+
+def test_a_keyless_loopback_gateway_stays_keyed_once_a_key_existed(tmp_path):
+    from twinspark.controller.store import Store
+    store = Store(str(tmp_path / "s.db"))
+    ks, gw = KeyStore(store), Gateway(None)
+    assert not ks.migrate(None) and gw.authenticate(None)["id"] == "open"    # never had a key: open (loopback)
+    token, rec = ks.create("app")
+    ks.revoke(rec["id"])
+    ks.delete(rec["id"])
+    gw.set_keys(ks.records(), managed=ks.managed())
+    assert ks.records() == [] and gw.authenticate(None) is None            # deleting the last key does not open it
+
+
+def test_a_revocation_is_not_lost_to_a_usage_flush(tmp_path):
+    """touch() reads the records, an API thread revokes, touch() writes: the revocation must survive."""
+    import threading
+
+    from twinspark.controller.store import Store
+    ks = KeyStore(Store(str(tmp_path / "s.db")))
+    token, rec = ks.create("app")
+    read, go = threading.Event(), threading.Event()
+    original = ks.records
+
+    def slow_records():
+        out = original()
+        if threading.current_thread().name == "flush":
+            read.set()
+            go.wait(5)
+        return out
+    ks.records = slow_records
+    flush = threading.Thread(name="flush", target=ks.touch, args=({rec["id"]: time.time()},))
+    flush.start()
+    assert read.wait(5)
+    revoker = threading.Thread(target=ks.revoke, args=(rec["id"],))
+    revoker.start()
+    time.sleep(0.2)                       # the revocation waits for the flush instead of interleaving with it
+    go.set()
+    flush.join(5)
+    revoker.join(5)
+    ks.records = original
+    (r,) = ks.records()
+    assert r["revoked_at"] and r["last_used_at"]

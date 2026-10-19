@@ -22,7 +22,9 @@ The same on the **Keys & usage** page, and `GET/POST /api/v1/keys`, `POST /api/v
 `DELETE /api/v1/keys/{id}` (revoked or expired only), `GET /api/v1/usage?days=30[&format=csv]`.
 
 - The single key of 0.6 (`inference_api_key` in the vault) became the key **default** on the first start of
-  0.7, so apps configured with it keep working. Revoke it once every app has its own.
+  0.7, so apps configured with it keep working. Revoke it once every app has its own: from then on 0.6's
+  key does not work again, also not after a restart, and deleting the last key leaves the gateway closed
+  rather than open.
 - A key limited to aliases sees only those in `/v1/models`; any other alias answers `403`.
 - **Hermes** gets its own key: the workstation client asks node A for "Hermes on <computer>" the first time
   it configures Hermes, keeps it in its credential store, and makes a new one if it was revoked.
@@ -56,7 +58,8 @@ to
   set separately (`tsm gateway fallback-key`, kept in the vault slot `fallback_api_key`). The cluster's own
   keys are never sent there.
 
-Responses from a fallback carry `X-TwinSpark-Fallback: alias:<name>` or `external`. The drain of the
+An external endpoint must use https (plain http only to `localhost`, for a local proxy): its key and the
+prompts travel there. Responses from a fallback carry `X-TwinSpark-Fallback: alias:<name>` or `external`. The drain of the
 switching alias does not wait for requests that went to the fallback. The same applies while the watchdog
 has marked an alias down.
 
