@@ -1,0 +1,34 @@
+name: Recipe report
+description: A recipe worked, failed, or needed changes on your Sparks
+labels: [recipe]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The client can send these automatically (Cookbook → Report, opt-in, previewed). This form is for
+        reports by hand, or for a recipe that is not in the catalog yet.
+  - type: input
+    id: recipe
+    attributes:
+      label: Recipe
+      placeholder: "glm-5.3-flash-nvfp4-tp2"
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options: [Started and served, Started after changes, Failed to start, Started but misbehaved]
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: "Topology, image digest, model commit, driver version — `tsm validation export <profile>` prints all of it."
+      render: text
+  - type: textarea
+    id: changes
+    attributes:
+      label: What you changed (if anything) and results
+      description: Flags, context, KV dtype, speculative settings; tokens/s or a `tsm bench` result if you have one.

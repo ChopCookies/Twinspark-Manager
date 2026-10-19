@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import re
 from contextlib import asynccontextmanager
 
 import httpx
@@ -244,6 +246,22 @@ async def test_backend_close_error_still_releases_agent_stream():
         assert gateway.routes["default"].errors == 1
 
 
+@contextlib.contextmanager
+def read_error(match: str | None = None):
+    """httpx.ReadError from a stream the gateway broke off. Starlette before 0.39 delivers it wrapped in an
+    ExceptionGroup (its task group); newer versions raise it as it is. Both are the same outcome."""
+    with pytest.raises((httpx.ReadError, BaseExceptionGroup)) as info:
+        yield
+    exc: BaseException = info.value
+    while isinstance(exc, BaseExceptionGroup):
+        group = exc.subgroup(lambda e: isinstance(e, httpx.ReadError))
+        assert group is not None, info.value
+        exc = group.exceptions[0]
+    assert isinstance(exc, httpx.ReadError)
+    if match:
+        assert re.search(match, str(exc)), str(exc)
+
+
 async def test_broken_tool_stream_is_not_reported_as_successful_end_of_stream():
     class InterruptedStream(Chunks):
         async def __aiter__(self):
@@ -256,7 +274,7 @@ async def test_broken_tool_stream_is_not_reported_as_successful_end_of_stream():
         return response(headers={"content-type": "text/event-stream"}, stream=stream)
 
     async with gateway_client(backend) as (gateway, client):
-        with pytest.raises(httpx.ReadError):
+        with read_error():
             await client.post("/v1/chat/completions", json={"model": "coder", "stream": True})
         assert stream.closed and gateway.routes["coder"].inflight == 0
         assert gateway.routes["coder"].errors == 1
@@ -350,7 +368,7 @@ async def test_probe_sse_cap_aborts_transfer_without_buffering_the_complete_stre
         return response(headers={"content-type": "text/event-stream"}, stream=stream)
 
     async with gateway_client(backend, max_response_bytes=32) as (gateway, client):
-        with pytest.raises(httpx.ReadError, match="size limit"):
+        with read_error("size limit"):
             await client.post("/v1/chat/completions", json={"model": "coder", "stream": True})
         assert stream.consumed == 2 and stream.closed
         assert gateway.routes["coder"].inflight == 0

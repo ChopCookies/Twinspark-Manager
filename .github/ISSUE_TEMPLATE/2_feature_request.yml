@@ -1,0 +1,21 @@
+name: Feature request
+description: Something TwinSpark should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem first, then the idea. Two Sparks, one Spark, or the workstation client?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+  - type: checkboxes
+    id: lean
+    attributes:
+      label: Footprint on the Sparks
+      options:
+        - label: This could run on the workstation client instead of on the Sparks

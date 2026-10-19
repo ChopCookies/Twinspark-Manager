@@ -202,6 +202,21 @@ def fit(name: str, revision: Optional[str] = None, ctrl: Controller = Depends(co
         raise HTTPException(404, str(e))
 
 
+@router.get("/{name}/validation")
+def validation_record(name: str, revision: Optional[str] = None, job: Optional[str] = None,
+                      format: str = "json", ctrl: Controller = Depends(controller_dep)):
+    """What was tested, with what, and what came out: a record a third party can reproduce from."""
+    from fastapi.responses import PlainTextResponse
+
+    from ..controller.validation import build_record, to_markdown
+    _profile(ctrl, name)
+    try:
+        rec = build_record(ctrl, name, revision, job)
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from None
+    return PlainTextResponse(to_markdown(rec), media_type="text/markdown") if format == "markdown" else rec
+
+
 # ---- transparency (spec §2.4) ------------------------------------------------
 @router.get("/{name}/revisions/{ref}/effective")
 def effective_config(name: str, ref: str, ctrl: Controller = Depends(controller_dep)):

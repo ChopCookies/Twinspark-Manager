@@ -1,0 +1,56 @@
+name: Bug report
+description: Something TwinSpark did wrong or not at all
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please remove host names, addresses and keys from anything you paste
+        (`tsm remote bundle` output is redacted, but read it first).
+  - type: input
+    id: version
+    attributes:
+      label: TwinSpark version
+      description: "`tsm --version` on node A (and on the client, if you use `tsm client`)"
+      placeholder: "tsm 0.7.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it happen?
+      options:
+        - On the Sparks (controller, agents, gateway)
+        - Workstation client (tsm client)
+        - Web GUI
+        - CLI
+        - Installer / setup
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Runtime mode
+      options: [live (real containers), dry-run, tsm demo]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Steps to reproduce if you have them.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`tsm doctor` output"
+      description: On node A. It checks both nodes.
+      render: text
+  - type: textarea
+    id: job
+    attributes:
+      label: Job or log excerpt
+      description: "For a failed switch: `tsm job <id>` (it shows the first error of each rank)."
+      render: text

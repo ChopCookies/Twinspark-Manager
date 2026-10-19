@@ -200,3 +200,45 @@ async def test_a_completed_dry_run_activation_records_nothing_but_still_plans(cl
     m = Measurements(c.store)
     assert m.startup(rev.draft, rev.identity, "A") is None and m.kv(rev.draft, rev.identity, "A") is None
     assert c.profile_fit("glm")["fingerprinted"] is True
+
+
+# ---- validation records (§1.4) ------------------------------------------------------------------------------
+async def test_a_validation_record_reconstructs_the_tested_combination(cluster):
+    import httpx
+
+    from twinspark.controller.app import create_app
+    c = cluster.controller
+    _setup(c)
+    c.create_profile(draft("glm", Topology.TP2))
+    from twinspark.controller.validation import build_record, to_markdown
+    rec = build_record(c, "glm")
+    assert rec["evidence"]["class"] == "none" and rec["procedure"] is None
+    job = await cluster.wait_job((await c.activate("glm")).job_id)
+    rec = build_record(c, "glm")
+    assert rec["format"] == "twinspark-validation/1"
+    assert rec["evidence"]["class"] == "dry-run"                # simulated containers prove the plan only
+    part = rec["deployment"]["parts"][0]
+    assert part["model_revision"] == SHA and part["image_digest"].startswith("sha256:") and part["topology"] == "tp2"
+    assert {"A", "B"} == set(rec["nodes"]) and all("agent_version" in f for f in rec["nodes"].values())
+    assert rec["procedure"]["job_id"] == job.job_id and rec["procedure"]["state"] == "completed"
+    assert [s["stage"] for s in rec["procedure"]["stages"]][-1] == "healthy"
+    commands = rec["deployment"]["commands"]
+    assert commands and all("vllm" in " ".join(x["command"]) for x in commands)
+    md = to_markdown(rec)
+    assert "dry-run" in md and "| Topology | tp2 on A, B |" in md
+    app = create_app(c, management_key="mk", run_startup=False, background=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://m",
+                                 headers={"x-api-key": "mk"}) as api:
+        r = await api.get("/api/v1/profiles/glm/validation")
+        assert r.status_code == 200 and r.json()["revision"]["profile"] == "glm"
+        r = await api.get("/api/v1/profiles/glm/validation", params={"format": "markdown"})
+        assert r.headers["content-type"].startswith("text/markdown") and "### glm" in r.text
+        assert (await api.get("/api/v1/profiles/glm/validation", params={"job": "nope"})).status_code == 404
+
+
+def test_records_leave_out_addresses_and_user_names():
+    from twinspark.controller.validation import _scrub
+    assert _scrub("--master-addr=10.0.0.1") == "--master-addr=<address>"
+    assert _scrub("/home/alice/.cache/hf") == "/home/<user>/.cache/hf"
+    assert _scrub("fd00:1:2::5") != "" and "<address>" in _scrub("fe80:0:0:0:1:2:3:4")
+    assert _scrub("--tensor-parallel-size 2") == "--tensor-parallel-size 2"

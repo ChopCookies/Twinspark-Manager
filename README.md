@@ -1,5 +1,7 @@
 # TwinSpark Manager
 
+[![CI](https://github.com/ChopCookies/Twinspark-Manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ChopCookies/Twinspark-Manager/actions/workflows/ci.yml)
+
 One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA DGX Spark
 (GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
 and keep the machines headless.
@@ -308,6 +310,7 @@ before). Update the client with `pipx upgrade twinspark-manager` (a git install:
 - [Monitoring and coordinated maintenance](docs/maintenance.md)
 - [Remote management: terminal, logs, power, Wake-on-LAN, network boot](docs/remote-management.md)
 - [The QSFP link: both interfaces, addresses, MTU, verification](docs/qsfp-link.md)
+- [Validation records and the hardware matrix](docs/validation.md)
 - [Development, testing and the demo harness](docs/development.md)
 - [Security model and known limits](docs/security.md) · [Reporting a vulnerability](SECURITY.md)
 - [Changelog](CHANGELOG.md)

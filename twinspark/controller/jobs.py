@@ -344,9 +344,11 @@ class ActivationCoordinator:
             if len({d for d in drivers.values() if d}) > 1:
                 warnings.append(f"NVIDIA driver differs between nodes {drivers} — mismatched "
                                 f"drivers have cost 2x+ throughput on dual-Spark setups")
-            if multi and self.plan.mods:
-                st = {n: (await self.agent(n).call("mods_status", names=self.plan.mods))["status"]
-                      for n in nodes}
+        if self.plan.mods:
+            st = {n: (await self.agent(n).call("mods_status", names=self.plan.mods))["status"] for n in nodes}
+            # what ran, for the validation record (tsm validation export)
+            job.payload["mods"] = {m: {n: (st[n].get(m) or {}).get("hash") for n in nodes} for m in self.plan.mods}
+            if multi:
                 for m in self.plan.mods:
                     hashes = {st[n][m]["hash"] for n in nodes}
                     if len(hashes) > 1:

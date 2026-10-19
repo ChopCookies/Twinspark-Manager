@@ -280,6 +280,20 @@ def cmd_show(args, api: Api):
               f"({fit['kv_bytes_per_token_source']} KV size){'' if fit['fits'] else '  — DOES NOT FIT'}")
 
 
+def cmd_validation(args, api: Api):
+    params = {k: v for k, v in (("revision", args.revision), ("job", args.job)) if v}
+    if args.markdown:
+        params["format"] = "markdown"
+        text = api("GET", f"/api/v1/profiles/{args.profile}/validation", params=params)   # text/markdown
+    else:
+        text = json.dumps(api("GET", f"/api/v1/profiles/{args.profile}/validation", params=params), indent=2)
+    if args.output:
+        Path(args.output).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        print(f"wrote {args.output}")
+    else:
+        print(text)
+
+
 def cmd_fit(args, api: Api):
     fit = api("GET", f"/api/v1/profiles/{args.profile}/fit")
     if _out(api, fit):
@@ -1143,6 +1157,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("profile")
     s = cmd("fit", cmd_fit, "memory fit and estimated KV pool")
     s.add_argument("profile")
+    v = sub.add_parser("validation", help="validation records: what was tested, with what, and the results")
+    vs = v.add_subparsers(dest="validation_cmd", metavar="<action>", required=True)
+    s = vs.add_parser("export", help="a record of a revision's activation (JSON, or Markdown for docs)")
+    s.set_defaults(fn=cmd_validation)
+    s.add_argument("profile")
+    s.add_argument("--revision", help="revision label or id (default: the pinned one)")
+    s.add_argument("--job", help="a specific activation job (default: the latest completed one)")
+    s.add_argument("--markdown", action="store_true", help="a Markdown table instead of JSON")
+    s.add_argument("-o", "--output", help="write to this file")
     s = cmd("pin", cmd_pin, "resolve the draft to a commit sha + image digest (activatable revision)")
     s.add_argument("profile")
     s.add_argument("--model-ref", help="branch, 40-char sha or org/repo@ref (default: keep / main)")
