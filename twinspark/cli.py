@@ -157,6 +157,8 @@ def cmd_serve(args, api=None):
 
     if args.what == "controller":
         asyncio.run(serve.run_controller(args.config))
+    elif args.what == "gateway":
+        serve.run_gateway(args.config)
     elif args.what == "agent":
         serve.run_agent(args.config)
     elif args.what == "termd":
@@ -193,6 +195,10 @@ def cmd_status(args, api: Api):
                   f"{h.get('label') or h['revision_id']} {_ago(h.get('since'))}{perf}{reason}")
     else:
         print("active    -")
+    gp = st.get("gateway_process") or {}
+    if gp.get("mode") == "standalone":
+        print("gateway   own process, " + (f"applied state {gp.get('applied_version')}" if gp.get("reachable")
+                                          else f"NOT ANSWERING ({gp.get('error') or 'no answer'})"))
     if st.get("current_job"):
         print(f"job       {st['current_job']} (running)")
     if st.get("staging"):
@@ -1113,7 +1119,7 @@ def cmd_hardware(args, api: Api):
 
 # ---- argument parsing -----------------------------------------------------------------------
 def _add_serve_args(s: argparse.ArgumentParser) -> None:
-    s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
+    s.add_argument("what", choices=["controller", "gateway", "agent", "privd", "termd"])
     s.add_argument("--config", help="controller.yaml / agent.yaml")
     s.add_argument("--socket", default="/run/twinspark/privd.sock")
     s.add_argument("--group", default="twinspark")
@@ -1136,8 +1142,8 @@ def _serve_main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="tsm serve", description="run a service (used by systemd)")
     _add_serve_args(p)
     args = p.parse_args(argv)
-    if args.what in ("controller", "agent", "termd") and not args.config:
-        p.error("serve controller|agent|termd needs --config")
+    if args.what in ("controller", "gateway", "agent", "termd") and not args.config:
+        p.error("serve controller|gateway|agent|termd needs --config")
     cmd_serve(args)
     return 0
 
@@ -1296,9 +1302,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_bench, cli_client, cli_gateway, cli_metrics, cli_qsfp, cli_remote, cli_setup
+    from . import cli_bench, cli_client, cli_gateway, cli_keys, cli_metrics, cli_qsfp, cli_remote, cli_setup
     cli_bench.add_parsers(sub, cmd)
     cli_gateway.add_parsers(sub, cmd)
+    cli_keys.add_parsers(sub, cmd)
     cli_metrics.add_parsers(sub, cmd)
     cli_client.add_parsers(sub, cmd)
     cli_setup.add_parsers(sub, cmd)

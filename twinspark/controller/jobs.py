@@ -696,7 +696,7 @@ class ActivationCoordinator:
             self.gateway.cancel_drain(a)
             st = self.gateway.routes.get(a)
             if st is not None and not st.backends and st.inflight == 0:
-                self.gateway.routes.pop(a, None)
+                self.gateway.remove_route(a)
         self.drained = []
         return "routing " + ", ".join(self.plan.routes)
 

@@ -14,14 +14,18 @@ it to the served name of whatever revision currently backs the alias.
   get a clean 503 instead of a proxy error.
 * A *fallback* per alias (another alias, or an external OpenAI-compatible endpoint) answers while the
   alias is switching or down; such responses carry ``X-TwinSpark-Fallback``.
+* *Named keys* (master plan §4.1): one per app, each limited to aliases, expirable and revocable. Only
+  SHA-256 hashes are kept here. Tokens per key and alias are counted per day (``take_usage``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import hashlib
 import itertools
 import math
+import secrets as _secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -68,6 +72,7 @@ class RouteState:
     backend_nodes: dict = field(default_factory=dict)              # backend URL -> node (for weights)
     _per_backend: dict = field(default_factory=dict, repr=False)   # backend URL -> requests in flight
     _credit: dict = field(default_factory=dict, repr=False)        # smooth weighted round robin
+    _remote: Optional[dict] = field(default=None, repr=False)      # a standalone gateway's report (state.py)
 
     def __post_init__(self) -> None:
         self._idle.set()
@@ -147,7 +152,7 @@ class RouteState:
 
     def oldest_inflight_s(self) -> Optional[float]:
         if not self._active:
-            return None
+            return (self._remote or {}).get("oldest")
         return round(time.monotonic() - min(self._active.values()), 1)
 
     def to_payload(self) -> dict:
@@ -158,7 +163,8 @@ class RouteState:
                 "errors": self.errors, "last_error": self.last_error,
                 "max_model_len": self.max_model_len, "down_reason": self.down_reason,
                 "backends": len(self.backends), "since": self.since,
-                "backend_inflight": {self.backend_nodes.get(b) or b: n for b, n in self._per_backend.items()}}
+                "backend_inflight": (self._remote or {}).get("backend_inflight") or
+                {self.backend_nodes.get(b) or b: n for b, n in self._per_backend.items()}}
 
 
 class Gateway:
@@ -176,10 +182,26 @@ class Gateway:
                                          "fallbacks": {}}
         self.fallback_api_key: Optional[str] = None
         self.fallback_routes: dict[str, RouteState] = {}     # external fallbacks, one per alias
+        # named keys by SHA-256 of the token; while there are none, inference_api_key alone is accepted
+        self.keys: dict[str, dict[str, Any]] = {}
+        # TwinSpark's own checks through the in-process gateway (compatibility, smoke): never leaves the process
+        self.internal_token = _secrets.token_urlsafe(32)
+        self.usage: dict[tuple[str, str, str], dict[str, int]] = {}   # (day, key id, alias) -> counters
+        self.last_used: dict[str, float] = {}
+        # standalone gateway (state.GatewayLink): every change is published; the process reports back
+        self.on_change = None
+        self.remote = False
+        self.remote_ok = False
+        self.published_version = 0
+        self.remote_version = 0
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10, read=1800, write=60, pool=10),
             limits=httpx.Limits(max_connections=512, max_keepalive_connections=64),
         )
+
+    def _changed(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
 
     # ---- controller-facing -------------------------------------------------
     def configure(self, settings: dict[str, Any], fallback_api_key: Optional[str] = None) -> None:
@@ -193,6 +215,7 @@ class Gateway:
         self.fallback_routes = {a: st for a, st in self.fallback_routes.items()
                                 if (self.settings["fallbacks"].get(a) or {}).get("url") and
                                 st.backends == [_external_base(self.settings["fallbacks"][a]["url"])]}
+        self._changed()
 
     def set_route(self, alias: str, backends: list[str], served_model: str,
                   revision_id: Optional[str] = None, max_model_len: Optional[int] = None,
@@ -208,35 +231,61 @@ class Gateway:
         st.down_reason = None
         st.since = time.time()
         st._down_until.clear()
+        self._changed()
 
     def begin_drain(self, alias: str, retry_after: int = 10) -> None:
         st = self.routes.setdefault(alias, RouteState(alias))
         st.draining = True
         st.retry_after = retry_after
+        self._changed()
 
     def cancel_drain(self, alias: str) -> None:
-        if alias in self.routes:
+        if alias in self.routes and self.routes[alias].draining:
             self.routes[alias].draining = False
+            self._changed()
 
     def mark_down(self, alias: str, reason: str, retry_after: int = 30) -> None:
         if alias in self.routes:
+            changed = self.routes[alias].down_reason != reason
             self.routes[alias].down_reason = reason
             self.routes[alias].retry_after = retry_after
+            if changed:
+                self._changed()
 
     def mark_up(self, alias: str) -> None:
-        if alias in self.routes:
+        if alias in self.routes and self.routes[alias].down_reason is not None:
             self.routes[alias].down_reason = None
+            self._changed()
+
+    def remove_route(self, alias: str) -> None:
+        if self.routes.pop(alias, None) is not None:
+            self._changed()
+
+    def _unacknowledged(self) -> bool:
+        """A standalone gateway has not applied the last published state yet (it may still accept requests the
+        new state would refuse). A gateway that does not answer has nothing in flight."""
+        return self.remote and self.remote_ok and self.remote_version < self.published_version
 
     def inflight(self, aliases: list[str]) -> tuple[int, Optional[float]]:
         """(requests in flight, seconds the oldest of them has been running) over ``aliases``."""
         sts = [self.routes[a] for a in aliases if a in self.routes]
         oldest = [s.oldest_inflight_s() for s in sts]
         oldest = [o for o in oldest if o is not None]
-        return sum(s.inflight for s in sts), (max(oldest) if oldest else None)
+        busy = sum(s.inflight for s in sts)
+        if self._unacknowledged():
+            busy = max(busy, 1)
+        return busy, (max(oldest) if oldest else None)
 
     async def wait_idle(self, alias: str, timeout: float) -> bool:
         """True if all in-flight requests on ``alias`` finished within ``timeout``."""
         st = self.routes.get(alias)
+        if self.remote:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if self.inflight([alias])[0] == 0:
+                    return True
+                await asyncio.sleep(0.25)
+            return self.inflight([alias])[0] == 0
         if st is None or st.inflight == 0:
             return True
         try:
@@ -253,16 +302,66 @@ class Gateway:
             st.revision_id = None
             st.max_model_len = None
             st.down_reason = None
+            self._changed()
 
     def aliases_for_revision_prefix(self, profile_name: str) -> list[str]:
         return [a for a, st in self.routes.items() if st.served_model == profile_name]
 
-    # ---- request handling ----------------------------------------------------
-    def check_key(self, authorization: Optional[str]) -> bool:
-        if self.inference_api_key is None:
-            return True
+    # ---- keys and usage (master plan §4.1) ------------------------------------
+    def set_keys(self, records: list[dict[str, Any]]) -> None:
+        """The named keys (``{id, sha256, aliases, expires_at, revoked_at, …}``; never a secret)."""
+        self.keys = {r["sha256"]: dict(r) for r in records if r.get("sha256")}
+        self._changed()
+
+    def authenticate(self, authorization: Optional[str]) -> Optional[dict[str, Any]]:
+        """The key a request uses, or None (401). Without any key configured the gateway is open (only allowed
+        on a loopback listener; serve.py refuses otherwise)."""
+        if self.inference_api_key is None and not self.keys:
+            return {"id": "open", "aliases": []}
         scheme, _, token = (authorization or "").partition(" ")
-        return scheme.lower() == "bearer" and tokens_equal(token.strip(), self.inference_api_key)
+        token = token.strip()
+        if scheme.lower() != "bearer" or not token:
+            return None
+        if tokens_equal(token, self.internal_token):
+            return {"id": "internal", "aliases": []}
+        rec = self.keys.get(hashlib.sha256(token.encode("utf-8", "surrogatepass")).hexdigest())
+        if rec is not None:
+            now = time.time()
+            if rec.get("revoked_at") or (rec.get("expires_at") and rec["expires_at"] <= now):
+                return None
+            return rec
+        if not self.keys and self.inference_api_key and tokens_equal(token, self.inference_api_key):
+            return {"id": "default", "aliases": []}
+        return None
+
+    def check_key(self, authorization: Optional[str]) -> bool:
+        return self.authenticate(authorization) is not None
+
+    @staticmethod
+    def allows(key: dict[str, Any], alias: str) -> bool:
+        return not key.get("aliases") or alias in key["aliases"]
+
+    def record_usage(self, key_id: str, alias: str, prompt: int, completion: int, estimated: bool) -> None:
+        if key_id in ("internal",):
+            return
+        day = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+        row = self.usage.setdefault((day, key_id, alias), {"requests": 0, "prompt_tokens": 0,
+                                                           "completion_tokens": 0, "estimated_requests": 0})
+        row["requests"] += 1
+        row["prompt_tokens"] += max(0, int(prompt))
+        row["completion_tokens"] += max(0, int(completion))
+        row["estimated_requests"] += int(bool(estimated))
+        self.last_used[key_id] = time.time()
+
+    def take_usage(self) -> dict[str, Any]:
+        """Counters since the last call (the controller adds them to its daily totals), and when each key was
+        last used."""
+        rows = [{"day": d, "key_id": k, "alias": a, **v} for (d, k, a), v in self.usage.items()]
+        out = {"rows": rows, "last_used": dict(self.last_used)}
+        self.usage, self.last_used = {}, {}
+        return out
+
+    # ---- request handling ----------------------------------------------------
 
     def resolve(self, model: Optional[str]) -> Optional[RouteState]:
         if model is not None and not isinstance(model, str):

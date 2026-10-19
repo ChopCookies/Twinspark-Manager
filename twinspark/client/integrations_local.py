@@ -15,6 +15,7 @@ the management key is passed as a forbidden value so a wrong paste is refused.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -44,7 +45,41 @@ def _ssh_host(session: ClientSession) -> SSHHost:
     return SSHHost(run, label=f"node A ({conn.host})")
 
 
-async def endpoint_for(session: ClientSession, host: str, alias: Optional[str]) -> Endpoint:
+_APP_KEY = {"workstation": "hermes_key", "node-a": "hermes_node_key"}
+
+
+async def app_key(session: ClientSession, host: str) -> Optional[str]:
+    """Hermes's own key (master plan §4.1): created once on node A as "Hermes on <computer>" and kept in this
+    client's credential store, so it can be revoked without touching any other app. Falls back to the
+    shared inference key when node A predates named keys or cannot create one."""
+    import platform
+
+    conn = session.current
+    slot = _APP_KEY.get(host)
+    if conn is None or slot is None:
+        return session.inference_key()
+    stored = session.creds.get(conn.id, slot)
+    try:
+        r = await session.node_request("GET", "/api/v1/keys", timeout=15)
+    except ConnectionError:
+        return stored.partition(":")[2] if stored else session.inference_key()
+    if r.status_code != 200:                      # an older node A: one shared key
+        return session.inference_key()
+    active = {k.get("id") for k in r.json() if isinstance(k, dict) and k.get("state") == "active"}
+    if stored and stored.partition(":")[0] in active:
+        return stored.partition(":")[2]
+    where = "node A" if host == "node-a" else (re.sub(r"[^\w.-]", "", platform.node())[:40] or "this computer")
+    made = await session.node_request("POST", "/api/v1/keys", json={"name": f"Hermes on {where}", "app": "hermes"},
+                                      timeout=15)
+    if made.status_code != 201:
+        return session.inference_key()
+    doc = made.json()
+    session.creds.set(conn.id, slot, f"{doc['id']}:{doc['key']}")
+    return doc["key"]
+
+
+async def endpoint_for(session: ClientSession, host: str, alias: Optional[str], *,
+                       for_app: bool = False) -> Endpoint:
     """The endpoint for ``alias`` as an app on ``host`` reaches it, with the deployed context limit."""
     try:
         models = await session.models()
@@ -72,7 +107,8 @@ async def endpoint_for(session: ClientSession, host: str, alias: Optional[str]) 
     else:
         base = session.gateway_url() or ""
         source = "workstation-forward" if session.current and session.current.uses_ssh else "tailnet"
-    return Endpoint(base_url=base, alias=alias, api_key=session.inference_key(),
+    key = await app_key(session, host) if for_app else session.inference_key()
+    return Endpoint(base_url=base, alias=alias, api_key=key,
                     context_length=ctx if isinstance(ctx, int) else None,
                     revision_id=meta.get("revision_id"), served_model=m.get("root"), source=source)
 
@@ -115,7 +151,7 @@ def add_integration_routes(app: FastAPI, session: ClientSession, connected: Call
         ep = None
         if session.phase == "connected":
             try:
-                ep = await endpoint_for(session, req.host, req.alias)
+                ep = await endpoint_for(session, req.host, req.alias, for_app=True)
             except HTTPException:
                 ep = None                       # status still shows what is installed and running
         st = await guarded(adapter(req).status(ep, log_lines=req.lines))
@@ -123,13 +159,13 @@ def add_integration_routes(app: FastAPI, session: ClientSession, connected: Call
 
     @app.post("/api/v1/client/integrations/hermes/inspect")
     async def hermes_inspect(req: AdapterIn):
-        ep = await endpoint_for(session, req.host, req.alias) if session.phase == "connected" else None
+        ep = await endpoint_for(session, req.host, req.alias, for_app=True) if session.phase == "connected" else None
         return await guarded(adapter(req).inspect(ep))
 
     @app.post("/api/v1/client/integrations/hermes/preview")
     async def hermes_preview(req: AdapterIn):
         connected()
-        ep = await endpoint_for(session, req.host, req.alias)
+        ep = await endpoint_for(session, req.host, req.alias, for_app=True)
         return {"preview": await guarded(adapter(req).preview(ep)), "endpoint": ep.to_dict()}
 
     @app.post("/api/v1/client/integrations/hermes/apply")
@@ -137,13 +173,13 @@ def add_integration_routes(app: FastAPI, session: ClientSession, connected: Call
         connected()
         if not req.token:
             raise HTTPException(422, "apply needs the token of the preview you reviewed")
-        ep = await endpoint_for(session, req.host, req.alias)
+        ep = await endpoint_for(session, req.host, req.alias, for_app=True)
         return await guarded(adapter(req).apply(ep, req.token))
 
     @app.post("/api/v1/client/integrations/hermes/validate")
     async def hermes_validate(req: AdapterIn):
         connected()
-        ep = await endpoint_for(session, req.host, req.alias)
+        ep = await endpoint_for(session, req.host, req.alias, for_app=True)
         return {"checks": await guarded(adapter(req).validate(ep)), "endpoint": ep.to_dict()}
 
     @app.post("/api/v1/client/integrations/hermes/launch")

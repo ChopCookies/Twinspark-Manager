@@ -26,7 +26,7 @@ function page(responses = {}) {
     window: { addEventListener() {} },
     document: { addEventListener() {}, querySelector: element, title: "" },
   });
-  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "client.js"]) {
+  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "keys.js", "client.js"]) {
     vm.runInContext(fs.readFileSync(path.join(JS, file), "utf8"), context, { filename: file });
   }
   return { element, requests, run: code => vm.runInContext(code, context) };
@@ -146,4 +146,21 @@ test("the dashboard says how requests are routed and what answers while switchin
   assert.match(html, /\(&lt;m&gt;\)/);
   assert.match(html, /data-act="routing"/);
   assert.equal(p.run("routingHtml(undefined)"), "");
+});
+
+test("the keys page shows state and aliases, never more than the prefix", () => {
+  const p = page();
+  const html = p.run(`keysTable([{ id: "default", name: "default", prefix: "abc123", aliases: [], state: "active", migrated: true, created_at: 1 },
+    { id: "key-1", name: "<laptop>", app: "openclaw", prefix: "tsk_abcdef", aliases: ["coder"], state: "revoked", created_at: 1 }])`);
+  assert.match(html, /the key from before 0.7/);
+  assert.match(html, /data-act="key-revoke" data-id="default" data-name="default" data-migrated="1"/);
+  assert.match(html, /&lt;laptop&gt;/);
+  assert.match(html, /data-act="key-delete" data-id="key-1"/);
+  assert.match(html, /tsk_abcdef…/);
+  const u = p.run(`usageHtml({ names: { "key-1": "laptop" }, rows: [
+    { day: "2026-10-18", key_id: "key-1", alias: "coder", requests: 2, prompt_tokens: 100, completion_tokens: 50, estimated_requests: 1 },
+    { day: "2026-10-19", key_id: "key-1", alias: "coder", requests: 1, prompt_tokens: 10, completion_tokens: 5, estimated_requests: 0 }] })`);
+  assert.match(u, /<td>laptop<\/td><td class="mono">coder<\/td><td class="num">3<\/td><td class="num">110<\/td><td class="num">55/);
+  assert.match(u, /1 estimated/);
+  assert.match(p.run("usageHtml({ rows: [] })"), /No requests/);
 });

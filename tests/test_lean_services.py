@@ -136,3 +136,12 @@ def test_no_test_module_defines_a_nose_style_setup_or_teardown_function():
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name in ("setup", "teardown", "setup_module", "teardown_module")]
     assert bad == []
+
+
+def test_the_standalone_gateway_stays_small():
+    """`tsm serve gateway` serves the endpoint without the controller, FastAPI or pydantic (master plan §3.2)."""
+    mods = _modules_after("import twinspark.gateway.standalone, twinspark.gateway.state, twinspark.serve as s\n"
+                          "s.run_gateway\n")
+    for heavy in ("fastapi", "pydantic", "twinspark.controller.controller", "twinspark.schemas.config",
+                  "twinspark.cookbook", "twinspark.controller.app"):
+        assert heavy not in mods, f"the gateway imports {heavy}"

@@ -1,5 +1,5 @@
 [Unit]
-Description=TwinSpark controller + stable gateway
+Description=TwinSpark controller (management API, GUI; and the gateway unless gateway_mode is standalone)
 After=network-online.target twinspark-agent.service
 Wants=network-online.target twinspark-agent.service
 

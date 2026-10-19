@@ -72,6 +72,12 @@ def build_servers(config_path: str, seed=None,
     if seed:
         seed(controller)
     mgmt = _server(create_app(controller, mgmt_key), cfg.listener, log_level)
+    if cfg.gateway_mode == "standalone":
+        # the gateway is its own service: publish to it instead of serving it (gateway/state.py)
+        from .gateway.state import GatewayLink
+        controller.gateway_link = GatewayLink(controller.gateway, cfg.gateway_state_path, cfg.gateway_control_socket)
+        controller.gateway_link.attach()
+        return controller, mgmt, None
     gw = _server(build_gateway_app(controller.gateway), cfg.gateway_listener, log_level)
     return controller, mgmt, gw
 
@@ -79,7 +85,13 @@ def build_servers(config_path: str, seed=None,
 async def run_controller(config_path: str) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     _, mgmt, gw = build_servers(config_path)
-    await asyncio.gather(mgmt.serve(), gw.serve())
+    await asyncio.gather(mgmt.serve(), *([gw.serve()] if gw is not None else []))
+
+
+def run_gateway(config_path: str) -> None:
+    """The standalone gateway (``gateway_mode: standalone``): no controller, FastAPI or pydantic in here."""
+    from .gateway.standalone import run
+    asyncio.run(run(config_path))
 
 
 def build_agent_server(config_path: str, log_level: str = "info") -> "uvicorn.Server":

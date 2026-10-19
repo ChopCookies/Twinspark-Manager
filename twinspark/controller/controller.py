@@ -98,6 +98,7 @@ class Controller:
         self.current_job: Optional[str] = None
         self.busy_profile: Optional[str] = None      # profile named by the running activation/prepare
         self.current_scope: Optional[dict] = None    # the halves the running switch touches (None = all)
+        self.gateway_link = None                     # gateway.state.GatewayLink with gateway_mode: standalone
         self.sampler = MetricsSampler()
         self.half_samplers: dict[str, MetricsSampler] = {}   # split deployments: one per half (node)
         self.history = MetricsHistory(self.store)             # minute averages, 24 h, kept across restarts
@@ -111,7 +112,41 @@ class Controller:
         self.remote = RemoteService(self)
         self.watch_state: dict[str, Any] = {"unhealthy_streak": 0, "recoveries": [], "last": None}
         self._apply_gateway_settings()
+        # named inference keys (master plan §4.1): 0.6's single key becomes the key "default"
+        from .keys import KeyStore, Usage
+        self.keys, self.usage = KeyStore(self.store), Usage(self.store)
+        if self.keys.migrate(self.gateway.inference_api_key):
+            self._audit("system", "keys.migrate", "keys/default", {"from": "inference_api_key"})
+        self.gateway.set_keys(self.keys.records())
         self._audit("system", "controller.init", "controller", {})
+
+    # ---- named keys and usage (master plan §4.1) ---------------------------------
+    def create_key(self, name: str, *, aliases: Optional[list[str]] = None, expires_in_days: Optional[int] = None,
+                   app: Optional[str] = None) -> tuple[str, dict]:
+        token, rec = self.keys.create(name, aliases=aliases, expires_in_days=expires_in_days, app=app)
+        self.gateway.set_keys(self.keys.records())
+        self._audit("user", "keys.create", f"keys/{rec['id']}", {"name": rec["name"], "aliases": rec["aliases"],
+                                                               "app": rec["app"], "expires_at": rec["expires_at"]})
+        return token, rec
+
+    def revoke_key(self, key_id: str) -> dict:
+        rec = self.keys.revoke(key_id)
+        self.gateway.set_keys(self.keys.records())
+        self._audit("user", "keys.revoke", f"keys/{key_id}", {"name": rec["name"]})
+        return rec
+
+    def delete_key(self, key_id: str) -> None:
+        self.keys.delete(key_id)
+        self.gateway.set_keys(self.keys.records())
+        self._audit("user", "keys.delete", f"keys/{key_id}", {})
+
+    def flush_usage(self) -> None:
+        """Move the gateway's counters into the daily totals (each metrics tick and at shutdown)."""
+        u = self.gateway.take_usage()
+        if u["rows"]:
+            self.usage.add(u["rows"])
+        if u["last_used"] and self.keys.touch(u["last_used"]):
+            self.gateway.set_keys(self.keys.records())
 
     # ---- gateway routing settings (master plan §3.3) ------------------------------
     def gateway_settings(self) -> GatewaySettings:
@@ -503,6 +538,7 @@ class Controller:
             "routes": [st.to_payload() for st in self.gateway.routes.values()],
             "halves": self.halves_status(),
             "gateway": {k: self.gateway.settings.get(k) for k in ("balance", "affinity", "weights", "fallbacks")},
+            "gateway_process": self.gateway_link.status() if self.gateway_link is not None else {"mode": "in-process"},
             # what the running switch touches: a client measuring another half's alias is not disturbed
             "switch": None if not (self.busy() and self.current_job) else {
                 "job": self.current_job, "nodes": (self.current_scope or {}).get("nodes"),
@@ -995,6 +1031,8 @@ class Controller:
         """Start-up without an interrupted switch: re-attach what still runs, autostart otherwise."""
         active = self.active()
         if not active:
+            for alias in list(self.gateway.routes):  # a standalone gateway may still route a stopped model
+                self.gateway.remove_route(alias)
             return None
         await self._wait_for_agents(self.config.startup_wait_s)
         if self.busy() or self.active() != active:
@@ -1088,6 +1126,8 @@ class Controller:
     def start_background(self) -> None:
         if self._background:
             return
+        if self.gateway_link is not None:
+            self.gateway_link.start()
         if self.config.watchdog.enabled:
             self._background.append(asyncio.create_task(self._watchdog_loop()))
         self._background.append(asyncio.create_task(self._metrics_loop()))
@@ -1207,6 +1247,10 @@ class Controller:
                 log.exception("metrics tick failed")
 
     async def metrics_tick(self, refresh_nodes: bool = True) -> Optional[dict]:
+        try:
+            self.flush_usage()
+        except Exception:  # noqa: BLE001 - usage is bookkeeping: never stop the metrics loop
+            log.exception("usage could not be saved")
         if refresh_nodes:
             async def sample_node(name, agent):
                 try:
@@ -1407,7 +1451,14 @@ class Controller:
         return await remove_mod(self, name)
 
     async def aclose(self) -> None:
+        if self.gateway_link is not None:
+            await self.gateway_link.poll()          # the last usage counters before the controller stops
+            await self.gateway_link.stop()
         self.history.flush()
+        try:
+            self.flush_usage()
+        except Exception:  # noqa: BLE001
+            log.exception("usage could not be saved at shutdown")
         for t in self._background + list(self._tasks):
             t.cancel()
         self._background = []

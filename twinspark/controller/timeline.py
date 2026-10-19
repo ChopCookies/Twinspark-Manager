@@ -112,7 +112,8 @@ def summarize(samples: list[dict], marks: list[dict]) -> dict[str, Any]:
             ts = float(start["t"])
             before = [a for a in avail if a[0] <= ts + 1e-6]
             after = [a for a in avail if a[0] >= ts - 1e-6]
-            base = before[-1] if before else (after[0] if after else None)
+            # by time, not by list order: a sample can arrive after a later one
+            base = max(before, key=lambda a: a[0]) if before else (min(after, key=lambda a: a[0]) if after else None)
             if base is not None and after:
                 low = min(after, key=lambda x: x[1])
                 # what this deployment took at the startup's lowest point, relative to just before it started

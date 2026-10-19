@@ -45,12 +45,14 @@ LAZY_ROUTERS: dict[str, str] = {
     "/api/v1/integrations": "twinspark.api.routes_integrations",
     "/api/v1/benchmarks": "twinspark.api.routes_benchmarks",
     "/metrics": "twinspark.api.routes_metrics",
+    "/api/v1/keys": "twinspark.api.routes_keys",
+    "/api/v1/usage": "twinspark.api.routes_keys",
 }
 # what this node API offers, for the client's version/capability handshake
 CAPABILITIES = ("activation-request-id", "expected-active", "activation-journal", "startup-timeline",
                 "memory-plan-v2", "node-memory", "lazy-rich-routes", "socket-terminal",
                 "measurement-fingerprints", "drain-policy", "validation-record", "benchmarks",
-                "split-halves", "prometheus-metrics", "gateway-routing")
+                "split-halves", "prometheus-metrics", "gateway-routing", "named-keys")
 
 
 def _clean(value: object, limit: int) -> str:

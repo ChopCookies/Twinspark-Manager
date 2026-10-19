@@ -9,7 +9,8 @@ tunnel itself. It is not designed to face the internet.
 | Component | Listens on | Authenticated by | Can do |
 |---|---|---|---|
 | Web GUI / management API | node A `127.0.0.1:8443` | management key (`tsm init --show`) | everything below |
-| Gateway (OpenAI API) | node A `:8000` | inference key | chat/completions only |
+| Gateway (OpenAI API) | node A `:8000` (its own process with `gateway_mode: standalone`) | a named inference key per app (only its SHA-256 hash is kept), optionally limited to aliases and expiring | chat/completions and the other inference endpoints, for its aliases |
+| Prometheus export | node A management port, `GET /metrics` | the read-only metrics key (`tsm prometheus key`) or the management key | read the metrics, nothing else |
 | Agent | node A `127.0.0.1:9443`, node B QSFP address | per-cluster bearer token | a fixed list of typed actions |
 | `tsm-privd` | Unix socket, root | socket permissions | allowlisted root operations (drop page cache, headless switch, maintenance reboot) and — only when `remote-policy.json` allows — reboot, power-off, boot-next, Wake-on-LAN |
 | `tsm-termd` (opt-in) | same address as the agent, node port 9444 (systemd socket; the process starts on the first connection and exits after 15 idle minutes) | agent bearer token, plus a one-time ticket from the controller for browsers | a recorded shell as the service user |
@@ -92,8 +93,10 @@ own API — otherwise any web page you visit could use it as a confused deputy:
   log, and only to the host whose key was confirmed. The client then uses its own ed25519 key.
 - API keys are kept in the OS keychain when `keyring` works, otherwise in `credentials.json` (0600) in
   the client's folder (0700). The management key never leaves the client: the GUI cannot read it
-  back, and agent-app configuration only ever receives the inference key (the management key is
-  refused if pasted there).
+  back, and agent-app configuration only ever receives an inference key (the management key is
+  refused if pasted there). Hermes gets a key of its own, so it can be revoked alone.
+- Keys sent elsewhere: an external fallback endpoint gets only its own key (`fallback_api_key`), never the
+  cluster's keys; the gateway's state file holds key hashes, never a key.
 - Reading the keys over SSH runs `tsm init --show` as the SSH user; `sudo -n` only when the user asks.
   Output is parsed in memory and never logged.
 

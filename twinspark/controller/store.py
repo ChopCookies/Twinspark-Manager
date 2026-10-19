@@ -133,6 +133,17 @@ class Store:
         row = self.conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         return json.loads(row["value"]) if row else default
 
+    @_locked
+    def kv_keys(self, prefix: str) -> list[str]:
+        like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self.conn.execute("SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\' ORDER BY key", (like,)).fetchall()
+        return [r["key"] for r in rows]
+
+    @_locked
+    def kv_delete(self, key: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM kv WHERE key=?", (key,))
+
     # ---- backups (spec §39) ------------------------------------------------
     @_locked
     def backup(self, dest: str | Path) -> Path:

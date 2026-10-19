@@ -500,3 +500,24 @@ def test_a_hugging_face_home_this_user_cannot_read_is_skipped_not_a_crash(tmp_pa
     monkeypatch.setattr(Path, "is_dir", is_dir)
     (out,) = hostprobe.hf_cache_candidates(home=str(locked), env={})
     assert out["exists"] is None and out["readable"] is False
+
+
+def test_a_new_install_runs_the_gateway_on_its_own_and_a_kept_06_config_does_not(tmp_path):
+    """Two processes must never compete for the gateway port: the unit follows what controller.yaml says."""
+    lay = Layout(tmp_path / "root")
+    a = answers_a(tmp_path)
+    p = Provisioner(a, lay, systemd=False)
+    p.apply()
+    assert "gateway_mode: standalone" in lay.controller_yaml.read_text()
+    gw = (lay.systemd / "twinspark-gateway.service").read_text()
+    assert "serve gateway --config" in gw and "RuntimeDirectory=twinspark-gateway" in gw
+    c = load_config(lay.controller_yaml, ControllerConfig)
+    assert c.gateway_mode == "standalone" and c.gateway_state_path.endswith("gateway-state.json")
+    # a 0.6 controller.yaml (no gateway_mode) is kept: no gateway unit, the controller serves it
+    old = tmp_path / "old"
+    lay2 = Layout(old)
+    lay2.controller_yaml.parent.mkdir(parents=True)
+    text = provision.render_controller_yaml(a, lay2).replace("gateway_mode: standalone\n", "")
+    lay2.controller_yaml.write_text(text)
+    Provisioner(answers_a(tmp_path), lay2, systemd=False).apply()
+    assert not (lay2.systemd / "twinspark-gateway.service").exists()

@@ -43,7 +43,7 @@ function page({ hash = "", responses = {} } = {}) {
     window: { addEventListener() {} },
     document: { addEventListener() {}, querySelector: element, title: "" },
   });
-  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "client.js"]) {
+  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "keys.js", "client.js"]) {
     vm.runInContext(fs.readFileSync(path.join(JS, file), "utf8"), context, { filename: file });
   }
   return { context, element, storage, requests, loc, run: code => vm.runInContext(code, context) };

@@ -221,6 +221,7 @@ tsm bench run max-throughput   # peak tokens/s and the knee, through the gateway
 sudo tsm prometheus key        # read-only scrape key for /metrics (docs/metrics.md)
 tsm activate duo --half B      # split profiles: restart only node B's model; A keeps serving
 tsm gateway set --fallback default=alias:secondary   # answer from another alias while switching
+tsm keys create "OpenClaw" --alias coder   # one key per app (shown once); tsm usage: tokens per key
 tsm link --mode rdma           # QSFP / NCCL link test (both nodes must be live, not dry-run)
 tsm rdma --apply               # write discovered RoCE devices into controller.yaml
 tsm qsfp status                # QSFP link on THIS node: both twins, addresses, MTU, RoCE (docs/qsfp-link.md)
@@ -317,7 +318,7 @@ before). Update the client with `pipx upgrade twinspark-manager` (a git install:
 - [Validation records and the hardware matrix](docs/validation.md)
 - [Benchmarks: throughput, latency targets, context and quality, compared per revision](docs/benchmarks.md)
 - [Metrics: Prometheus export, Grafana dashboard, 24-hour history](docs/metrics.md)
-- [The gateway: session affinity, least in flight, weights, fallbacks while switching](docs/gateway.md)
+- [The gateway: one key per app and usage, routing, fallbacks while switching, its own process](docs/gateway.md)
 - [Engines (vLLM, SGLang) and the image check before a switch](docs/engines.md)
 - [Development, testing and the demo harness](docs/development.md)
 - [Security model and known limits](docs/security.md) · [Reporting a vulnerability](SECURITY.md)

@@ -99,7 +99,7 @@ class DemoCluster:
                       vllm_port=free_port(), runtime_mode="dry-run", peer_ssh_user=user)
         a = Answers(role="controller", node_id="A", hostname="demo-a", qsfp_iface="lo", qsfp_ip="127.0.0.1",
                     peer_ip="127.0.0.2", peer_iface="lo", hf_cache_dir=str(self.base / "node-a" / "hf"),
-                    docker_group=False,
+                    docker_group=False, gateway_mode="in-process",
                     **common)
         a.agent_port = self.agent_port
         pa = Provisioner(a, self.a_layout, systemd=False)

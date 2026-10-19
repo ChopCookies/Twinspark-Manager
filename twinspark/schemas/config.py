@@ -285,6 +285,11 @@ class ControllerConfig(BaseModel):
     secrets_dir: str = "/etc/twinspark/secrets"
     listener: Listener = Field(default_factory=lambda: Listener(bind="127.0.0.1", port=8443))
     gateway_listener: Listener = Field(default_factory=lambda: Listener(bind="0.0.0.0", port=8000))
+    # standalone: the gateway runs as its own service (twinspark-gateway.service), so a controller restart
+    # keeps running streams (master plan §3.2); in-process: 0.6's single process. See docs/gateway.md.
+    gateway_mode: Literal["in-process", "standalone"] = "in-process"
+    gateway_state_path: str = "/var/lib/twinspark/gateway-state.json"
+    gateway_control_socket: str = "/run/twinspark-gateway/control.sock"
     nodes: dict[str, NodeEndpoint] = Field(default_factory=dict)   # {"A": ..., "B": ...}
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     autostart: bool = True                  # re-activate the last healthy revision at boot
