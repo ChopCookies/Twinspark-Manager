@@ -37,7 +37,10 @@ jobs:
           pip list
       - name: pytest
         # no hardware: dry-run agents, loopback servers, fake host tools; browser tests skip without Chromium
-        run: PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rs
+        run: PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider -rs --junitxml=pytest.xml
+      - name: Failures as annotations
+        if: failure()
+        run: python scripts/ci_annotate.py pytest.xml
 
   web:
     name: GUI tests
