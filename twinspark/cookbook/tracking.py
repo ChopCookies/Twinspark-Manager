@@ -22,7 +22,12 @@ def record_import(draft: ProfileDraft, text: str, ref: str | None, fmt: str,
                "format": fmt, "overrides": copy.deepcopy(overrides or {}), "baseline": settings(draft)}
     if metadata is not None:
         receipt["metadata_sha256"] = hashlib.sha256(metadata.encode("utf-8")).hexdigest()
-    return draft.model_copy(update={"source": {**draft.source, "receipt": receipt}}, deep=True)
+    source = {**draft.source, "receipt": receipt}
+    if source.get("kv_bytes_per_token") and not overrides and not isinstance(source.get("kv_measured_with"), dict):
+        # the recipe's KV size is true for the settings it ships with; a later edit of them invalidates it
+        from ..controller.measurements import kv_settings
+        source["kv_measured_with"] = kv_settings(draft)
+    return draft.model_copy(update={"source": source}, deep=True)
 
 
 _MISSING = object()

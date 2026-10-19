@@ -16,6 +16,7 @@ from ..schemas.job import Job, JobStep
 from ..schemas.profile import ProfileRevision
 from .agent_client import AgentActionError, AgentClient
 from .launch import LaunchError, LaunchPlan, LaunchPlanner
+from .measurements import Measurements, kv_memory_from_log, resolve_kv
 from .planner import MemoryPlanner, ModelSpec
 from .staging import StageError, WeightsStager
 from .timeline import STAGES as TIMELINE_STAGES
@@ -63,6 +64,9 @@ def kv_facts_from_log(text: str) -> dict:
     if m:
         out["max_concurrency"] = float(m.group(2))
         out["max_concurrency_at_tokens"] = int(m.group(1).replace(",", ""))
+    pool = kv_memory_from_log(text)
+    if pool is not None:
+        out["kv_memory_gib"] = pool          # with the token count: the KV bytes per token as served
     return out
 
 
@@ -93,6 +97,7 @@ class ActivationCoordinator:
         # Where a successful start's observed startup peak is kept for the planner. The controller hands
         # over its bound ``_persist``; until it passes ``store=`` itself, its store is taken from there.
         self.store = store if store is not None else getattr(getattr(persist, "__self__", None), "store", None)
+        self.measurements = Measurements(self.store) if self.store is not None else None
         self.timeline: Optional[StartupTimeline] = None
 
     def agent(self, node: str) -> AgentClient:
@@ -124,8 +129,32 @@ class ActivationCoordinator:
             await self._timeline_failed()
             raise
         if stage == ActivationStage.HEALTHY:
-            await self._timeline_success(job, rev)
+            summaries = await self._timeline_success(job, rev)
+            self._record_measurements(job, rev, summaries or {})
         return message
+
+    def _record_measurements(self, job: Job, rev: ProfileRevision, summaries: dict) -> None:
+        """Keep what this start measured under the fingerprint of its settings (controller.measurements):
+        the KV bytes per token vLLM's pool implies and each node's startup footprint. Simulated (dry-run)
+        readings are not kept: they would calibrate real plans with invented numbers."""
+        if self.measurements is None or self.dry_run:
+            return
+        try:
+            for part in rev.parts():
+                nodes = part.required_nodes()
+                model = (self.plan.route_models or {}).get(part.draft.simple.api_alias) if self.plan else None
+                kv = (((job.payload.get("models") or {}).get(model) or {}).get("kv")
+                      or (job.payload.get("kv") if not rev.draft.secondary else None) or {})
+                self.measurements.record_kv(part.draft, part.identity, nodes, kv, revision_id=rev.revision_id,
+                                            job_id=job.job_id)
+                for n in nodes:
+                    summary = summaries.get(n) if isinstance(summaries.get(n), dict) else None
+                    if summary and not summary.get("simulated"):
+                        self.measurements.record_startup(part.draft, part.identity, n, summary,
+                                                         revision_id=rev.revision_id, job_id=job.job_id,
+                                                         kv_tokens=kv.get("kv_cache_tokens"))
+        except Exception:  # noqa: BLE001 - a measurement must never fail the activation
+            log.exception("could not keep this start's measurements")
 
     # ---- startup memory timeline (best effort: never fails the activation) ------------------------
     async def _timeline_mark(self, job: Job, rev: ProfileRevision, stage: ActivationStage) -> None:
@@ -156,9 +185,9 @@ class ActivationCoordinator:
         except Exception:  # noqa: BLE001
             log.exception("startup timeline could not be stopped")
 
-    async def _timeline_success(self, job: Job, rev: ProfileRevision) -> None:
+    async def _timeline_success(self, job: Job, rev: ProfileRevision) -> Optional[dict]:
         if self.timeline is None:
-            return
+            return None
         try:
             summaries = await self.timeline.finish_success()
             if summaries:
@@ -168,10 +197,12 @@ class ActivationCoordinator:
                     # its own key: the revision's observed:{id} record is rewritten when the job completes
                     self.store.kv_set(f"observed_startup:{rev.revision_id}", obs)
             self.persist(job)
+            return obs["nodes"] if summaries else None
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.exception("startup timeline could not be kept")
+            return None
 
     # ---- helpers -------------------------------------------------------------
     def _models(self, rev: ProfileRevision):
@@ -199,8 +230,10 @@ class ActivationCoordinator:
             mem_total = min(totals) if totals else job.payload.get("mem_total_gib")
             util = self._util(part, mem_total)
             if spec is not None:
-                if rev.draft.secondary:
-                    spec = replace(spec, kv_bytes_per_token=part.draft.source.get("kv_bytes_per_token"))
+                # the KV size of exactly this setup: never one that another profile of the model measured
+                kvb, kv_src, kv_note = resolve_kv(self.measurements, part.draft, part.identity, nodes[0])
+                spec = replace(spec, kv_bytes_per_token=kvb)
+                job.payload.setdefault("kv_sources", {})[part.profile_name] = {"source": kv_src, "note": kv_note}
                 if s.topology.value in ("tp2", "tp-ep") and spec.num_attention_heads % 2:
                     raise RuntimeError(f"{part.profile_name}: {spec.num_attention_heads} attention heads "
                                        "cannot split over TP2 — use pp2 or a single node")
@@ -255,19 +288,22 @@ class ActivationCoordinator:
         hardware facts the controller saw. Empty when the store is not available."""
         if self.store is None:
             return {}
+        from .controller import load_model_spec
         from .planner import drafter_inputs
 
-        def lookup(repo: str) -> Optional[ModelSpec]:
-            d = self.store.kv_get(f"model_spec:{repo}")
-            return ModelSpec(**{k: v for k, v in d.items() if k in ModelSpec.__dataclass_fields__}) if d else None
         s, a = part.draft.simple, part.draft.advanced
         try:
-            drafters = drafter_inputs(a, lookup)
+            drafters = drafter_inputs(a, lambda repo: load_model_spec(self.store, repo))
             out = {}
             for n in nodes:
                 facts = self.store.kv_get(f"hardware:{n}") or {}
+                kvb, kv_src, kv_note = resolve_kv(self.measurements, part.draft, part.identity, n)
+                cal = self.measurements.startup(part.draft, part.identity, n) if self.measurements else None
                 plan = self.planner.plan_node(
-                    spec=spec, quant=s.quantization, context_length=s.planning_context(),
+                    spec=replace(spec, kv_bytes_per_token=kvb), kv_source=(kv_src, kv_note),
+                    observed={"nodes": {n: cal}, "at": cal["at"]} if cal else None,
+                    observed_kv_tokens=cal.get("kv_tokens") if cal else None,
+                    quant=s.quantization, context_length=s.planning_context(),
                     concurrency=a.max_num_seqs or s.concurrency, topology=s.topology, node_id=n,
                     backend="ray" if self.launch.resolve_backend(part).value == "ray" else "native",
                     kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode, gpu_memory_utilization=util,

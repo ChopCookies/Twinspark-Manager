@@ -43,6 +43,33 @@ A dry-run node's readings come from the simulation host, not from a Spark, so th
 estimates. The TwinSpark units it reports are simulated values marked `"simulated": true`. Other
 processes stay unknown.
 
+## Measurements belong to their settings (0.7)
+
+A measurement is only true for the setup it was made with. Each one is stored under a fingerprint of
+what it depends on, and a fingerprint that does not match counts as "no measurement":
+
+| Measurement | Fingerprint covers | Not in it (so it is reused) |
+|---|---|---|
+| KV bytes per token, per node (vLLM's KV pool GiB ÷ its token count) | model commit, image digest, engine, KV cache dtype, topology, block size, attention backend, KV-related flags and environment, speculative decoding setup, node | context length, concurrency |
+| Startup footprint, per node (the startup timeline) | everything above, plus context length, concurrency, batched tokens, chunked prefill, `gpu_memory_utilization`, eager mode, quantization, distributed backend, extra models, mods | — |
+
+The KV size a plan uses comes from, in order:
+
+1. a measurement of exactly this setup on that node;
+2. the recipe's own number, if the draft still has the settings the recipe measured it with. Imports
+   since 0.7 record those settings; changing, say, the KV dtype from fp8 to bf16 drops the recipe's
+   number, and the plan says why;
+3. the textbook formula, labelled estimated.
+
+Model specs (architecture and weight size) are stored per repository **and commit**. They never carry a
+KV size any more, and one that 0.6 left on a shared spec is ignored. Pinning or rolling back one
+profile never changes another profile's forecast.
+
+Calibrations survive a controller restart (they are in its database). A startup calibration uses the
+worst footprint seen among up to 10 starts of the same settings, plus 0.5 GiB while there are fewer
+than three; the plan shows how many starts back it, their median and spread (`calibration` in
+`/fit`). Dry-run starts are never recorded.
+
 ## Buckets and formulas
 
 Resident before vLLM starts (from the node's last `hardware_facts`):

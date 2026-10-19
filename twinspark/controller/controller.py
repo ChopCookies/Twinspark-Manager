@@ -24,6 +24,7 @@ from ..schemas.profile import _NAME_RE, ImmutableIdentity, Profile, ProfileDraft
 from .agent_client import AgentActionError, AgentClient
 from .jobs import ActivationCoordinator
 from .launch import LaunchPlan, LaunchPlanner
+from .measurements import Measurements, resolve_kv
 from .planner import MemoryPlanner, ModelSpec
 from .state_machine import StageFailed
 from .store import Store
@@ -49,6 +50,17 @@ class BusyError(RuntimeError):
     """Another activation/stop is running."""
 
 
+
+def load_model_spec(store, repo: str, sha: Optional[str] = None) -> Optional[ModelSpec]:
+    """The registered spec of ``repo`` at commit ``sha`` (else the latest registered one). A KV size
+    stored on a spec by 0.6 is dropped: it belonged to one profile's settings, not to the model."""
+    d = (store.kv_get(f"model_spec:{repo}@{sha}") if sha else None) or store.kv_get(f"model_spec:{repo}")
+    if not d:
+        return None
+    fields = set(ModelSpec.__dataclass_fields__) - {"kv_bytes_per_token"}
+    return ModelSpec(**{k: v for k, v in d.items() if k in fields})
+
+
 class Controller:
     """Owns state, coordination and the desired-state loop for one cluster.
 
@@ -63,6 +75,7 @@ class Controller:
         self.gateway = gateway
         self.store = store or Store(config.db_path)
         self.planner = MemoryPlanner()
+        self.measurements = Measurements(self.store)      # fingerprinted KV sizes and startup calibrations
         self.planner.mem_total_provider = self._mem_total
         self.agents: dict[str, AgentClient] = dict(agents or {})
         self.poll_interval = poll_interval
@@ -231,14 +244,16 @@ class Controller:
             self.store.kv_set(f"observed:{revision_id}", merged)
 
     # ---- model specs for the memory planner ------------------------------------
-    def set_model_spec(self, repo: str, spec: ModelSpec) -> None:
-        self.store.kv_set(f"model_spec:{repo}", spec.__dict__)
+    def set_model_spec(self, repo: str, spec: ModelSpec, sha: Optional[str] = None) -> None:
+        """Architecture and weight size of ``repo`` (at commit ``sha``). Never a KV measurement: those are
+        kept per experiment (controller.measurements), not per repository."""
+        doc = {**spec.__dict__, "kv_bytes_per_token": None}
+        if sha:
+            self.store.kv_set(f"model_spec:{repo}@{sha}", doc)
+        self.store.kv_set(f"model_spec:{repo}", doc)          # the latest registered, for unpinned drafts
 
-    def model_spec(self, repo: str) -> Optional[ModelSpec]:
-        d = self.store.kv_get(f"model_spec:{repo}")
-        if not d:
-            return None
-        return ModelSpec(**{k: v for k, v in d.items() if k in ModelSpec.__dataclass_fields__})
+    def model_spec(self, repo: str, sha: Optional[str] = None) -> Optional[ModelSpec]:
+        return load_model_spec(self.store, repo, sha)
 
     def profile_fit(self, name: str, ref: Optional[str] = None) -> dict[str, Any]:
         """Will this profile fit, and roughly how many KV tokens does it leave?
@@ -263,8 +278,11 @@ class Controller:
         same = obs_rev is not None and (rev is not None or obs_rev.draft == d)
         observed = self.store.kv_get(f"observed:{obs_rev.revision_id}") if obs_rev is not None else None
         startup_obs = self.store.kv_get(f"observed_startup:{obs_rev.revision_id}") if same else None
+        # the pinned identity the measurements are keyed by: a working draft that differs has none yet
+        identity = rev.identity if rev else (d.identity if d.identity is not None else
+                                             (obs_rev.identity if same and obs_rev is not None else None))
         if d.secondary:
-            fits = {node: self._draft_fit(part, [node], recipe_kv=True, observed_startup=startup_obs)
+            fits = {node: self._draft_fit(part, [node], identity=part.identity, legacy_startup=startup_obs)
                     for node, part in zip(("A", "B"), d.parts(), strict=True)}
             out = {"profile": name, "topology": "split", "nodes": fits,
                    "known": all(f["known"] for f in fits.values()),
@@ -273,8 +291,8 @@ class Controller:
                 out["observed"] = {**(observed or {}), "startup": startup_obs}
             return out
         kv_tokens = ((observed or {}).get("kv") or {}).get("kv_cache_tokens") if same else None
-        out = self._draft_fit(d, rev.required_nodes() if rev else None, observed_startup=startup_obs,
-                              observed_kv_tokens=kv_tokens if isinstance(kv_tokens, int) else None)
+        out = self._draft_fit(d, rev.required_nodes() if rev else None, identity=identity, legacy_startup=startup_obs,
+                              legacy_kv_tokens=kv_tokens if isinstance(kv_tokens, int) else None)
         out["profile"] = name
         if obs_rev is not None:
             obs = dict(observed) if isinstance(observed, dict) else None
@@ -283,37 +301,45 @@ class Controller:
             out["observed"] = obs
         return out
 
-    def _draft_fit(self, d: ProfileDraft, nodes=None, recipe_kv=False, *,
-                   observed_startup: Optional[dict] = None, observed_kv_tokens: Optional[int] = None) -> dict:
+    def _draft_fit(self, d: ProfileDraft, nodes=None, *, identity=None, legacy_startup: Optional[dict] = None,
+                   legacy_kv_tokens: Optional[int] = None) -> dict:
+        """``identity`` keys the measurements (controller.measurements); ``legacy_*`` are the 0.6 per-revision
+        observations, used only when no measurement of these exact settings exists yet."""
         from .planner import drafter_inputs
         s, a = d.simple, d.advanced
         out = {"model": s.model, "known": False}
-        spec = self.model_spec(s.model)
+        spec = self.model_spec(s.model, identity.model_revision if identity is not None else None)
         if spec is None:
             out["note"] = "model size unknown — pin the profile (or Resolve the model) first"
             return out
-        if recipe_kv:
-            spec = replace(spec, kv_bytes_per_token=d.source.get("kv_bytes_per_token"))
+        if nodes is None:
+            t = s.topology.value
+            nodes = ["A"] if t == "single-a" else ["B"] if t == "single-b" else ["A", "B"]
+        kv = {n: resolve_kv(self.measurements, d, identity, n) for n in nodes}
+        cal = {n: self.measurements.startup(d, identity, n) for n in nodes}
+        spec = replace(spec, kv_bytes_per_token=kv[nodes[0]][0])
         ctx, conc = s.planning_context(), a.max_num_seqs or s.concurrency
         budget = self.planner.estimate(spec=spec, quant=s.quantization, context_length=ctx,
                                        concurrency=conc, topology=s.topology,
                                        kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
                                        mem_total_gib=self._mem_total(nodes))
         util = a.gpu_memory_utilization or self.planner.gpu_memory_utilization(budget)
-        if nodes is None:
-            t = s.topology.value
-            nodes = ["A"] if t == "single-a" else ["B"] if t == "single-b" else ["A", "B"]
         drafters = drafter_inputs(a, self.model_spec)
         backend = "ray" if str(getattr(d.distributed_backend, "value", d.distributed_backend)) == "ray" else "native"
         plans = {}
         for n in nodes:
             facts = self.store.kv_get(f"hardware:{n}") or {}
+            if cal[n]:
+                observed, kv_tokens = {"nodes": {n: cal[n]}, "at": cal[n]["at"]}, cal[n].get("kv_tokens")
+            else:
+                observed, kv_tokens = legacy_startup, legacy_kv_tokens
             plans[n] = self.planner.plan_node(
-                spec=spec, quant=s.quantization, context_length=ctx, concurrency=conc, topology=s.topology,
+                spec=replace(spec, kv_bytes_per_token=kv[n][0]), kv_source=(kv[n][1], kv[n][2]),
+                quant=s.quantization, context_length=ctx, concurrency=conc, topology=s.topology,
                 node_id=n, backend=backend, kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
                 gpu_memory_utilization=util, facts=facts if isinstance(facts, dict) else {}, drafters=drafters,
                 max_num_batched_tokens=a.max_num_batched_tokens, chunked_prefill=a.chunked_prefill,
-                observed=observed_startup, observed_kv_tokens=observed_kv_tokens)
+                observed=observed, observed_kv_tokens=kv_tokens)
         # the 0.5 keys, now from the per-node plans: the worst node decides
         startup = min((p.startup for p in plans.values()), key=lambda v: v["margin_gib"])
         one = [p.one_context for p in plans.values()]
@@ -345,6 +371,11 @@ class Controller:
             "est_full_context_seqs": min(seqs) if seqs else None,
             "context_length": ctx, "concurrency": conc,
             "kv_bytes_per_token_source": "measured" if spec.kv_bytes_per_token else "formula",
+            "kv_source": {n: {"source": v[1], "note": v[2], "bytes_per_token": v[0]} for n, v in kv.items()},
+            # which measurements back this forecast (shown on the plan): none, or N starts of these exact settings
+            "calibration": {n: ({k: c[k] for k in ("samples", "worst_gib", "median_gib", "spread_gib", "margin_gib",
+                                                   "at")} if c else None) for n, c in cal.items()},
+            "fingerprinted": identity is not None,
             "budget": budget.as_dict(),
             "plan": {n: p.as_dict() for n, p in plans.items()},
             "verdicts": {
@@ -540,8 +571,9 @@ class Controller:
             coord = ActivationCoordinator(
                 config=self.config, agents=self.agents, gateway=self.gateway,
                 planner=self.planner, persist=self._persist,
-                model_spec=self.model_spec(rev.identity.model_repo),
-                model_specs={part.identity.model_repo: self.model_spec(part.identity.model_repo)
+                model_spec=self.model_spec(rev.identity.model_repo, rev.identity.model_revision),
+                model_specs={part.identity.model_repo: self.model_spec(part.identity.model_repo,
+                                                                       part.identity.model_revision)
                              for part in rev.parts()},
                 poll_interval=self.poll_interval, cancel_check=cancel_check,
                 staging_wait=self._staging_wait, store=self.store,
