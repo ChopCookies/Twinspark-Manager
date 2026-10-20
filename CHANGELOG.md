@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.6.0 — 2026-10-16 — a workstation client, lean services on the Sparks
+
+The test of 0.5.0 on two DGX Sparks asked for three things: less TwinSpark on the Sparks, a connection
+that does not depend on a hand-typed SSH tunnel, and memory planning that explains a failed start before
+it happens. This release moves the work that does not need the Sparks to your own computer and keeps the
+deployment where it is.
+
+### The workstation client (`tsm client`)
+
+- **Connect by address.** Install TwinSpark on your computer with pipx (macOS, Windows, Linux), run
+  `tsm client`, add node A's address and SSH user. The client:
+  - shows node A's SSH host key fingerprints and stores only the ones you confirm, in its own
+    `known_hosts` (`StrictHostKeyChecking=yes`; never `no`, and `~/.ssh` is not touched);
+  - logs in with your SSH agent or keys, or installs its own key once with your password (used once,
+    never stored, only sent to the confirmed host);
+  - reads node A's `controller.yaml` and the keys (`tsm init --show`, `sudo -n` only on request, or paste);
+  - keeps `ssh -N -L` forwards for the management API and the gateway up, with keep-alives and a 1–30 s
+    back-off, on stable local ports so apps configured once keep working.
+  Tailscale addresses are recognised (and your tailnet peers listed); a deliberately exposed HTTPS
+  listener can be used directly (plain http only for loopback). [docs/client.md](docs/client.md)
+- **The whole GUI on `127.0.0.1`**, guarded like node A's own API: a per-launch session key handed over in
+  the URL fragment, loopback `Host` only (DNS rebinding), `Origin` checks on state changes. Node A's pages
+  are passed through with the stored management key; a dropped connection shows *Not connected to the
+  Sparks* with a link to the Connection page instead of an error, and a rotated key says so.
+- **Three states, kept apart:** client connected · agents compatible · model ready — in the sidebar and on
+  the Connection page, each with its own fix. A version/capability handshake (`/api/v1/health` now reports
+  `api: 2` and a capability list) tells you which side to update when the client and the Sparks differ.
+- **Work moved off the Sparks:** the cookbook index, community recipe fetching and recipe → profile
+  conversion run on the client; node A receives only the finished profile. Integrations gains **Test from
+  this computer** (chat, streaming and a tool call through the address local apps use).
+- **Hermes lifecycle** on your computer (default) or on node A: detect (including a broken launcher and
+  the working one), five separate states, a previewed diff of `config.yaml` and `.env`, apply with a
+  byte-exact backup and only if the files are unchanged, validate, start/stop/restart its gateway, the
+  exact chat command, restore any backup, disconnect. The context length comes from the deployed model;
+  below Hermes's 64k minimum it is refused. Only the inference key is ever written; the management key
+  is refused. [docs/agent-integrations.md](docs/agent-integrations.md#hermes-agent-lifecycle)
+- **CLI:** `tsm client add | list | remove | connect | env | ports`; `eval "$(tsm client env NAME)"` points
+  the `tsm` CLI at the client's forward.
+
+### Lean services on the Sparks
+
+- Each service imports only what its role needs: the agent and the terminal are plain Starlette,
+  `tsm serve` no longer loads the whole CLI, shared container definitions moved to `twinspark.containers`,
+  and the cookbook and integrations routes load on first use.
+- **The terminal is socket-activated** (`twinspark-terminal.socket`): it uses no memory until someone opens
+  a shell and exits after 15 idle minutes. Status checks ask systemd about the socket instead of connecting
+  to it (which would start the terminal). `sudo tsm remote enable terminal` moves an existing install to it
+  (stopping the always-on 0.5 terminal first).
+- Measured on an x86 dry-run sandbox (unique set size): node A ≈188 → ≈100 MiB, node B ≈134 → ≈49 MiB with
+  the terminal switched on but idle. Provisional budgets: 128 MiB on A, 80 MiB on B.
+  `scripts/measure_memory.py` measures a Spark without touching its services.
+  [docs/memory-planning.md](docs/memory-planning.md#twinsparks-own-footprint)
+
+### Memory planning per node
+
+- Every node is planned on its own, bucket by bucket (OS + Docker, TwinSpark services, desktop, other
+  processes, weights, drafter weights and scratch, first-prefill peak, CUDA graphs, NCCL buffers, loader
+  transient, KV), each with a source — measured,
+  calibrated, estimated or unknown (never counted as 0). Three verdicts per node: **startup peak**, **one
+  max-length request**, **requested concurrency**. A one-rank drafter (`draft_tensor_parallel_size: 1`) is
+  counted on both nodes. `/fit` keeps its 0.5 keys, now derived from the worst node.
+- A start whose estimated startup margin on a node is critical gets a warning in the validating stage.
+- **Startup timeline:** each node samples MemAvailable, MemFree, page cache, swap, PSI and the cgroups of
+  TwinSpark and the deployment once a second from just before the old model stops; every stage is marked.
+  A successful start calibrates the next plan of the same settings; a failed one keeps the timeline in its
+  evidence, drawn on the job page.
+- **Failure classification** of a failed start: container limit, host OOM, driver allocation, RDMA/NCCL,
+  timeout, application exception or unknown, with the evidence for it.
+
+### Activations that survive a lost client or a reboot
+
+- **Idempotent requests:** an activation carries a `request_id`; a retried request (a dropped connection,
+  a double click) returns the same job instead of starting a second switch.
+- **Stale-view check:** the GUI sends the deployment it showed (`expected_active`); if another client changed
+  it meanwhile, the switch is refused with 409 instead of overriding it.
+- **Durable journal:** an accepted switch is recorded before it starts. If the controller restarts in the
+  middle (crash, reboot, power cut), recovery is deterministic: before the old model was touched, nothing
+  changed and it keeps serving; after that, the partial containers are stopped and — with `auto_rollback` —
+  the previous deployment is started again.
+- One writer: while a restarted controller recovers an interrupted switch, a new switch is refused (409)
+  instead of being torn down by the recovery; cancel is refused while a failed start is still cleaning up.
+
+### Compatibility
+
+- Node A still serves the GUI, the API and the CLI as before; SSH tunnels and Tailscale Serve keep working.
+  The client is an additional way in.
+- New optional extra `client` (`keyring`) for keys in the system keychain.
+
+### Needs on-site validation
+
+GB10 memory numbers of the services; the full GLM-5.3 DFlash2 run that calibrates the per-node plan; Hermes
+against a real install; the client on Windows and macOS (including the one-time password key install on
+Windows); the socket-activated terminal on real systemd; the client over Tailscale.
+
 ## 0.5.1 — 2026-10-08 — fixes from the first hardware test
 
 The first test of 0.5.0 on two DGX Sparks found these problems:

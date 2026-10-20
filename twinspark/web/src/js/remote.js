@@ -62,7 +62,8 @@ async function openTerminal(node) {
   try { t = await POST("/api/v1/remote/terminal/ticket", { node, cols: term.cols, rows: term.rows }); }
   catch (e) { term.dispose(); closeTerminal(); throw e; }
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}${t.ws_path}?ticket=${enc(t.ticket)}`);
+  // through the workstation client the socket also carries this tab's session key (a browser cannot set headers)
+  const ws = new WebSocket(`${proto}//${location.host}${t.ws_path}?ticket=${enc(t.ticket)}${S.client ? "&client_key=" + enc(S.key) : ""}`);
   ws.binaryType = "arraybuffer";
   R.ws = ws; R.term = term; R.fit = fit;
   const text = new TextEncoder();
@@ -103,7 +104,7 @@ function remoteStatusHtml(n, ov) {
     body = `<div class="kv"><b>Host</b><span>${esc(n.hostname)}</span><b>Up for</b><span>${esc(remoteDur(n.uptime_s))}</span>
       <b>Kernel</b><span class="mono">${esc(n.kernel)}</span><b>TwinSpark</b><span>${esc(n.version)}</span>
       <b>Privileged helper</b><span>${n.privd ? tag("running", "good") : tag("missing", "bad") + ` <span class="small muted">power, boot and Wake-on-LAN controls need it: sudo systemctl start twinspark-privd</span>`}</span>
-      <b>Terminal service</b><span>${n.terminal_service ? tag("running", "good") : (remoteOn(n, "terminal") ? tag("not running", "bad") + ` <span class="small muted">sudo systemctl enable --now twinspark-terminal</span>` : tag("off", "muted"))}</span>
+      <b>Terminal service</b><span>${n.terminal_service ? tag("ready", "good") : (remoteOn(n, "terminal") ? tag("not listening", "bad") + ` <span class="small muted">sudo tsm remote enable terminal</span>` : tag("off", "muted"))}</span>
       <b>Out-of-band power</b><span>${esc(oob.join(" · ") || "none configured")}</span></div>`;
     if ((n.power_pending || []).length) body += `<div class="callout warn" style="margin-top:12px"><div><b>${esc(n.power_pending.join(", "))} is scheduled.</b> It will happen in a moment — use Cancel below to stop it.</div></div>`;
     if (n.policy && n.policy.error) body += `<div class="callout warn" style="margin-top:12px"><div><b>The remote-management policy on this node is ignored:</b> ${esc(n.policy.error)}. Everything is off until it is fixed.</div></div>`;
@@ -128,7 +129,7 @@ function remoteTerminalHtml(n) {
   const on = remoteOn(n, "terminal");
   return `<div class="card"><div class="card-head"><h2>Terminal</h2>
     <div class="row"><button class="btn primary sm" data-act="term-open" ${on && n.terminal_service ? "" : "disabled"}>Open terminal</button><button class="btn sm hidden" data-act="term-close">Disconnect</button></div></div>
-    ${on ? (n.terminal_service ? "" : `<div class="callout warn"><div>The terminal is switched on but its service is not running. On the node: <span class="mono">sudo systemctl enable --now twinspark-terminal</span></div></div>`)
+    ${on ? (n.terminal_service ? "" : `<div class="callout warn"><div>The terminal is switched on but nothing listens on its port. On the node: <span class="mono">sudo tsm remote enable terminal</span> (it installs the socket that starts the terminal on demand)</div></div>`)
       : `<div class="callout info"><div>The terminal is off on node ${esc(n.node)}. It is a shell as the TwinSpark user, recorded on the node. To allow it, run on that node: <span class="mono">${esc(remoteCmd("terminal"))}</span></div></div>`}
     <p id="r-termstate" class="small muted" role="status"></p>
     <div id="r-termwrap" class="hidden"><div id="r-termbox" class="term-box"></div>

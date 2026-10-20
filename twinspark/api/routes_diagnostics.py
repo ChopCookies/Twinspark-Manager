@@ -12,11 +12,9 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from ..controller import onboarding
 from ..controller.agent_client import AgentActionError
 from ..controller.controller import BusyError, Controller
 from ..metrics import combine_snapshots, scrape_metrics
-from ..resolver import resolve_hf_revision, resolve_image_digest, spec_from_resolved
 from .deps import controller_dep, require_auth
 
 router = APIRouter(prefix="/api/v1/system", tags=["diagnostics"],
@@ -31,6 +29,7 @@ class ResolveRequest(BaseModel):
 @router.post("/resolve")
 async def resolve(req: ResolveRequest, ctrl: Controller = Depends(controller_dep)):
     """Resolve a model ref to its commit sha (+ size/arch) and an image to its digest."""
+    from ..resolver import resolve_hf_revision, resolve_image_digest, spec_from_resolved  # first use only
     try:
         resolved = await asyncio.to_thread(resolve_hf_revision, req.ref, ctrl.hf_token)
         out = {"repo": resolved["repo"], "branch": resolved["branch"],
@@ -58,6 +57,7 @@ async def doctor(ctrl: Controller = Depends(controller_dep)):
 @router.get("/onboarding")
 async def get_started(ctrl: Controller = Depends(controller_dep)):
     """The first-run checklist: what is done, what is next, how to do it."""
+    from ..controller import onboarding  # loaded on first use (the client builds its own)
     return await onboarding.build(ctrl)
 
 

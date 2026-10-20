@@ -213,7 +213,7 @@ async def test_ticket_explains_how_to_turn_the_terminal_on(ctl):
 
 async def test_ticket_explains_a_missing_terminal_service_and_an_unsafe_policy(ctl):
     ctl.agents["B"].answers["remote_status"] = status_answer(service=False)
-    with pytest.raises(RemoteError, match="systemctl enable --now twinspark-terminal"):
+    with pytest.raises(RemoteError, match="sudo tsm remote enable terminal"):
         await ctl.remote.issue_ticket("B")
     st = status_answer(terminal=False)
     st["policy"]["error"] = "policy file is writable by group/other"
@@ -484,7 +484,11 @@ def ports(monkeypatch):
 async def test_reach_ok_when_the_agent_answers(ctl, ports):
     ports.update({80, 22})
     r = await ctl.remote.reach("B")
-    assert r["verdict"] == "ok" and r["agent_answers"] and r["ssh_port_open"] and not r["terminal_port_open"]
+    # the terminal's state comes from the agent: a TCP probe would start a socket-activated terminal
+    assert r["verdict"] == "ok" and r["agent_answers"] and r["ssh_port_open"] and r["terminal_port_open"]
+    ctl.agents["B"].answers["remote_status"] = status_answer(service=False)
+    ports.add(9444)                                       # never probed while the agent can say
+    assert (await ctl.remote.reach("B"))["terminal_port_open"] is False
 
 
 async def test_reach_blames_the_token_when_the_port_is_open_but_the_agent_refuses(ctl, ports):

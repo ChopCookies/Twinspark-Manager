@@ -267,3 +267,26 @@ def test_a_shell_outside_the_privd_group_is_told_to_log_in_again(tmp_path, monke
     monkeypatch.setattr(os, "getgroups", lambda: [os.stat(sock).st_gid])
     with pytest.raises(privd.PrivdUnavailable, match="check the socket's mode"):
         privd.PrivClient(str(sock)).call("status")
+
+
+def test_status_asks_systemd_about_a_socket_activated_terminal_instead_of_connecting(actions, monkeypatch):
+    """A TCP probe of a systemd socket would start the terminal (and keep it for its idle time)."""
+    from twinspark.agent import remote_actions
+    real_connect = remote_actions.socket.create_connection
+    answers = {("is-active", "twinspark-terminal.socket"): (0, "active\n", ""),
+               ("is-failed", "twinspark-terminal.service"): (1, "inactive\n", "")}
+
+    def run(argv, timeout=10):
+        return answers.get(tuple(argv[1:3]), (3, "inactive\n", ""))
+
+    def no_connect(*a, **k):
+        raise AssertionError("the terminal port must not be connected to")
+    monkeypatch.setattr(privops, "RUN", run)
+    monkeypatch.setattr(remote_actions.socket, "create_connection", no_connect)
+    assert actions.registry["remote_status"]({})["terminal_service"] is True
+    answers[("is-failed", "twinspark-terminal.service")] = (0, "failed\n", "")
+    assert actions.registry["remote_status"]({})["terminal_service"] is False
+    # no socket unit (0.5 units, the demo): an always-on terminal is probed over TCP
+    answers.clear()
+    monkeypatch.setattr(remote_actions.socket, "create_connection", real_connect)
+    assert actions.registry["remote_status"]({})["terminal_service"] is False

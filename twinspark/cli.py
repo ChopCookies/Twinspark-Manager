@@ -160,7 +160,7 @@ def cmd_serve(args, api=None):
     elif args.what == "agent":
         serve.run_agent(args.config)
     elif args.what == "termd":
-        serve.run_termd(args.config)
+        serve.run_termd(args.config, idle_exit_s=getattr(args, "idle_exit", 0.0) or 0.0)
     else:
         serve.run_privd(args.socket, args.group, args.remote_policy, not args.unsafe_policy_owner)
 
@@ -444,12 +444,40 @@ def _print_evidence(job: dict) -> None:
     if payload.get("evidence_error"):
         print(f"\n! {payload['evidence_error']}")
     ev = payload.get("startup_evidence") or {}
-    if not ev.get("containers"):
+    if not ev.get("containers") and not ev.get("timeline") and not ev.get("classification"):
         return
-    from .controller.evidence import describe_exit
+    from .controller.evidence import CAUSE_TEXT, describe_exit
     print(f"\n--- startup evidence ({ev.get('profile')} {ev.get('revision_id')}; "
           f"image {', '.join(ev.get('images') or []) or '?'}) ---")
-    for c in ev["containers"]:
+    cls = ev.get("classification") or {}
+    if cls.get("cause"):
+        print(f"  likely cause: {cls['cause']} ({cls.get('confidence', '?')} confidence) — "
+              f"{CAUSE_TEXT.get(cls['cause'], '')}")
+        for line in cls.get("evidence") or []:
+            print(f"    · {line}")
+    for node, t in sorted((ev.get("timeline") or {}).items()):
+        if not isinstance(t, dict):
+            continue
+        if t.get("error"):
+            print(f"  node {node} memory timeline: not recorded ({t['error']})")
+            continue
+        s = t.get("summary") or {}
+        bits = []
+        if s.get("min_mem_available_gib") is not None:
+            bits.append(f"lowest MemAvailable {s['min_mem_available_gib']:.1f} GiB at {s.get('min_at_s', 0):.0f} s"
+                        + (f" ({s['min_stage']})" if s.get("min_stage") else ""))
+        if s.get("footprint_gib") is not None:
+            bits.append(f"the new model took {s['footprint_gib']:.1f} GiB")
+        for key, label in (("peak_swap_out_pps", "swap-out peak {:,.0f} pages/s"),
+                           ("max_psi_full_avg10", "memory pressure peak {:.0f}% (PSI full)")):
+            if s.get(key):
+                bits.append(label.format(s[key]))
+        for e in s.get("oom_events") or []:
+            bits.append(f"{e.get('container')}: oom_kill {e.get('oom_kill')}")
+        sim = ", simulated" if t.get("simulated") else ""
+        print(f"  node {node} memory timeline ({t.get('points', 0)} points{sim}): "
+              + ("; ".join(bits) or "no readings"))
+    for c in ev.get("containers") or []:
         mem = c.get("memory") or {}
         bits = [describe_exit(c)]
         if mem.get("mem_available_gib") is not None:
@@ -467,7 +495,11 @@ def _print_evidence(job: dict) -> None:
 
 
 def cmd_activate(args, api: Api):
-    job = api("POST", f"/api/v1/profiles/{args.profile}/activate", params={"revision": args.revision})
+    import secrets as _secrets
+    # an id per invocation: if the connection drops while the request is in flight, sending it again
+    # (e.g. by the client's retry) returns the same job instead of starting a second switch
+    job = api("POST", f"/api/v1/profiles/{args.profile}/activate", params={"revision": args.revision},
+              json={"request_id": f"cli-{_secrets.token_hex(8)}"})
     print(f"job {job['job_id']}  (Ctrl-C stops watching, not the switch; `tsm cancel {job['job_id']}`)")
     if args.no_wait:
         return
@@ -1051,6 +1083,36 @@ def cmd_hardware(args, api: Api):
 
 
 # ---- argument parsing -----------------------------------------------------------------------
+def _add_serve_args(s: argparse.ArgumentParser) -> None:
+    s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
+    s.add_argument("--config", help="controller.yaml / agent.yaml")
+    s.add_argument("--socket", default="/run/twinspark/privd.sock")
+    s.add_argument("--group", default="twinspark")
+    s.add_argument("--remote-policy", help="privd: path of the remote-management policy "
+                                           "(default /etc/twinspark/remote-policy.json)")
+    s.add_argument("--unsafe-policy-owner", action="store_true",
+                   help="privd: accept a policy file not owned by root (sandbox installs and tests only)")
+    s.add_argument("--idle-exit", type=float, default=0.0, metavar="SECONDS",
+                   help="termd: exit after this long without an open terminal (socket activation starts it "
+                        "again on the next connection); 0 = never")
+
+
+def _serve_main(argv: list[str]) -> int:
+    """``tsm serve …`` without building the full CLI.
+
+    The full parser imports the controller, the cookbook and FastAPI (other commands need them). The
+    services systemd starts on every Spark — above all the agent and the root helper — must not carry
+    that: each service imports only what its role uses (see serve.py and scripts/measure_memory.py).
+    """
+    p = argparse.ArgumentParser(prog="tsm serve", description="run a service (used by systemd)")
+    _add_serve_args(p)
+    args = p.parse_args(argv)
+    if args.what in ("controller", "agent", "termd") and not args.config:
+        p.error("serve controller|agent|termd needs --config")
+    cmd_serve(args)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tsm", description="TwinSpark Manager — dual DGX Spark model switching")
     p.add_argument("--api", default=os.environ.get("TSM_API", DEFAULT_API), help="management API URL")
@@ -1073,15 +1135,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--show", action="store_true",
                    help="print the secret values; on its own it only reads and never creates anything")
 
-    s = cmd("serve", cmd_serve, "run a service (used by systemd)")
-    s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
-    s.add_argument("--config", help="controller.yaml / agent.yaml")
-    s.add_argument("--socket", default="/run/twinspark/privd.sock")
-    s.add_argument("--group", default="twinspark")
-    s.add_argument("--remote-policy", help="privd: path of the remote-management policy "
-                                           "(default /etc/twinspark/remote-policy.json)")
-    s.add_argument("--unsafe-policy-owner", action="store_true",
-                   help="privd: accept a policy file not owned by root (sandbox installs and tests only)")
+    _add_serve_args(cmd("serve", cmd_serve, "run a service (used by systemd)"))
 
     cmd("status", cmd_status, "active model, routes, memory, live serving metrics")
     cmd("profiles", cmd_profiles, "list profiles", aliases=["ls"])
@@ -1197,7 +1251,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_qsfp, cli_remote, cli_setup
+    from . import cli_client, cli_qsfp, cli_remote, cli_setup
+    cli_client.add_parsers(sub, cmd)
     cli_setup.add_parsers(sub, cmd)
     cli_remote.add_parsers(sub, cmd)
     cli_qsfp.add_parsers(sub, cmd)
@@ -1221,6 +1276,9 @@ cmd_first_night.local = True
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["serve"]:
+        return _serve_main(argv[1:])
     p = build_parser()
     args = p.parse_args(argv)
     if not getattr(args, "fn", None):

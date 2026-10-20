@@ -19,7 +19,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .. import __version__
-from ..controller.launch import (
+from ..containers import (
     ALLOWED_CAPS,
     ALLOWED_DEVICES,
     CACHE_MOUNTS,
@@ -127,6 +127,8 @@ class AgentActions:
         }
         from .remote_actions import build as _remote_actions
         self.registry.update(_remote_actions(self))
+        from .timeline import build as _timeline_actions
+        self.registry.update(_timeline_actions(self))      # timeline_start / _mark / _stop / _read
 
     @property
     def dry_run(self) -> bool:
@@ -183,7 +185,56 @@ class AgentActions:
             facts["foreign_inference"] = self.runtime.list_foreign()
         except RuntimeError_:
             facts["foreign_inference"] = []
+        facts.update(self._planner_facts())
         return facts
+
+    # The SIMULATED units of a dry-run node: what the four TwinSpark units hold on a real Spark (the
+    # controller and the terminal run on node A).
+    _SIM_SERVICES = {"twinspark-agent": (96.0, 140.0), "twinspark-privd": (28.0, 34.0),
+                     "twinspark-controller": (210.0, 265.0), "twinspark-terminal": (45.0, 60.0)}
+
+    def _planner_facts(self) -> dict[str, Any]:
+        """Memory planner inputs: the TwinSpark units' cgroup memory, the largest other processes and the
+        memory of running TwinSpark containers (so a reading taken while a model serves can be separated).
+        Each read is bounded; a reading that cannot be taken is null, never 0."""
+        import time as _time
+        out: dict[str, Any] = {"read_at": round(_time.time(), 1)}
+        if self.dry_run:
+            node_a = self.config.node.node_id == "A"
+            out["services_memory"] = {u: {"current_mib": c, "peak_mib": p, "oom_kills": 0, "simulated": True}
+                                      for u, (c, p) in self._SIM_SERVICES.items()
+                                      if node_a or u in ("twinspark-agent", "twinspark-privd")}
+            out["other_processes"] = None
+            running = sum(1 for c in self.runtime.list_owned() if c.status == "running")
+            out["owned_containers"] = {"running": running, "current_mib": None if running else 0.0,
+                                       "simulated": True}
+            return out
+        try:
+            out["services_memory"] = sysinfo.services_memory()
+        except OSError:
+            out["services_memory"] = None
+        try:
+            out["other_processes"] = sysinfo.other_processes()
+        except OSError:
+            out["other_processes"] = None
+        out["owned_containers"] = self._owned_containers_memory()
+        return out
+
+    def _owned_containers_memory(self) -> dict[str, Any]:
+        from .timeline import container_id
+        try:
+            running = [c for c in self.runtime.list_owned() if c.status == "running"]
+        except RuntimeError_:
+            return {"running": None, "current_mib": None}
+        total = 0.0
+        for c in running[:8]:
+            cid = container_id(self.runtime, c.name)
+            d = sysinfo.container_cgroup_dir(cid) if cid else None
+            m = sysinfo.cgroup_memory(d) if d else None
+            if m is None:
+                return {"running": len(running), "current_mib": None}
+            total += m["current_mib"]
+        return {"running": len(running), "current_mib": round(total, 1) if len(running) <= 8 else None}
 
     def memory_telemetry(self, params: dict) -> dict:
         return sysinfo.memory_snapshot()

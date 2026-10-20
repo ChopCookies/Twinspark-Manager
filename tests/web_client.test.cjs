@@ -43,7 +43,7 @@ function client() {
     window: { addEventListener: (name, fn) => events.set(name, fn) },
     document: { addEventListener() {}, querySelector: element },
   });
-  for (const file of ["app.js", "start.js", "remote.js"]) {
+  for (const file of ["app.js", "start.js", "remote.js", "client.js"]) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js", file), "utf8"), context, { filename: file });
   }
   return { context, element, events, storage, run: code => vm.runInContext(code, context) };
@@ -369,7 +369,7 @@ test("terminal card explains why it is unavailable and offers touch keys", () =>
   assert.match(off, /sudo tsm remote enable terminal/);
   assert.match(off, /data-act="term-open" disabled/);
   const nosvc = c.run(`remoteTerminalHtml(${JSON.stringify({ ...NODE_B, terminal_service: false })})`);
-  assert.match(nosvc, /systemctl enable --now twinspark-terminal/);
+  assert.match(nosvc, /sudo tsm remote enable terminal/);
   const on = c.run(`remoteTerminalHtml(${JSON.stringify(NODE_B)})`);
   assert.doesNotMatch(on, /data-act="term-open" disabled/);
   for (const k of ["Esc", "Tab", "Ctrl-C", "Ctrl-D"]) assert.match(on, new RegExp(`data-key="${k}"`));
@@ -513,4 +513,102 @@ test("first-night easter egg: the Konami code on the dashboard, never while typi
   c.context.location = { hash: "#/jobs" };
   press({ tagName: "BODY" });
   assert.equal(c.run("shown.length"), 1);
+});
+
+/* 0.6 memory plan and startup timeline */
+function planFixture() {
+  const bucket = (key, label, gib, source, phase, note = "", low = gib, high = gib) => ({ key, label, gib, low, high, source, phase, note });
+  const node = (startupOk) => ({
+    mem_total_gib: 121.6, mem_total_source: "measured", gpu_memory_utilization: 0.85, vllm_claim_gib: 103.36,
+    buckets: [bucket("os_kernel_docker", "OS, kernel + Docker", 8.6, "measured", "resident", "MemTotal - MemAvailable"),
+      bucket("desktop", "Desktop session", null, "unknown", "resident", "not read yet", null, null),
+      bucket("other_apps", "Other processes", 0.38, "measured", "resident", "RSS: <script>alert(1)</script> 394 MiB"),
+      bucket("main_weights", "Model weights", 30, "measured", "pool", "checkpoint size", 29.4, 31.5),
+      bucket("drafter_weights", "Drafter weights", 3, "measured", "pool", "incoai/d: unconfirmed (counted on both nodes)"),
+      bucket("first_prefill", "First-prefill peak", 2.25, "estimated", "pool", "max_num_batched_tokens 8,192", 1.1, 3.4),
+      bucket("kv_one_sequence", "KV: one max-length sequence", 2.24, "measured", "kv")],
+    startup: { ok: startupOk, level: startupOk ? "LOW" : "CRITICAL", peak_gib: 119.1, peak_low_gib: 117, peak_high_gib: 122.4, margin_gib: startupOk ? 2.5 : -0.8, source: "estimated", note: "peak during first prefill" },
+    one_context: { ok: true, level: "SAFE", kv_space_gib: 68.1, needed_gib: 2.24, source: "measured" },
+    full_concurrency: { ok: false, level: "LOW", est_full_length_seqs: 4.2, est_kv_tokens: 1100000, requested_concurrency: 6, source: "calibrated", note: "vLLM serves fewer in parallel" },
+    steady_state: { gib: 116.9 }, confidence: { text: "measured inputs: 6/9", unknown: ["Desktop session"] },
+    drafter: { placement: "incoai/d: unconfirmed (counted on both nodes)" }, notes: ["the drafter runs with draft_tensor_parallel_size 1"] });
+  return { known: true, fits: true, plan: { A: node(false), B: node(true) }, confidence: "measured inputs: 12/18",
+    verdicts: { startup: { ok: false }, one_context: { ok: true }, full_concurrency: { ok: false } },
+    observed: { startup: { nodes: { A: { footprint_gib: 98.1, min_mem_available_gib: 12.9 } } } } };
+}
+
+test("the memory plan shows three verdicts per node and every bucket with its source", () => {
+  const c = client();
+  const html = c.run(`fitHtml(${JSON.stringify(planFixture())})`);
+  assert.match(html, /startup does not fit/);
+  assert.equal((html.match(/<b>Startup peak<\/b>/g) || []).length, 2);
+  assert.equal((html.match(/<b>One max-length request<\/b>/g) || []).length, 2);
+  assert.equal((html.match(/<b>Requested concurrency<\/b>/g) || []).length, 2);
+  assert.match(html, /Node A · 121\.6 GiB · vLLM claims 0\.85/);
+  assert.match(html, /margin −0\.8 GiB/);
+  assert.match(html, /margin \+2\.5 GiB/);
+  assert.match(html, /≈ 4\.2 full-length sequences, 6 requested/);
+  assert.match(html, /<td>Desktop session<div class="sub">not read yet<\/div><\/td><td class="num">unknown<\/td>/);
+  assert.match(html, /tag warn">unknown<\/span>/);
+  assert.match(html, /tag good">measured<\/span>/);
+  assert.match(html, /tag info">calibrated<\/span>/);
+  assert.match(html, /29\.4–31\.5/);
+  assert.match(html, /Inside vLLM&#39;s claim/);
+  assert.match(html, /unconfirmed \(counted on both nodes\)/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /node A took 98\.1 GiB, lowest MemAvailable 12\.9 GiB/);
+  assert.doesNotMatch(html, /256/);
+  // a fit from an older controller (no plan) still renders the 0.5 view
+  const old = c.run(`fitHtml(${JSON.stringify({ known: true, fits: true, full_concurrency_fits: true, kv_pool_gib_per_node: 50, weights_gib_per_node: 30, budget: { mem_total: 121.6 }, est_kv_tokens: 1000, est_full_context_seqs: 2, context_length: 32768, headroom_gib: 5, level: "SAFE", kv_bytes_per_token_source: "formula" })})`);
+  assert.match(old, /fits/);
+});
+
+function timelineFixture() {
+  return { A: { points: 5, simulated: false, series: { t: [0, 10, 20, 30, 40], mem_available_gib: [15, 110, null, 3.1, 14], mem_free_gib: [12, 108, null, 1, 11] },
+    summary: { mem_total_gib: 121.6, min_mem_available_gib: 3.1, min_at_s: 30, min_stage: "loading", footprint_gib: 106.9, max_psi_full_avg10: null, peak_swap_out_pps: 1200,
+      marks: [{ stage: "stopping", t: 0 }, { stage: "starting-cluster", t: 12 }, { stage: "loading", t: 14 }, { stage: "failed", t: 40 }],
+      oom_events: [{ container: "tsm-<x>", oom_kill: 1, limit_mib: null }] } },
+    B: { error: "timeline_read: agent <unreachable>" } };
+}
+
+test("the job page draws each node's memory timeline with stage marks and the lowest point", () => {
+  const c = client();
+  const ev = { profile: "glm", revision_id: "r1", images: [], limits: {}, containers: [], timeline: timelineFixture(),
+    classification: { cause: "driver-allocation", confidence: "high", evidence: ["node A tsm-a: 129 NVIDIA <NV_ERR_NO_MEMORY>"] } };
+  const html = c.run(`evidenceHtml(${JSON.stringify(ev)})`);
+  assert.match(html, /Likely cause: the NVIDIA driver could not allocate memory/);
+  assert.match(html, /129 NVIDIA &lt;NV_ERR_NO_MEMORY&gt;/);
+  assert.match(html, /<svg class="memtl"/);
+  assert.equal((html.match(/<line class="mark/g) || []).length, 4);
+  assert.match(html, /<line class="mark failed"/);
+  assert.match(html, /<circle class="min"[^>]*><title>lowest MemAvailable 3\.1 GiB at 30 s \(loading\)<\/title>/);
+  // a missing reading breaks the line instead of dropping to 0
+  const path = html.match(/<path class="line" d="([^"]+)"/)[1];
+  assert.equal((path.match(/M/g) || []).length, 2);
+  assert.match(html, /memory pressure: unknown/);
+  assert.match(html, /tsm-&lt;x&gt;: oom_kill 1/);
+  assert.match(html, /Node B: no memory timeline \(timeline_read: agent &lt;unreachable&gt;\)/);
+  assert.match(html, /unknown on a GB10/);
+  // evidence without containers is still shown; without anything it is not
+  assert.equal(c.run(`evidenceHtml({containers: []})`), "");
+  // a successful switch shows its startup curve
+  const ok = c.run(`jobHtml(${JSON.stringify({ job_id: "act-0123456789", kind: "activation", state: "completed", created_at: 0, steps: [],
+    payload: { profile: "glm", startup_timeline: { nodes_data: { A: timelineFixture().A } } } })})`);
+  assert.match(ok, /<h2>Startup memory<\/h2>/);
+  assert.match(ok, /the new model took 106\.9 GiB/);
+  assert.match(c.run("memTimelineSvg({t:[0], mem_available_gib:[1]}, {})"), /Not enough MemAvailable readings/);
+});
+
+test("an activation carries a request id and the deployment the browser saw", () => {
+  const c = client();
+  const first = c.run("activationBody()");
+  assert.match(first.request_id, /^gui-[0-9a-f]{16}$/);
+  assert.equal("expected_active" in first, false);            // nothing seen yet: no precondition
+  c.run("S.seenActive = null");
+  assert.equal(c.run("activationBody()").expected_active, null);
+  c.run("S.seenActive = 'glm-r1-abc'");
+  const b = c.run("activationBody()");
+  assert.equal(b.expected_active, "glm-r1-abc");
+  assert.notEqual(b.request_id, first.request_id);
 });

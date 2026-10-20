@@ -17,10 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from .. import __version__
 from ..api import (
     routes_activation,
-    routes_cookbook,
     routes_diagnostics,
     routes_files,
-    routes_integrations,
     routes_profiles,
     routes_remote,
     routes_system,
@@ -37,6 +35,17 @@ log = logging.getLogger("twinspark.app")
 WEB_ASSETS = Path(__file__).resolve().parent.parent / "web" / "dist"
 
 _BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# Recipe research and client integrations are the workstation client's job in 0.6; the node keeps them
+# for the on-node CLI and older browsers, but only imports them when one of their paths is first asked
+# for (scripts/measure_memory.py shows what that saves).
+LAZY_ROUTERS: dict[str, str] = {
+    "/api/v1/cookbook": "twinspark.api.routes_cookbook",
+    "/api/v1/integrations": "twinspark.api.routes_integrations",
+}
+# what this node API offers, for the client's version/capability handshake
+CAPABILITIES = ("activation-request-id", "expected-active", "activation-journal", "startup-timeline",
+                "memory-plan-v2", "node-memory", "lazy-rich-routes", "socket-terminal")
 
 
 def _clean(value: object, limit: int) -> str:
@@ -82,9 +91,22 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
     app.add_middleware(BodyLimitMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+    loaded: set[str] = set()
+
+    def _load_lazy(path: str) -> None:
+        for prefix, module in LAZY_ROUTERS.items():
+            if module not in loaded and (path == prefix or path.startswith(prefix + "/")):
+                import importlib
+                app.include_router(importlib.import_module(module).router)
+                loaded.add(module)
+                # routes match in order and the GUI's static mount at "/" matches every path: keep it last
+                routes = app.router.routes
+                routes.sort(key=lambda r: getattr(r, "name", "") == "web")
+
     @app.middleware("http")
     async def guard_and_headers(request: Request, call_next):
         path = request.url.path
+        _load_lazy(path)
         if path.startswith("/api/") and path != "/api/v1/health" and request.method in _BODY_METHODS:
             # Authenticate and size-check from the headers *before* FastAPI reads the body, so an
             # unauthenticated caller cannot make the controller buffer or parse a large payload.
@@ -126,14 +148,14 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
         return JSONResponse(status_code=500, content={"detail": f"internal error ({type(exc).__name__})"})
 
     for r in (routes_profiles.router, routes_activation.router, routes_system.router,
-              routes_cookbook.router, routes_diagnostics.router, routes_files.router,
-              routes_remote.router, routes_remote.ws_router, routes_integrations.router):
+              routes_diagnostics.router, routes_files.router, routes_remote.router, routes_remote.ws_router):
         app.include_router(r)
 
     @app.get("/api/v1/health")
     def health():
+        # unauthenticated: only what a client needs to decide whether it can talk to this node
         return {"status": "ok", "version": __version__, "nodes": sorted(controller.agents),
-                "busy": controller.busy()}
+                "busy": controller.busy(), "api": 2, "capabilities": list(CAPABILITIES)}
 
     if WEB_ASSETS.exists():
         app.mount("/", StaticFiles(directory=str(WEB_ASSETS), html=True), name="web")

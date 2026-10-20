@@ -7,7 +7,6 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from ..controller.autopilot import ContextAdvisor, MemoryAutopilot, QuantizationAdvisor
 from ..controller.controller import Controller
 from ..controller.planner import ModelSpec, make_spec_from_hf
 from ..schemas.enums import MemoryStrategy, Quantization, Topology
@@ -123,6 +122,7 @@ def estimate(req: PlanRequest, ctrl: Controller = Depends(controller_dep)):
 
 @router.post("/autopilot/plan")
 def autopilot(req: PlanRequest, ctrl: Controller = Depends(controller_dep)):
+    from ..controller.autopilot import MemoryAutopilot  # advisory: loaded on first use
     a = MemoryAutopilot(ctrl.planner, _spec(ctrl, req), req.quantization, req.topology).plan(
         req.strategy, req.context_length, req.concurrency)
     return a.__dict__
@@ -130,12 +130,14 @@ def autopilot(req: PlanRequest, ctrl: Controller = Depends(controller_dep)):
 
 @router.post("/context/max-safe")
 def context_advisory(req: PlanRequest, ctrl: Controller = Depends(controller_dep)):
+    from ..controller.autopilot import ContextAdvisor
     adv = ContextAdvisor(ctrl.planner, _spec(ctrl, req), req.quantization, req.topology, req.kv_dtype)
     return {"rows": [r.as_row() for r in adv.find_max_safe(req.concurrency, req.contexts)]}
 
 
 @router.post("/quantization/variants")
 def quantization_variants(req: PlanRequest, ctrl: Controller = Depends(controller_dep)):
+    from ..controller.autopilot import QuantizationAdvisor
     qa = QuantizationAdvisor(ctrl.planner, _spec(ctrl, req), req.topology, base_quant=req.quantization)
     return [{**v.__dict__, "quant": v.quant.value, "status": v.status.value}
             for v in qa.variants(req.context_length, req.concurrency)]

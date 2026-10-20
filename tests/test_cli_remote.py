@@ -617,3 +617,21 @@ def test_linux_privilege_selection_preserves_root_and_privd_paths(monkeypatch):
     assert isinstance(cli_remote._pick_priv(config), privops.LocalPriv)
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     assert isinstance(cli_remote._pick_priv(config), PrivClient)
+
+
+def test_moving_a_05_always_on_terminal_to_the_socket_stops_the_old_process_first(box, monkeypatch):
+    """The 0.5 service still holds the port: enabling the socket without stopping it fails until a reboot."""
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(cli_remote, "_systemctl", lambda *argv: (calls.append(argv), (0, ""))[1])
+    monkeypatch.setattr(type(box), "sandbox", property(lambda self: False))      # act like a real node
+    wants = box.systemd / "multi-user.target.wants"
+    wants.mkdir(parents=True, exist_ok=True)
+    (wants / "twinspark-terminal.service").symlink_to(box.systemd / "twinspark-terminal.service")
+    notes = cli_remote._terminal_unit(box, True)
+    assert not (wants / "twinspark-terminal.service").is_symlink()
+    assert calls.index(("stop", "twinspark-terminal.service")) < calls.index(
+        ("enable", "--now", "twinspark-terminal.socket"))
+    assert any("always-on" in n for n in notes)
+    calls.clear()
+    cli_remote._terminal_unit(box, True)                                     # already moved: nothing stopped
+    assert ("stop", "twinspark-terminal.service") not in calls

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from dataclasses import replace
@@ -33,6 +34,15 @@ EVIDENCE_TIMEOUT_S = 150      # saving startup logs never holds up the cleanup l
 
 class DuplicateProfileError(ValueError):
     pass
+
+
+class StaleViewError(RuntimeError):
+    """The caller decided on a deployment that is no longer the active one (two clients raced)."""
+
+
+_ANY = object()            # expected_active not given: no precondition
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,80}\Z")
+JOURNAL_KEY = "inflight_activation"
 
 
 class BusyError(RuntimeError):
@@ -216,7 +226,9 @@ class Controller:
             rev.known_good = True
             self.store.save_profile(p)
         if facts:
-            self.store.kv_set(f"observed:{revision_id}", facts)
+            # merge: other observations (e.g. the startup timeline summary) live in the same record
+            merged = {**(self.store.kv_get(f"observed:{revision_id}") or {}), **facts}
+            self.store.kv_set(f"observed:{revision_id}", merged)
 
     # ---- model specs for the memory planner ------------------------------------
     def set_model_spec(self, repo: str, spec: ModelSpec) -> None:
@@ -231,10 +243,11 @@ class Controller:
     def profile_fit(self, name: str, ref: Optional[str] = None) -> dict[str, Any]:
         """Will this profile fit, and roughly how many KV tokens does it leave?
 
-        Uses the registered ModelSpec (real checkpoint size from the Hub, measured
-        KV bytes/token from the recipe) and the nodes' real MemTotal. After a
-        successful activation the observed KV pool from vLLM's boot log is shown
-        next to the estimate.
+        Uses the registered ModelSpecs (real checkpoint sizes from the Hub for the model and its
+        drafter, measured KV bytes/token from the recipe) and each node's last hardware facts. Every
+        node gets its own plan with three verdicts (startup peak, one max-length request, the full
+        requested concurrency). After a successful activation the observed KV pool from vLLM's boot
+        log and the observed startup footprint calibrate the plan of the same settings.
         """
         p = self.get_profile(name)
         if p is None:
@@ -245,21 +258,34 @@ class Controller:
         d = rev.draft if rev else p.working_draft()
         if d is None:
             raise ValueError("profile has no draft")
+        obs_rev = rev or p.latest()
+        # an observation only calibrates the settings it was made with
+        same = obs_rev is not None and (rev is not None or obs_rev.draft == d)
+        observed = self.store.kv_get(f"observed:{obs_rev.revision_id}") if obs_rev is not None else None
+        startup_obs = self.store.kv_get(f"observed_startup:{obs_rev.revision_id}") if same else None
         if d.secondary:
-            fits = {node: self._draft_fit(part, [node], recipe_kv=True)
+            fits = {node: self._draft_fit(part, [node], recipe_kv=True, observed_startup=startup_obs)
                     for node, part in zip(("A", "B"), d.parts(), strict=True)}
-            return {"profile": name, "topology": "split", "nodes": fits,
-                    "known": all(f["known"] for f in fits.values()),
-                    "fits": all(f.get("fits", False) for f in fits.values())}
-        out = self._draft_fit(d, rev.required_nodes() if rev else None)
+            out = {"profile": name, "topology": "split", "nodes": fits,
+                   "known": all(f["known"] for f in fits.values()),
+                   "fits": all(f.get("fits", False) for f in fits.values())}
+            if startup_obs:
+                out["observed"] = {**(observed or {}), "startup": startup_obs}
+            return out
+        kv_tokens = ((observed or {}).get("kv") or {}).get("kv_cache_tokens") if same else None
+        out = self._draft_fit(d, rev.required_nodes() if rev else None, observed_startup=startup_obs,
+                              observed_kv_tokens=kv_tokens if isinstance(kv_tokens, int) else None)
         out["profile"] = name
-        if rev is None and p.latest():
-            rev = p.latest()
-        if rev is not None:
-            out["observed"] = self.store.kv_get(f"observed:{rev.revision_id}")
+        if obs_rev is not None:
+            obs = dict(observed) if isinstance(observed, dict) else None
+            if startup_obs:
+                obs = {**(obs or {}), "startup": startup_obs}
+            out["observed"] = obs
         return out
 
-    def _draft_fit(self, d: ProfileDraft, nodes=None, recipe_kv=False) -> dict:
+    def _draft_fit(self, d: ProfileDraft, nodes=None, recipe_kv=False, *,
+                   observed_startup: Optional[dict] = None, observed_kv_tokens: Optional[int] = None) -> dict:
+        from .planner import drafter_inputs
         s, a = d.simple, d.advanced
         out = {"model": s.model, "known": False}
         spec = self.model_spec(s.model)
@@ -274,24 +300,62 @@ class Controller:
                                        kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
                                        mem_total_gib=self._mem_total(nodes))
         util = a.gpu_memory_utilization or self.planner.gpu_memory_utilization(budget)
-        fits, headroom = self.planner.fits(budget, util)
-        fixed = budget.vllm_needed - budget.kv_cache           # weights + scratch + graphs + comms
-        pool = util * budget.mem_total - fixed
-        per_tok = budget.kv_cache * 1024**3 / max(1, ctx * conc)
+        if nodes is None:
+            t = s.topology.value
+            nodes = ["A"] if t == "single-a" else ["B"] if t == "single-b" else ["A", "B"]
+        drafters = drafter_inputs(a, self.model_spec)
+        backend = "ray" if str(getattr(d.distributed_backend, "value", d.distributed_backend)) == "ray" else "native"
+        plans = {}
+        for n in nodes:
+            facts = self.store.kv_get(f"hardware:{n}") or {}
+            plans[n] = self.planner.plan_node(
+                spec=spec, quant=s.quantization, context_length=ctx, concurrency=conc, topology=s.topology,
+                node_id=n, backend=backend, kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
+                gpu_memory_utilization=util, facts=facts if isinstance(facts, dict) else {}, drafters=drafters,
+                max_num_batched_tokens=a.max_num_batched_tokens, chunked_prefill=a.chunked_prefill,
+                observed=observed_startup, observed_kv_tokens=observed_kv_tokens)
+        # the 0.5 keys, now from the per-node plans: the worst node decides
+        startup = min((p.startup for p in plans.values()), key=lambda v: v["margin_gib"])
+        one = [p.one_context for p in plans.values()]
+        full = [p.full_concurrency for p in plans.values()]
+        kv_space = min(p.one_context["kv_space_gib"] for p in plans.values())
+        tokens = [f["est_kv_tokens"] for f in full if f.get("est_kv_tokens") is not None]
+        seqs = [f["est_full_length_seqs"] for f in full if f.get("est_full_length_seqs") is not None]
+        measured = sum(p.confidence["measured_inputs"] for p in plans.values())
+        inputs = sum(p.confidence["inputs"] for p in plans.values())
+
+        def worst(items: list[dict]) -> dict:
+            known = [v for v in items if v.get("margin_gib") is not None]
+            return min(known, key=lambda v: v["margin_gib"]) if known else items[0]
+        first = next(iter(plans.values()))
         out.update({
-            # vLLM starts as long as weights + one max-length sequence fit in its pool
-            "known": True, "fits": pool > 0 and pool * 1024**3 >= per_tok * ctx,
-            "full_concurrency_fits": fits,
-            "headroom_gib": round(headroom, 2), "level": self.planner.classify_headroom(headroom),
-            "gpu_memory_utilization": util, "weights_gib_per_node": round(budget.model_weights, 2),
-            "kv_pool_gib_per_node": round(max(0.0, pool), 2),
-            "kv_needed_gib_per_node": round(budget.kv_cache, 2),
-            "est_kv_tokens": int(max(0.0, pool) * 1024**3 / per_tok) if per_tok > 0 else None,
-            "est_full_context_seqs": round(max(0.0, pool) * 1024**3 / per_tok / ctx, 1)
-            if per_tok > 0 else None,
+            "known": True,
+            # starts = the startup peak fits on every node and vLLM's claim holds one max-length sequence
+            "fits": all(p.startup["ok"] and p.one_context["ok"] is not False for p in plans.values()),
+            "full_concurrency_fits": all(f["ok"] is not False for f in full),
+            # headroom = the smallest startup margin of any node (the risk the 0.5 single verdict hid)
+            "headroom_gib": startup["margin_gib"], "level": startup["level"],
+            "gpu_memory_utilization": util,
+            "weights_gib_per_node": round(first.bucket("main_weights").gib, 2),
+            "drafter_gib_per_node": max((getattr(p.bucket("drafter_weights"), "gib", None) or 0.0)
+                                        for p in plans.values()),
+            "kv_pool_gib_per_node": round(max(0.0, kv_space), 2),
+            "kv_needed_gib_per_node": first.full_concurrency["needed_gib"],
+            "est_kv_tokens": min(tokens) if tokens else None,
+            "est_full_context_seqs": min(seqs) if seqs else None,
             "context_length": ctx, "concurrency": conc,
             "kv_bytes_per_token_source": "measured" if spec.kv_bytes_per_token else "formula",
             "budget": budget.as_dict(),
+            "plan": {n: p.as_dict() for n, p in plans.items()},
+            "verdicts": {
+                "startup": {**{k: startup[k] for k in ("ok", "level", "margin_gib", "source")},
+                            "node": next(n for n, p in plans.items() if p.startup is startup)},
+                "one_context": {k: worst(one).get(k) for k in ("ok", "level", "margin_gib", "source")},
+                "full_concurrency": {**{k: worst(full).get(k) for k in ("ok", "level", "margin_gib", "source")},
+                                     "est_full_length_seqs": min(seqs) if seqs else None},
+            },
+            "confidence": f"measured inputs: {measured}/{inputs}",
+            "drafters": [x.repo for x in drafters],
         })
         return out
 
@@ -366,9 +430,32 @@ class Controller:
 
     # ---- activation ---------------------------------------------------------------
     async def activate(self, profile_name: str, ref: str = "latest", *,
+                       request_id: Optional[str] = None, expected_active: Any = _ANY,
                        _rollback_of: Optional[str] = None, _recovery: bool = False,
                        _maintenance: bool = False) -> Job:
-        """Validate synchronously, then run the activation in the background."""
+        """Validate synchronously, then run the activation in the background.
+
+        ``request_id`` makes the request idempotent: the same id returns the job it already started
+        (a client that lost its connection mid-request can safely send it again). ``expected_active``
+        is the revision id the caller saw as active (None = nothing active); when the deployment changed
+        since, the request is refused instead of switching on a stale view (two clients racing).
+        """
+        if request_id is not None:
+            if not isinstance(request_id, str) or not _REQUEST_ID_RE.match(request_id):
+                raise ValueError("request_id must be 8-80 characters: letters, digits and . _ : -")
+            known = self.store.kv_get(f"activation_request:{request_id}")
+            if known:
+                job = self.store.load_job(known.get("job_id", ""))
+                if job is not None:
+                    if known.get("profile") != profile_name:
+                        raise ValueError(f"request_id {request_id} was already used for another profile")
+                    return job
+        if expected_active is not _ANY:
+            now = (self.active() or {}).get("revision_id")
+            if (expected_active or None) != now:
+                raise StaleViewError(f"the deployment changed since you looked: "
+                                     f"{now or 'nothing'} is active now (you saw {expected_active or 'nothing'}) "
+                                     f"— reload and decide again")
         p = self.get_profile(profile_name)
         if p is not None and not p.revisions:
             raise ValueError(f"profile {profile_name} is not pinned yet — pin it first "
@@ -394,6 +481,13 @@ class Controller:
         await self._lock.acquire()           # taken now so a second request gets 409
         self.current_job = job.job_id
         self.busy_profile = profile_name
+        if request_id is not None:
+            self.store.kv_set(f"activation_request:{request_id}", {"job_id": job.job_id, "profile": profile_name,
+                                                                   "at": time.time()})
+        # the journal: what a controller restart in the middle of this switch has to clean up
+        self.store.kv_set(JOURNAL_KEY, {"job_id": job.job_id, "profile": profile_name,
+                                        "revision_id": rev.revision_id, "previous": self.active(),
+                                        "rollback_of": _rollback_of, "accepted_at": time.time()})
         self._spawn(self._run_activation(job, rev))
         self._audit("controller" if (_rollback_of or _recovery) else "user", "profile.activate",
                     f"profile/{profile_name}", {"revision": rev.revision_id, "job": job.job_id,
@@ -450,7 +544,7 @@ class Controller:
                 model_specs={part.identity.model_repo: self.model_spec(part.identity.model_repo)
                              for part in rev.parts()},
                 poll_interval=self.poll_interval, cancel_check=cancel_check,
-                staging_wait=self._staging_wait,
+                staging_wait=self._staging_wait, store=self.store,
             )
             job.payload["_revision"] = rev
             job.payload["mem_total_gib"] = self._mem_total()
@@ -508,6 +602,8 @@ class Controller:
             self._persist(job)
             job.payload.pop("_revision", None)
             self.store.save_job(job)
+            if (self.store.kv_get(JOURNAL_KEY) or {}).get("job_id") == job.job_id:
+                self.store.kv_set(JOURNAL_KEY, None)
             self._cancel.discard(job.job_id)
             self.current_job = None
             self.busy_profile = None
@@ -535,8 +631,10 @@ class Controller:
         return Redactor(values)
 
     async def _capture_evidence(self, job: Job, rev: ProfileRevision) -> None:
-        """Save each started container's state and log (both ranks) before the containers are removed."""
+        """Save each started container's state and log (both ranks) before the containers are removed,
+        each node's startup memory timeline, and what the evidence says the failure was."""
         from . import evidence as ev
+        from . import timeline as tl
         from .state_machine import guidance_for
         seen, started = set(), []
         for item in job.payload.get("started_containers") or []:
@@ -544,10 +642,21 @@ class Controller:
             if key not in seen and item.get("node") in self.agents:
                 seen.add(key)
                 started.append(item)
-        if not started:
+        recorded = (job.payload.get("startup_timeline") or {}).get("nodes") or []
+        tl_nodes = [n for n in recorded if n in self.agents]
+        if not started and not tl_nodes:
             return
         root = ev.evidence_dir(self.config.db_path)
         redact = self._redactor()
+
+        async def timeline() -> dict[str, dict]:
+            if not tl_nodes:
+                return {}
+            try:
+                return tl.stored(await tl.collect(self.agents, job.job_id, tl_nodes, tl.EVIDENCE_POINTS, stop=True))
+            except Exception as exc:  # noqa: BLE001 - the timeline is best effort like the rest
+                log.exception("startup timeline could not be read")
+                return {n: {"error": f"{type(exc).__name__}: {exc}"[:300]} for n in tl_nodes}
 
         async def one(item: dict) -> dict[str, Any]:
             node, name = item["node"], item["name"]
@@ -579,12 +688,17 @@ class Controller:
             rec.update(await asyncio.to_thread(digest))
             return rec
 
-        records = list(await asyncio.gather(*(one(i) for i in started)))
+        gathered, timelines = await asyncio.gather(asyncio.gather(*(one(i) for i in started)), timeline())
+        records = list(gathered)
+        summaries = {n: d["summary"] for n, d in timelines.items() if isinstance(d.get("summary"), dict)}
         job.payload["startup_evidence"] = {
             "containers": records, "profile": rev.profile_name, "revision_id": rev.revision_id,
             "images": list(dict.fromkeys(p.identity.image_ref for p in rev.parts() if p.identity)),
             "captured_at": time.time(),
-            "limits": {"max_log_chars": ev.MAX_LOG_CHARS, "kept_jobs": ev.KEEP_JOBS}}
+            "timeline": timelines,
+            "classification": ev.classify(records, summaries, job),
+            "limits": {"max_log_chars": ev.MAX_LOG_CHARS, "kept_jobs": ev.KEEP_JOBS,
+                       "timeline_points_per_node": tl.EVIDENCE_POINTS}}
         failed = next((st for st in reversed(job.steps) if st.status == "failed"), None)
         text = ev.excerpt(records)
         if failed is not None and text:
@@ -650,6 +764,8 @@ class Controller:
 
     # ---- boot / power-cut recovery (spec §36) --------------------------------------
     async def on_startup(self) -> Optional[Job]:
+        journal = self.store.kv_get(JOURNAL_KEY)
+        interrupted: Optional[Job] = None
         for j in self.store.list_jobs(limit=50):
             if j.state in (JobState.RUNNING, JobState.PENDING):
                 j.state = JobState.FAILED
@@ -658,10 +774,67 @@ class Controller:
                 from .phases import settle
                 settle(j, "interrupted by controller restart")
                 self.store.save_job(j)
+                if journal and j.job_id == journal.get("job_id"):
+                    interrupted = j
         await self.refresh_hardware()
         if self.maintenance.blocking():
             self.maintenance.ensure_running()
             return None
+        if journal:
+            return await self._recover_interrupted(journal, interrupted)
+        return await self._resume_active()
+
+    async def _recover_interrupted(self, journal: dict, job: Optional[Job]) -> Optional[Job]:
+        """The controller stopped in the middle of an accepted switch (crash, reboot, power cut).
+
+        Deterministic: if the old model had not been touched yet, nothing changed and the usual
+        start-up path (re-attach what still runs) follows. If the switch had begun stopping the old
+        model, the partial containers are stopped and — as an automatic rollback would have done — the
+        previous deployment is started again; without auto_rollback nothing is started.
+        """
+        from .state_machine import DESTRUCTIVE_FROM, STAGE_ORDER
+        order = {st.value: i for i, st in enumerate(STAGE_ORDER)}
+        destructive = job is not None and any(order.get(st.stage, -1) >= order[DESTRUCTIVE_FROM.value]
+                                              for st in job.steps)
+        if job is None or not destructive:
+            self.store.kv_set(JOURNAL_KEY, None)
+            if job is not None:
+                job.rollback = "the controller restarted before the old model was touched; it keeps serving"
+                self.store.save_job(job)
+            return await self._resume_active()
+        # the single writer: while the agents come back and the partial containers are stopped, the API is
+        # already answering, and a switch started meanwhile would be torn down here — refuse it (409)
+        async with self._lock:
+            self.current_job, self.busy_profile = job.job_id, journal.get("profile")
+            try:
+                down = await self._wait_for_agents(self.config.startup_wait_s)
+                stopped = await self._stop_everything([])
+                self.store.kv_set("active", None)
+                # cleared only now: a restart during the wait or the stop runs this recovery again
+                self.store.kv_set(JOURNAL_KEY, None)
+            finally:
+                self.current_job, self.busy_profile = None, None
+        previous = journal.get("previous") or None
+        target = journal.get("revision_id")
+        restore = bool(self.config.auto_rollback and previous and not journal.get("rollback_of")
+                       and previous.get("revision_id") != target)
+        job.rollback = (f"the controller restarted during the switch: stopped {len(stopped)} partial "
+                        f"container(s)" + (f" (node(s) {', '.join(down)} did not answer)" if down else "")
+                        + (f"; restoring previous {previous['profile']} {previous.get('label', '')}".rstrip()
+                           if restore else "; nothing to restore"))
+        self.store.save_job(job)
+        self._audit("controller", "deployment.recover", f"job/{job.job_id}",
+                    {"stopped": stopped, "restore": previous if restore else None})
+        if not restore or self.busy():
+            return None
+        try:
+            return await self.activate(previous["profile"], previous["revision_id"], _rollback_of=job.job_id)
+        except Exception:  # noqa: BLE001
+            log.exception("restoring %s after an interrupted switch failed", previous)
+            return None
+
+    async def _resume_active(self) -> Optional[Job]:
+        """Start-up without an interrupted switch: re-attach what still runs, autostart otherwise."""
         active = self.active()
         if not active:
             return None

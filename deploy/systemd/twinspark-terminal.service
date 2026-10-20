@@ -1,16 +1,13 @@
 [Unit]
 Description=TwinSpark terminal (opt-in browser/CLI shell on this node, recorded)
-After=network-online.target twinspark-agent.service
-Wants=network-online.target
+Requires=twinspark-terminal.socket
+After=network-online.target twinspark-agent.service twinspark-terminal.socket
 
 [Service]
 User=twinspark
-ExecStart=/opt/twinspark/venv/bin/tsm serve termd --config /etc/twinspark/agent.yaml
+ExecStart=/opt/twinspark/venv/bin/tsm serve termd --config /etc/twinspark/agent.yaml --idle-exit 900
 Restart=on-failure
 RestartSec=3
 # stopping the unit ends every shell it started
 KillMode=control-group
 TasksMax=1024
-
-[Install]
-WantedBy=multi-user.target

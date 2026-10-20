@@ -20,12 +20,16 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket
-from starlette.websockets import WebSocketDisconnect
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .. import __version__
 from ..schemas.config import AgentConfig
@@ -43,50 +47,67 @@ def policy_source(config: AgentConfig) -> PolicySource:
 
 
 def build_termd_app(config: AgentConfig, token: Optional[str] = None,
-                    manager: Optional[TerminalManager] = None) -> FastAPI:
+                    manager: Optional[TerminalManager] = None, idle_exit_s: float = 0.0) -> Starlette:
+    """Plain Starlette (no FastAPI): a handful of endpoints, and the process should stay small.
+
+    ``idle_exit_s`` > 0: once no shell has been open for that long, ask the server in
+    ``app.state.server`` to finish. Used with socket activation, where systemd keeps the port and starts
+    the service again on the next connection.
+    """
     expected = token if token is not None else SecretsVault(config.secrets_dir).get("agent_token")
     if not expected:
         raise RuntimeError("agent_token is not set — run `tsm init --role agent` first")
     mgr = manager or TerminalManager(policy_source(config), config.remote_mgmt.record_dir,
                                      config.remote_mgmt.shell, config.node.node_id)
+    idle = {"since": time.monotonic()}
+
+    async def watch_idle(app: Starlette) -> None:
+        while True:
+            await asyncio.sleep(min(15.0, max(0.05, idle_exit_s / 4)))
+            if mgr.sessions:
+                idle["since"] = time.monotonic()
+                continue
+            server = getattr(app.state, "server", None)
+            if server is not None and time.monotonic() - idle["since"] >= idle_exit_s:
+                log.info("no terminal session for %.0f s: exiting until the next connection", idle_exit_s)
+                server.should_exit = True
+                return
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: Starlette):
         mgr.start()
+        watcher = asyncio.create_task(watch_idle(app)) if idle_exit_s > 0 else None
         yield
+        if watcher is not None:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
         await mgr.stop()
-
-    app = FastAPI(title="tsm-termd", version=__version__, docs_url=None, redoc_url=None, openapi_url=None,
-                  lifespan=lifespan)
-    app.state.manager = mgr
 
     def _bearer(value: Optional[str]) -> bool:
         scheme, _, tok = (value or "").partition(" ")
         return scheme.lower() == "bearer" and tokens_equal(tok.strip(), expected)
 
-    def _auth(authorization: Optional[str]) -> None:
-        if not _bearer(authorization):
-            raise HTTPException(401, "invalid agent token")
+    def _denied(request: Request) -> Optional[JSONResponse]:
+        if _bearer(request.headers.get("authorization")):
+            return None
+        return JSONResponse({"detail": "invalid agent token"}, status_code=401)
 
-    @app.get("/v1/terminal/status")
-    def status(authorization: Optional[str] = Header(default=None)):
-        _auth(authorization)
-        return {**mgr.status(), "node": config.node.node_id, "version": __version__}
+    async def status(request: Request):
+        return _denied(request) or JSONResponse({**mgr.status(), "node": config.node.node_id,
+                                                 "version": __version__})
 
-    @app.get("/v1/terminal/recordings")
-    def recordings(authorization: Optional[str] = Header(default=None)):
-        _auth(authorization)
-        return {"recordings": mgr.recordings()}
+    async def recordings(request: Request):
+        return _denied(request) or JSONResponse({"recordings": mgr.recordings()})
 
-    @app.get("/v1/terminal/recordings/{name}")
-    def recording(name: str, authorization: Optional[str] = Header(default=None)):
-        _auth(authorization)
+    async def recording(request: Request):
+        if (refused := _denied(request)) is not None:
+            return refused
+        name = request.path_params["name"]
         try:
-            return {"name": name, "cast": mgr.read_recording(name)}
+            return JSONResponse({"name": name, "cast": mgr.read_recording(name)})
         except TerminalError as exc:
-            raise HTTPException(404, str(exc)) from None
+            return JSONResponse({"detail": str(exc)}, status_code=404)
 
-    @app.websocket("/v1/terminal")
     async def terminal(ws: WebSocket):
         # Refuse before the upgrade completes: an unauthenticated caller never gets a socket.
         if not _bearer(ws.headers.get("authorization")):
@@ -103,6 +124,7 @@ def build_termd_app(config: AgentConfig, token: Optional[str] = None,
             await _send_json(ws, {"type": "error", "error": str(exc)})
             await ws.close(code=1011)
             return
+        idle["since"] = time.monotonic()
         log.info("terminal session %s opened for %s", sess.id, actor)
         await _send_json(ws, {"type": "hello", "session": sess.id, "recorded": sess.recorder is not None,
                               "cols": sess.cols, "rows": sess.rows,
@@ -147,9 +169,17 @@ def build_termd_app(config: AgentConfig, token: Optional[str] = None,
             await mgr.close(sess, sess.reason or "client disconnected")
             log.info("terminal session %s closed: %s (in %d B, out %d B)", sess.id, sess.reason,
                      sess.bytes_in, sess.bytes_out)
+            idle["since"] = time.monotonic()
             with contextlib.suppress(Exception):
                 await ws.close()
 
+    app = Starlette(lifespan=lifespan, routes=[
+        Route("/v1/terminal/status", status, methods=["GET"]),
+        Route("/v1/terminal/recordings", recordings, methods=["GET"]),
+        Route("/v1/terminal/recordings/{name}", recording, methods=["GET"]),
+        WebSocketRoute("/v1/terminal", terminal),
+    ])
+    app.state.manager = mgr
     return app
 
 

@@ -6,7 +6,6 @@ import asyncio
 import secrets
 from typing import TYPE_CHECKING, Any, Optional
 
-from ..resolver import resolve_model_ref
 from ..schemas.enums import JobState
 from ..schemas.job import Job
 from .agent_client import AgentActionError
@@ -158,6 +157,7 @@ async def stage(ctrl: "Controller", ref: str, nodes: Optional[list[str]] = None,
     if not nodes:
         raise FilesError("no configured nodes to stage to")
     try:
+        from ..resolver import resolve_model_ref  # Hub lookups: loaded on first use
         repo, sha = await asyncio.to_thread(resolve_model_ref, ref, ctrl.hf_token)
     except ValueError as exc:
         raise FilesError(str(exc)) from exc

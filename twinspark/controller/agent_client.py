@@ -20,6 +20,8 @@ ALLOWED_AGENT_ACTIONS = {
     "mods_list", "mods_status", "mods_install", "mods_remove",
     "remote_status", "remote_logs", "remote_bundle", "remote_power", "remote_power_cancel",
     "remote_boot_status", "remote_boot_next", "remote_boot_next_clear", "remote_wol_status", "remote_wol_set",
+    # startup memory timeline (read-only sampling of the node while an activation runs)
+    "timeline_start", "timeline_mark", "timeline_stop", "timeline_read",
 }
 
 

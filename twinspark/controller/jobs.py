@@ -18,6 +18,9 @@ from .agent_client import AgentActionError, AgentClient
 from .launch import LaunchError, LaunchPlan, LaunchPlanner
 from .planner import MemoryPlanner, ModelSpec
 from .staging import StageError, WeightsStager
+from .timeline import STAGES as TIMELINE_STAGES
+from .timeline import StartupTimeline
+from .timeline import observation as timeline_observation
 
 if TYPE_CHECKING:
     from ..gateway.gateway import Gateway
@@ -71,7 +74,8 @@ class ActivationCoordinator:
                  model_specs: Optional[dict[str, ModelSpec]] = None,
                  poll_interval: float = 5.0,
                  cancel_check: Optional[Callable[[], bool]] = None,
-                 staging_wait: Optional[Callable[[str, str], "asyncio.Future | None"]] = None):
+                 staging_wait: Optional[Callable[[str, str], "asyncio.Future | None"]] = None,
+                 store=None):
         self.config = config
         self.agents = agents
         self.gateway = gateway
@@ -86,6 +90,10 @@ class ActivationCoordinator:
         self.drained: list[str] = []            # aliases we put into draining
         self.cancel_check = cancel_check or (lambda: False)
         self.staging_wait = staging_wait
+        # Where a successful start's observed startup peak is kept for the planner. The controller hands
+        # over its bound ``_persist``; until it passes ``store=`` itself, its store is taken from there.
+        self.store = store if store is not None else getattr(getattr(persist, "__self__", None), "store", None)
+        self.timeline: Optional[StartupTimeline] = None
 
     def agent(self, node: str) -> AgentClient:
         if node not in self.agents:
@@ -108,7 +116,62 @@ class ActivationCoordinator:
             ActivationStage.ROUTING: self._route,
             ActivationStage.HEALTHY: self._healthy,
         }[stage]
-        return await handler(job, rev, step)
+        if stage.value in TIMELINE_STAGES:
+            await self._timeline_mark(job, rev, stage)
+        try:
+            message = await handler(job, rev, step)
+        except Exception:
+            await self._timeline_failed()
+            raise
+        if stage == ActivationStage.HEALTHY:
+            await self._timeline_success(job, rev)
+        return message
+
+    # ---- startup memory timeline (best effort: never fails the activation) ------------------------
+    async def _timeline_mark(self, job: Job, rev: ProfileRevision, stage: ActivationStage) -> None:
+        try:
+            if self.timeline is None:
+                # the destructive part begins: from here on every node of the plan records its memory
+                nodes = list(self.plan.nodes) if self.plan else rev.required_nodes()
+                containers: dict[str, list[str]] = {}
+                for c in (self.plan.containers if self.plan else []):
+                    containers.setdefault(c.node, []).append(c.name)
+                self.timeline = StartupTimeline(self.agents, job, nodes, containers)
+                await self.timeline.start()
+            await self.timeline.mark(stage.value)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a bug here must not take the activation down
+            log.exception("startup timeline mark failed")
+
+    async def _timeline_failed(self) -> None:
+        """The evidence capture reads the timeline back after a failure; here it only stops growing."""
+        if self.timeline is None:
+            return
+        try:
+            await self.timeline.mark("failed")
+            await self.timeline.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("startup timeline could not be stopped")
+
+    async def _timeline_success(self, job: Job, rev: ProfileRevision) -> None:
+        if self.timeline is None:
+            return
+        try:
+            summaries = await self.timeline.finish_success()
+            if summaries:
+                obs = timeline_observation(summaries, job.job_id)
+                job.payload["startup_timeline"]["observed"] = obs["nodes"]
+                if self.store is not None:
+                    # its own key: the revision's observed:{id} record is rewritten when the job completes
+                    self.store.kv_set(f"observed_startup:{rev.revision_id}", obs)
+            self.persist(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("startup timeline could not be kept")
 
     # ---- helpers -------------------------------------------------------------
     def _models(self, rev: ProfileRevision):
@@ -162,6 +225,17 @@ class ActivationCoordinator:
                     notes.append(f"{part.profile_name}: KV estimate exceeds pool by {-headroom:.1f} "
                                  "GiB/node — vLLM fits fewer parallel sequences")
                 notes.append(f"{part.profile_name}: estimated headroom {headroom:.1f} GiB/node")
+                startup = self._startup_verdicts(part, spec, util, nodes)
+                if startup:
+                    job.payload.setdefault("startup_verdicts", {})[part.profile_name] = startup
+                    for n, v in startup.items():
+                        if v.get("level") == "CRITICAL":
+                            # an estimate, not a measurement: say it before the old model is stopped
+                            warn = (f"WARNING: {part.profile_name}: estimated startup margin on node {n} is "
+                                    f"{v.get('margin_gib')} GiB (CRITICAL) — the startup peak (weights, drafter, "
+                                    f"first prefill) may not fit; see the memory plan before switching")
+                            notes.append(warn)
+                            job.payload.setdefault("startup_warnings", []).append(warn)
             else:
                 notes.append(f"{part.profile_name}: no model spec registered — memory check skipped")
             node_utils.update({n: util for n in nodes})
@@ -171,9 +245,39 @@ class ActivationCoordinator:
         except LaunchError as exc:
             raise RuntimeError(str(exc)) from exc
         job.payload["launch_plan"] = self.plan.model_dump(mode="json")
-        job.payload["warnings"] = [n for n in self.plan.notes if n.startswith("WARNING")]
+        job.payload["warnings"] = ([n for n in self.plan.notes if n.startswith("WARNING")]
+                                   + list(job.payload.get("startup_warnings") or []))
         return "plan ready (" + ", ".join(f"{n}: gpu_memory_utilization={u:.2f}"
                                           for n, u in node_utils.items()) + "); " + "; ".join(notes)
+
+    def _startup_verdicts(self, part, spec: ModelSpec, util: float, nodes: list[str]) -> dict[str, dict]:
+        """Per-node startup verdict from the drafter-aware plan (planner.plan_node), using the last
+        hardware facts the controller saw. Empty when the store is not available."""
+        if self.store is None:
+            return {}
+        from .planner import drafter_inputs
+
+        def lookup(repo: str) -> Optional[ModelSpec]:
+            d = self.store.kv_get(f"model_spec:{repo}")
+            return ModelSpec(**{k: v for k, v in d.items() if k in ModelSpec.__dataclass_fields__}) if d else None
+        s, a = part.draft.simple, part.draft.advanced
+        try:
+            drafters = drafter_inputs(a, lookup)
+            out = {}
+            for n in nodes:
+                facts = self.store.kv_get(f"hardware:{n}") or {}
+                plan = self.planner.plan_node(
+                    spec=spec, quant=s.quantization, context_length=s.planning_context(),
+                    concurrency=a.max_num_seqs or s.concurrency, topology=s.topology, node_id=n,
+                    backend="ray" if self.launch.resolve_backend(part).value == "ray" else "native",
+                    kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode, gpu_memory_utilization=util,
+                    facts=facts if isinstance(facts, dict) else {}, drafters=drafters,
+                    max_num_batched_tokens=a.max_num_batched_tokens, chunked_prefill=a.chunked_prefill)
+                out[n] = {k: plan.startup.get(k) for k in ("ok", "level", "margin_gib", "peak_gib")}
+            return out
+        except Exception:  # noqa: BLE001 - advisory only: never block a switch on the advisory model
+            log.debug("startup verdict failed", exc_info=True)
+            return {}
 
     async def _resolve(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         nodes = self.plan.nodes

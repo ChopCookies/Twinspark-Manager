@@ -1,7 +1,8 @@
 # Security model and known limits
 
 TwinSpark Manager is meant for two machines on a private QSFP link plus a laptop that reaches the GUI
-over an SSH tunnel or Tailscale. It is not designed to face the internet.
+over an SSH tunnel or Tailscale — usually through the [workstation client](client.md), which makes that
+tunnel itself. It is not designed to face the internet.
 
 ## Who can do what
 
@@ -11,7 +12,8 @@ over an SSH tunnel or Tailscale. It is not designed to face the internet.
 | Gateway (OpenAI API) | node A `:8000` | inference key | chat/completions only |
 | Agent | node A `127.0.0.1:9443`, node B QSFP address | per-cluster bearer token | a fixed list of typed actions |
 | `tsm-privd` | Unix socket, root | socket permissions | allowlisted root operations (drop page cache, headless switch, maintenance reboot) and — only when `remote-policy.json` allows — reboot, power-off, boot-next, Wake-on-LAN |
-| `tsm-termd` (opt-in) | same address as the agent, node port 9444 | agent bearer token, plus a one-time ticket from the controller for browsers | a recorded shell as the service user |
+| `tsm-termd` (opt-in) | same address as the agent, node port 9444 (systemd socket; the process starts on the first connection and exits after 15 idle minutes) | agent bearer token, plus a one-time ticket from the controller for browsers | a recorded shell as the service user |
+| `tsm client` (your computer) | `127.0.0.1` only, a free port near 18765 | a per-launch session key, a loopback `Host` and the `Origin` of state-changing calls | everything the management key can, through its SSH forward to node A |
 
 There is no generic "run this command" action anywhere. The controller refuses to send an action that
 is not in `ALLOWED_AGENT_ACTIONS`, and the agent refuses anything it does not implement.
@@ -63,6 +65,41 @@ is not in `ALLOWED_AGENT_ACTIONS`, and the agent refuses anything it does not im
   not guess a port that looks cabled to your network, validates with `netplan generate` and puts the
   previous file back if the addresses do not come up. `tsm qsfp scan --identify` uses key-only SSH
   (`BatchMode`), a validated user name and no password prompt. Details: [qsfp-link.md](qsfp-link.md).
+
+### The workstation client
+
+`tsm client` adds node A's management key to the requests it passes on, so it is guarded like node A's
+own API — otherwise any web page you visit could use it as a confused deputy:
+
+- It listens on loopback only. Every `/api/` call needs the session key of this launch (random, 192
+  bits), handed to the browser in the URL **fragment** (`#k=…`), which never reaches a server, a log or a
+  `Referer`; the page moves it to the tab's `sessionStorage` and removes it from the address bar. The
+  browser `tsm client` starts is given a one-time `/launch/<code>` address that redirects to the page
+  with the key, so the key is never in a command line other local users could read.
+- Requests whose `Host` is not a loopback name or address are refused (DNS rebinding), as are
+  state-changing requests with a foreign `Origin` or `Sec-Fetch-Site: cross-site`. Responses carry
+  `X-Frame-Options: DENY` and `nosniff`. The browser's own `Origin`, cookies and `x-api-key` are never
+  passed upstream. The terminal's WebSocket is checked the same way — the session key travels as a
+  query parameter there, because a browser cannot set headers on a WebSocket, and is removed before the
+  relay — and node A still requires its one-time ticket.
+- **SSH host keys are trust-on-first-use with an explicit confirmation**: the client shows the
+  fingerprints, stores only the confirmed ones in its own `known_hosts`, and connects with
+  `StrictHostKeyChecking=yes` against that file. A changed key stops the connection until the user
+  compares and replaces it. `StrictHostKeyChecking=no` is never used, and `~/.ssh/known_hosts` is
+  not modified.
+- **Passwords are used once and never stored.** The one-time key install passes the password to
+  `ssh` through `SSH_ASKPASS` and an environment variable of that one process, never argv, a file or a
+  log, and only to the host whose key was confirmed. The client then uses its own ed25519 key.
+- API keys are kept in the OS keychain when `keyring` works, otherwise in `credentials.json` (0600) in
+  the client's folder (0700). The management key never leaves the client: the GUI cannot read it
+  back, and agent-app configuration only ever receives the inference key (the management key is
+  refused if pasted there).
+- Reading the keys over SSH runs `tsm init --show` as the SSH user; `sudo -n` only when the user asks.
+  Output is parsed in memory and never logged.
+
+Limits: any program running as you on your computer can read the client's folder (and, depending on
+the OS, your keychain) — the same as for `~/.ssh`. A direct connection crosses the network; it is only
+offered for an HTTPS listener whose certificate verifies.
 
 ## Known limits (deliberately not fixed yet)
 

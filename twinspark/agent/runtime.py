@@ -20,7 +20,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from ..controller.launch import OWNER_LABEL, ContainerSpec, docker_run_argv
+from ..containers import OWNER_LABEL, ContainerSpec, docker_run_argv
 
 
 class RuntimeError_(RuntimeError):
