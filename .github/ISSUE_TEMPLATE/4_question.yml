@@ -1,0 +1,11 @@
+name: Question
+description: How do I …?
+labels: [question]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: Have a look at the docs first — the Get started page and `tsm doctor` answer many setup questions.
+    validations:
+      required: true

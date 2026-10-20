@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from typing import Any
 
 from ..schemas.enums import VerificationStatus
@@ -16,13 +17,28 @@ def settings(draft: ProfileDraft) -> dict:
     return doc
 
 
+def draft_digest(draft: ProfileDraft) -> str:
+    """What a profile takes from a recipe — its settings and the recipe's notes for it — without the name the
+    user chose and the receipt itself. Two modes of one recipe file have different digests."""
+    doc = draft.model_dump(mode="json", exclude={"name"})
+    doc["source"] = {k: v for k, v in (doc.get("source") or {}).items()
+                     if k not in ("receipt", "updated_from", "kv_measured_with")}
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def record_import(draft: ProfileDraft, text: str, ref: str | None, fmt: str,
                   overrides: dict | None = None, metadata: str | None = None) -> ProfileDraft:
     receipt = {"ref": ref or "pasted", "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+               "draft_sha256": draft_digest(draft),
                "format": fmt, "overrides": copy.deepcopy(overrides or {}), "baseline": settings(draft)}
     if metadata is not None:
         receipt["metadata_sha256"] = hashlib.sha256(metadata.encode("utf-8")).hexdigest()
-    return draft.model_copy(update={"source": {**draft.source, "receipt": receipt}}, deep=True)
+    source = {**draft.source, "receipt": receipt}
+    if source.get("kv_bytes_per_token") and not overrides and not isinstance(source.get("kv_measured_with"), dict):
+        # the recipe's KV size is true for the settings it ships with; a later edit of them invalidates it
+        from ..controller.measurements import kv_settings
+        source["kv_measured_with"] = kv_settings(draft)
+    return draft.model_copy(update={"source": source}, deep=True)
 
 
 _MISSING = object()

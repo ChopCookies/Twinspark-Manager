@@ -23,7 +23,9 @@ log = logging.getLogger("twinspark.client")
 
 SERVICE = "TwinSpark Manager"
 # The complete list of what may be stored. A keyring cannot be enumerated, so delete_all() relies on it.
-CREDENTIAL_NAMES: tuple[str, ...] = ("management_key", "inference_key")
+# hermes_key / hermes_node_key: Hermes's own named key (master plan §4.1), "id:token", for Hermes on this
+# computer and on node A
+CREDENTIAL_NAMES: tuple[str, ...] = ("management_key", "inference_key", "hermes_key", "hermes_node_key")
 _CONN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 _OFF = {"0", "off", "no", "false", "file"}
 

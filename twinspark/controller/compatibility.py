@@ -196,8 +196,8 @@ async def check_alias(ctrl, alias: str, checks=None) -> Job:
             for node, fact in zip(part.required_nodes(), facts, strict=True):
                 ctrl.store.kv_set(f"hardware:{node}", fact)
             job.finish_step(step, "Simulated runtime; no inference will be sent." if dry_run else "Runtime confirmed.")
-            headers = {"Authorization": f"Bearer {ctrl.gateway.inference_api_key}"} \
-                if ctrl.gateway.inference_api_key is not None else {}
+            # TwinSpark's own token for the in-process gateway: works whatever keys the apps have
+            headers = {"Authorization": f"Bearer {ctrl.gateway.internal_token}"}
             app = build_gateway_app(ctrl.gateway, max_response_bytes=MAX_RESPONSE_BYTES)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                          base_url="http://twinspark-gateway", headers=headers) as client:

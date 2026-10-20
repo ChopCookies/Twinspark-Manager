@@ -19,6 +19,7 @@ from ..api import (
     routes_activation,
     routes_diagnostics,
     routes_files,
+    routes_gateway,
     routes_profiles,
     routes_remote,
     routes_system,
@@ -42,16 +43,33 @@ _BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 LAZY_ROUTERS: dict[str, str] = {
     "/api/v1/cookbook": "twinspark.api.routes_cookbook",
     "/api/v1/integrations": "twinspark.api.routes_integrations",
+    "/api/v1/benchmarks": "twinspark.api.routes_benchmarks",
+    "/metrics": "twinspark.api.routes_metrics",
+    "/api/v1/keys": "twinspark.api.routes_keys",
+    "/api/v1/usage": "twinspark.api.routes_keys",
 }
 # what this node API offers, for the client's version/capability handshake
 CAPABILITIES = ("activation-request-id", "expected-active", "activation-journal", "startup-timeline",
-                "memory-plan-v2", "node-memory", "lazy-rich-routes", "socket-terminal")
+                "memory-plan-v2", "node-memory", "lazy-rich-routes", "socket-terminal",
+                "measurement-fingerprints", "drain-policy", "validation-record", "benchmarks",
+                "split-halves", "prometheus-metrics", "gateway-routing", "named-keys")
 
 
 def _clean(value: object, limit: int) -> str:
     """Printable, JSON/UTF-8 safe, bounded text for error payloads."""
     text = str(value)[:limit]
     return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
+class _GZip(GZipMiddleware):
+    """Compression for the API and the GUI, but not for the playground's token streams: older Starlette
+    versions would hold back the first tokens until enough text for a compressed block had arrived."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/api/v1/playground/"):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
 
 
 def create_app(controller: Controller, management_key: str, run_startup: bool = True,
@@ -87,9 +105,11 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
     app.state.controller = controller
     app.state.management_key = management_key
     app.state.rate_buckets = {}
+    from ..cookbook import catalog
+    catalog.configure(controller.catalog)       # the Cookbook overlays this node's copy of the recipe catalog
 
     app.add_middleware(BodyLimitMiddleware)
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(_GZip, minimum_size=1000)
 
     loaded: set[str] = set()
 
@@ -148,8 +168,12 @@ def create_app(controller: Controller, management_key: str, run_startup: bool = 
         return JSONResponse(status_code=500, content={"detail": f"internal error ({type(exc).__name__})"})
 
     for r in (routes_profiles.router, routes_activation.router, routes_system.router,
-              routes_diagnostics.router, routes_files.router, routes_remote.router, routes_remote.ws_router):
+              routes_diagnostics.router, routes_files.router, routes_remote.router, routes_remote.ws_router,
+              routes_gateway.router):
         app.include_router(r)
+
+    from . import playground
+    app.router.routes.extend(playground.routes(controller))       # the GUI's chat playground (streams as is)
 
     @app.get("/api/v1/health")
     def health():

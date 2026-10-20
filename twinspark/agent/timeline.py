@@ -218,11 +218,14 @@ class TimelineSampler:
                     return
 
     def _sample(self, run: _Run) -> dict[str, Any]:
-        now = self.clock()
-        base = {"t": round(now - run.started_mono, 2), "at": round(time.time(), 2), "stage": run.stage,
+        with self._lock:
+            # the time and the stage of one sample are read together: a sampler thread that is held up
+            # between the two must not stamp an early time on a later stage (mark() changes it under the lock)
+            now, stage = self.clock(), run.stage
+        base = {"t": round(now - run.started_mono, 2), "at": round(time.time(), 2), "stage": stage,
                 "driver_allocated_gib": None}
         if run.simulated:
-            return {**base, **self._synthetic(run)}
+            return {**base, **self._synthetic(run, stage)}
         mem = sysinfo.read_meminfo(f"{self.proc}/meminfo")
 
         def gib(*keys: str) -> Optional[float]:
@@ -262,9 +265,9 @@ class TimelineSampler:
             out[name] = sysinfo.cgroup_memory(d) if d else None
         return out
 
-    def _synthetic(self, run: _Run) -> dict[str, Any]:
+    def _synthetic(self, run: _Run, stage: Optional[str]) -> dict[str, Any]:
         i = len(run.samples)
-        avail = _SIMULATED.get(run.stage, 14.8) - 0.3 * (i % 3)
+        avail = _SIMULATED.get(stage, 14.8) - 0.3 * (i % 3)
         return {"mem_total_gib": 121.6, "mem_available_gib": round(avail, 2), "mem_free_gib": round(avail - 2.5, 2),
                 "page_cache_gib": 3.1, "swap_used_gib": 0.0, "swap_in_pps": 0.0, "swap_out_pps": 0.0,
                 "psi_some_avg10": 0.0, "psi_full_avg10": 0.0, "services": {}, "containers": {},

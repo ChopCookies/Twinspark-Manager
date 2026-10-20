@@ -132,11 +132,26 @@ if [ ! -x "$TSM_HOME/venv/bin/python" ]; then
   "$PY" -m venv "$TSM_HOME/venv"
 fi
 "$TSM_HOME/venv/bin/python" -m pip install --quiet --upgrade pip
-"$TSM_HOME/venv/bin/python" -m pip install --quiet --upgrade "${SRC}[hf]" || die "pip could not install TwinSpark (see the message above; offline? pip needs PyPI)"
+# the dependency versions this release was tested with (constraints/release.txt); TSM_UNPINNED=1 takes the newest
+PIN_ARGS=()
+if [ -f "$SRC/constraints/release.txt" ] && [ "${TSM_UNPINNED:-0}" != "1" ]; then
+  PIN_ARGS=(-c "$SRC/constraints/release.txt")
+fi
+"$TSM_HOME/venv/bin/python" -m pip install --quiet --upgrade "${PIN_ARGS[@]}" "${SRC}[hf]" || die "pip could not install TwinSpark (see the message above; offline? pip needs PyPI)"
 # same version number, newer checkout (git pull): make sure the program itself is replaced
 "$TSM_HOME/venv/bin/python" -m pip install --quiet --force-reinstall --no-deps "$SRC" || die "pip could not refresh TwinSpark"
 rm -rf "$SRC/build" "$SRC"/*.egg-info 2>/dev/null || true
 echo "TwinSpark Manager program directory; \`install.sh --uninstall\` deletes it." > "$MARKER"
+# which commit this is, for validation records (`tsm validation export`); "dirty" when edited locally
+if command -v git >/dev/null 2>&1 && SHA_NOW="$(git -c safe.directory="$SRC" -C "$SRC" rev-parse HEAD 2>/dev/null)"; then
+  if git -c safe.directory="$SRC" -C "$SRC" diff --quiet HEAD -- 2>/dev/null; then
+    echo "$SHA_NOW" > "$TSM_HOME/source-commit"
+  else
+    echo "$SHA_NOW dirty" > "$TSM_HOME/source-commit"
+  fi
+else
+  rm -f "$TSM_HOME/source-commit"
+fi
 # code that runs as root (privd) must not be writable by anyone else
 chown -R root:root "$TSM_HOME"
 chmod -R go-w "$TSM_HOME"

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/ChopCookies/Twinspark-Manager/tree/main/docs
+    about: Setup, the workstation client, recipes, memory planning, remote management
+  - name: Report a security problem privately
+    url: https://github.com/ChopCookies/Twinspark-Manager/blob/main/SECURITY.md
+    about: Please do not open a public issue for vulnerabilities

@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.7.0 — 2026-10-19 — measured, not guessed
+
+0.6 moved the work off the Sparks. 0.7 makes what TwinSpark says about a deployment checkable: memory
+forecasts tied to the exact settings they were measured with, a benchmark runner whose results are stored
+against a revision, metrics for Prometheus, and a recipe catalog with community results. Around it the
+gateway grew up (one key per app, affinity, fallbacks, its own process) and SGLang joined vLLM. The plan
+behind it compared TwinSpark with GPUStack and took ideas, not code.
+
+### Correctness first
+
+- **Measurements tied to their settings.** KV bytes per token and start-up footprints are stored under a
+  fingerprint of what they depend on (model commit, image digest, engine, KV dtype, topology, attention and
+  cache flags, speculation, node); a different setup is not a measurement. A recipe's KV size applies only
+  while the profile keeps the settings it was measured with. Model specs are per repository and commit.
+- **Real calibration.** Successful starts record vLLM's KV pool and each node's start-up footprint; the
+  planner uses them with sample count, median, spread and an allowance while there are few. Dry runs are
+  never recorded.
+- **Verdicts that name their numbers:** "with --gpu-memory-utilization=0.60 vLLM may use 76.8 of 128.0 GiB
+  per node and needs 286.5 GiB (weights 261.9, KV cache 10.0, …) — 209.7 GiB short per node".
+- **A safe drain policy.** A manual switch no longer cuts off running requests: *abort* (default) fails the
+  switch before anything stops and reopens the old model when requests outlast `drain_timeout_s`; *wait*
+  lets them finish (cancellable); *force* is 0.6's behaviour. Status shows the oldest request's age.
+- **CI on every push and pull request:** the minimum and the newest dependency sets, GUI tests, ruff, a
+  wheel install smoke test, the recipe catalog check; failures arrive as annotations.
+  `constraints/minimum.txt` and `constraints/release.txt` (what `install.sh` installs).
+- **Validation records** (`tsm validation export`): what was tested with what — manager commit, agents,
+  model commit, image digest, mod hashes, settings, stages, benchmarks — with evidence classes
+  (manager-validated, dry-run, external). [docs/validation.md](docs/validation.md)
+- **Virtual interfaces** (docker, br-, veth, cni, flannel, tailscale, VLANs, macvlans, …) never count as a
+  QSFP port, and a RoCE GID that belongs to one is never chosen for NCCL.
+
+### Measuring
+
+- **Benchmark runner** (`tsm bench`, the *Benchmarks* page; runs from the client through the gateway):
+  max-throughput (the knee), latency-slo (the highest concurrency meeting TTFT/TPOT p95), context (a ladder
+  up to the deployed limit with needle retrieval), quality (retrieval and a tool call), fixed. Exact output
+  lengths, a fresh seed and prompt per request, a run invalidated by a switch. Results are stored on node A
+  against the revision and appear in its validation record; *Compare* measures two revisions back to back.
+  [docs/benchmarks.md](docs/benchmarks.md)
+- **Prometheus export** (`GET /metrics`, a read-only scrape key from `tsm prometheus key`): the engine's
+  metrics with alias, node, model and revision labels, node memory, PSI and GPU, gateway routes, switch
+  state. Windowed TTFT/ITL percentiles from histogram deltas; 24 h of minute averages kept across restarts;
+  a Prometheus + Grafana compose file and dashboard for the workstation. [docs/metrics.md](docs/metrics.md)
+- **Split profiles, one half at a time.** A new revision touches only the half that changed; *Restart this
+  half* (`tsm activate --half B`); the watchdog restarts only the half that failed; status shows each half.
+- **Performance lab**: what each recipe measured on two Sparks, generated from the recipes.
+  [docs/perf-lab.md](docs/perf-lab.md)
+
+### The gateway
+
+- **One key per app**, limited to aliases, expirable, revocable, shown once; only hashes are kept. 0.6's
+  key becomes the key `default`, so configured apps keep working. Requests and tokens per day, key and
+  alias for 90 days (*Keys & usage*, `tsm keys`, `tsm usage --csv`). Hermes gets a key of its own.
+- **Routing:** session affinity (`session-id` header or `prompt_cache_key`), least requests in flight,
+  per-node weights. A **fallback** per alias while it switches or is down: another alias or an external
+  OpenAI-compatible endpoint with its own key. `tsm gateway set`, the dashboard's *Routing…*.
+- **Its own process** (`twinspark-gateway.service`, new installs): fed by an atomically written state file,
+  answering the controller on a Unix socket; a controller restart or update keeps running streams.
+  [docs/gateway.md](docs/gateway.md)
+
+### Engines
+
+- **SGLang** next to vLLM: profiles name an engine apart from the image family; the same settings become
+  SGLang flags (two-node launch, EP, speculation, the backend key). Mods and Ray are refused for SGLang.
+- **Image check before a switch:** a fixed probe in the pinned image (no network, no GPU, memory-capped)
+  confirms flags, parsers, speculative method and architecture before anything is drained
+  (`runtime.image_check: enforce | warn | off`). [docs/engines.md](docs/engines.md)
+
+### The Cookbook
+
+- **Recipe modes:** a recipe can offer variants with their own numbers — the GLM-5.3-Flash recipes come as
+  *latency* (the drafter, as published) and *throughput* (no drafter, more sequences). Import asks which;
+  `tsm cookbook import … --mode`. Update checks compare with the same mode.
+- **A recipe catalog in this repository** (`catalog/index.json`, generated and checked by CI): node A and
+  the client fetch new and corrected recipes from `main` — https only, size limits, every file checked
+  against its SHA-256, refreshed when older than a day or on `tsm cookbook refresh`. A recipe for a newer
+  TwinSpark is listed, not offered. **Imported profiles are never changed**: a newer recipe is an update
+  to review, which creates a separate profile. [catalog/README.md](catalog/README.md)
+- **Community results**, opt-in and previewed (`tsm cookbook report`, *Share result…*): how a recipe went,
+  versions, benchmark numbers and the tuning settings changed — built from an allowlist, without host
+  names, addresses, paths, model names or keys. The Cookbook shows totals (success rate, median tok/s,
+  settings changed most often). The server side is a small PHP + MySQL/MariaDB endpoint in
+  [community/strato](community/strato/README.md); reports stay off until `cookbook.community_url` is set.
+- **Playground:** chat with one alias or two side by side, streamed as an app sees it, with time to first
+  token, decode tok/s and *Copy as curl*. It uses the management session, not an app key.
+  [docs/cookbook.md](docs/cookbook.md)
+
+### Documentation
+
+- A documentation site from `docs/` (mkdocs-material, GitHub Pages).
+- Guides for [Open WebUI, n8n, LiteLLM, Continue, Cherry Studio, Aider and OpenCode](docs/integrations/README.md).
+- The README compares TwinSpark with general cluster managers.
+
+### Upgrading from 0.6
+
+- Update both nodes as before (`git pull && sudo ./install.sh --no-setup`, then restart the services); the
+  installer keeps your `controller.yaml`. An installation set up with 0.6 keeps the gateway in-process. To
+  run it as its own service: add `gateway_mode: standalone` and run `sudo tsm setup`
+  ([docs/gateway.md](docs/gateway.md#its-own-process)).
+- Your inference key keeps working as the key `default`; give each app its own and revoke `default` later.
+- A KV size that 0.6 stored on a model spec shared by several profiles is ignored; the next real start of
+  each profile measures its own. Profiles imported before 0.7 still use their recipe's KV size, with a note
+  that the settings it was measured with are unknown; re-importing records them.
+- The recipe catalog is on by default; `cookbook.catalog_url: ""` switches it off for an air-gapped setup.
+
 ## 0.6.0 — 2026-10-16 — a workstation client, lean services on the Sparks
 
 The test of 0.5.0 on two DGX Sparks asked for three things: less TwinSpark on the Sparks, a connection

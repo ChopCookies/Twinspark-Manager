@@ -415,3 +415,36 @@ svg.memtl .min-label { fill:var(--bad); }
 .client-state{display:flex;align-items:center;gap:7px}
 .pill-link{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
 @media(max-width:900px){.client-states{display:none}}
+/* benchmarks: output tok/s per concurrency level */
+.bench-bars{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+.bench-bar-row{display:grid;grid-template-columns:minmax(52px,max-content) 1fr;gap:10px;align-items:center}
+.bench-bar-set{display:flex;flex-direction:column;gap:3px}
+.bench-bar{position:relative;height:18px;border-radius:6px;background:var(--panel-2);overflow:hidden}
+.bench-bar i{position:absolute;inset:0 auto 0 0;border-radius:6px;opacity:.75}
+.bench-bar span{position:relative;padding-left:8px;line-height:18px}
+
+/* recipe modes */
+.mode-choice{display:grid;gap:8px;margin-top:10px}
+.mode-choice .option{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--stroke);border-radius:10px;cursor:pointer;background:var(--panel-2)}
+.mode-choice .option:has(input:checked){border-color:var(--accent)}
+.mode-choice input{margin-top:3px}
+/* recipe catalog and community totals */
+.catalog-line{margin:0 0 12px;gap:10px;flex-wrap:wrap}
+.warn-text{color:var(--warn)}
+.community-line{margin-top:8px;line-height:1.5}
+/* playground */
+.pg-form{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.pg-cols{margin-top:12px}
+.pg-col{display:flex;flex-direction:column;min-width:0}
+.pg-log{display:grid;gap:10px;max-height:60vh;overflow:auto;padding-right:4px}
+.pg-msg{padding:10px 12px;border:1px solid var(--stroke);border-radius:10px;background:var(--panel-2);min-width:0}
+.pg-msg.user{border-color:rgba(106,167,255,.35)}
+.pg-role{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2);margin-bottom:4px}
+.pg-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
+.pg-think{margin-bottom:6px;font-size:12px;color:var(--ink-2)}
+.pg-stats{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px;font-size:12px}
+.pg-stats span{display:flex;flex-direction:column}
+.pg-stats small{color:var(--ink-2)}
+.pg-input{margin-top:12px}
+.pg-input textarea{width:100%;margin-bottom:8px}
+#pg-system{width:100%;margin-top:6px}

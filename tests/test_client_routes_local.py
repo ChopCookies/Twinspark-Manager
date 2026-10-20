@@ -47,7 +47,7 @@ def hermes(tmp_path, monkeypatch):
         def __init__(self, host, profile=None, **kw):
             super().__init__(host, profile, http=gw.client(), start_wait=5.0, stop_grace=3.0, **kw)
 
-    async def endpoint_for(session, host, alias):
+    async def endpoint_for(session, host, alias, for_app=False):
         return Endpoint(base_url=BASE, alias=alias or "glm", api_key=KEY, context_length=131072,
                         revision_id="rev-1", served_model="org/glm-model", source="workstation-forward")
 
@@ -169,3 +169,65 @@ async def test_hermes_on_node_a_uses_the_gateway_as_node_a_reaches_it(tmp_path, 
     assert (await integrations_local.endpoint_for(session, "node-a", "glm")).base_url == "https://10.0.0.5:8443/v1"
     session.node_cfg = {"gateway_port": 8000, "gateway_forward_host": "fd00::5"}
     assert (await integrations_local.endpoint_for(session, "node-a", "glm")).base_url == "http://[fd00::5]:8000/v1"
+
+
+async def test_hermes_gets_a_key_of_its_own_and_a_new_one_after_a_revoke(tmp_path, monkeypatch):
+    """The client asks node A for "Hermes on <computer>" once, keeps it, and replaces it when revoked."""
+    from twinspark.client import integrations_local
+    keys, created = [], []
+
+    class Resp:
+        def __init__(self, status, body):
+            self.status_code, self._body = status, body
+
+        def json(self):
+            return self._body
+
+    async def node_request(method, path, **kw):
+        if method == "GET":
+            return Resp(200, [{"id": k["id"], "state": k["state"]} for k in keys])
+        created.append(kw["json"])
+        k = {"id": f"key-{len(created)}", "state": "active", "key": f"tsk_secret{len(created)}"}
+        keys.append(k)
+        return Resp(201, {"id": k["id"], "key": k["key"], "name": kw["json"]["name"]})
+    session = ClientSession(home=tmp_path / "client")
+    conn = session.connections.add(Connection(id="", name="lab", mode="direct", host="127.0.0.1",
+                                              direct_url="http://127.0.0.1:9"))
+    session.creds.set(conn.id, "inference_key", "shared-key")
+    session.current = conn
+    monkeypatch.setattr(session, "node_request", node_request)
+    first = await integrations_local.app_key(session, "workstation")
+    again = await integrations_local.app_key(session, "workstation")
+    assert first == again == "tsk_secret1" and len(created) == 1
+    assert created[0]["app"] == "hermes" and created[0]["name"].startswith("Hermes on ")
+    keys[0]["state"] = "revoked"
+    assert await integrations_local.app_key(session, "workstation") == "tsk_secret2"
+    node = await integrations_local.app_key(session, "node-a")
+    assert node == "tsk_secret3" and created[-1]["name"] == "Hermes on node A"
+
+    async def old_node(method, path, **kw):
+        return Resp(404, {"detail": "Not Found"})
+    monkeypatch.setattr(session, "node_request", old_node)
+    assert await integrations_local.app_key(session, "workstation") == "shared-key"
+
+
+async def test_the_client_keeps_its_own_catalog_copy_and_reads_community_totals(tmp_path, monkeypatch):
+    from twinspark.cookbook import community
+    monkeypatch.setenv("TSM_CLIENT_KEYRING", "off")
+    session = ClientSession(home=tmp_path / "client")
+    async with client_for(create_client_app(session, LOCAL)) as c:
+        r = await c.get("/api/v1/cookbook/community-stats")
+        assert r.status_code == 200 and r.json() == {}                 # no community server configured
+        session.node_cfg["cookbook"] = {"catalog_url": None, "catalog_refresh_hours": 24,
+                                        "community_url": "https://reports.example/ts"}
+        seen = []
+        monkeypatch.setattr(community, "community_stats",
+                            lambda url, client=None, refresh=False: seen.append(url) or {"recipes": {}})
+        r = await c.get("/api/v1/cookbook/community-stats")
+        assert r.status_code == 200 and seen == ["https://reports.example/ts"]
+        r = await c.get("/api/v1/cookbook/catalog")
+        assert r.status_code == 200 and r.json()["enabled"] is False     # node A switched it off
+        session.node_cfg["cookbook"]["catalog_url"] = "https://raw.githubusercontent.com/o/r/main/catalog/index.json"
+        r = await c.post("/api/v1/cookbook/catalog/refresh")
+        assert r.status_code == 502 and "no network in tests" in r.json()["detail"]
+    await session.aclose()

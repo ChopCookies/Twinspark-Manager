@@ -122,3 +122,26 @@ async def test_rich_routes_load_on_first_use_and_health_names_the_capabilities(c
         r = await c.post("/api/v1/integrations/check", headers={"x-api-key": "k"}, json={})
         assert r.status_code in (400, 404, 422)                               # routed, not the static 405
         assert (await c.get("/")).status_code in (200, 404)                    # the GUI mount still answers
+
+
+def test_no_test_module_defines_a_nose_style_setup_or_teardown_function():
+    """pytest 8.0 still runs a module-level setup()/teardown() as the module's hook. A helper with that name
+    once ran a real `tsm setup` against / before the tests of its module (on a CI runner with sudo)."""
+    import ast
+    from pathlib import Path
+    bad = []
+    for path in Path(__file__).resolve().parent.glob("test_*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        bad += [f"{path.name}:{node.lineno} {node.name}" for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in ("setup", "teardown", "setup_module", "teardown_module")]
+    assert bad == []
+
+
+def test_the_standalone_gateway_stays_small():
+    """`tsm serve gateway` serves the endpoint without the controller, FastAPI or pydantic (master plan §3.2)."""
+    mods = _modules_after("import twinspark.gateway.standalone, twinspark.gateway.state, twinspark.serve as s\n"
+                          "s.run_gateway\n")
+    for heavy in ("fastapi", "pydantic", "twinspark.controller.controller", "twinspark.schemas.config",
+                  "twinspark.cookbook", "twinspark.controller.app"):
+        assert heavy not in mods, f"the gateway imports {heavy}"

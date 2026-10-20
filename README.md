@@ -1,15 +1,19 @@
 # TwinSpark Manager
 
+[![CI](https://github.com/ChopCookies/Twinspark-Manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ChopCookies/Twinspark-Manager/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-chopcookies.github.io-blue)](https://chopcookies.github.io/Twinspark-Manager/)
+
 One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA DGX Spark
 (GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
 and keep the machines headless.
 
-> **Status: alpha (0.6.0).** The control path is covered by automated tests (about 1,300). Real Docker
+> **Status: alpha (0.7.0).** The control path is covered by automated tests (about 1,450). Real Docker
 > activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
 > and two-node PP2) on 2026-09-28, at the code of that day — see the
 > [validation note](docs/notes/small-model-validation-2026-09-28.md). Large models, other topologies
-> and the newer features (remote management, `tsm qsfp`) still need on-site validation, which is why a
-> new install starts in **dry-run** (nothing is run on your machines) until you say otherwise.
+> and the newer features (remote management, `tsm qsfp`, everything new in 0.7) still need on-site
+> validation, which is why a new install starts in **dry-run** (nothing is run on your machines) until you
+> say otherwise.
 
 ---
 
@@ -154,8 +158,23 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
 - **Safe switching:** preflight → download / rsync A→B over QSFP → drain → stop → reclaim memory →
   start → health → smoke test → route. Before the stop stage the old model keeps serving; after it,
   a failure restores the previous known-good deployment.
-- **Stable gateway:** aliases, real SSE streaming, `503 + Retry-After` while switching, in-flight draining,
-  round-robin across replicas.
+- **Stable gateway:** aliases, real SSE streaming, in-flight draining with a choice of what happens to long
+  requests. **One key per app** (limited to aliases, expirable, revocable) with tokens per key and day;
+  **session affinity** and least-in-flight balancing across replicas; a **fallback** (another alias or an
+  external endpoint) instead of `503` while switching. It runs as **its own service**, so a controller restart
+  or update keeps running streams. [docs/gateway.md](docs/gateway.md)
+- **Measured, not guessed:** a **benchmark runner** (peak throughput and its knee, the most requests that
+  meet a latency target, context ladder with retrieval, tool calls) stored per revision and compared; a
+  **Prometheus export** with a Grafana dashboard and 24 h of history; **validation records** that say what
+  exactly ran. [docs/benchmarks.md](docs/benchmarks.md) · [docs/metrics.md](docs/metrics.md)
+- **Cookbook that keeps up:** recipes with **modes** (latency / throughput), a **catalog** in this repo that
+  brings new and corrected recipes without an update (hash-checked, never changes your profiles), opt-in
+  **community results** (success rate, median tok/s, the settings people changed), and a **playground** with
+  time to first token and tok/s. [docs/cookbook.md](docs/cookbook.md) · [performance lab](docs/perf-lab.md)
+- **Engines:** vLLM and **SGLang**, with an image check before a switch that refuses an image that cannot
+  serve the profile. [docs/engines.md](docs/engines.md)
+- **Your apps:** short guides for [Open WebUI, n8n, LiteLLM, Continue, Cherry Studio, Aider and
+  OpenCode](docs/integrations/README.md).
 - **Memory aware:** `gpu_memory_utilization` is derived from the unified-memory reserve; page cache is
   dropped before launch (via the root helper); headless modes free the desktop's memory.
 - **Operations:** system status (CPU / GPU / shm / network per node), opt-in coordinated OS/driver
@@ -202,7 +221,7 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
 | `/etc/twinspark/controller.yaml`, `agent.yaml` | configuration (safe to edit; comments explain) |
 | `/etc/twinspark/secrets/` | encrypted vault (keys, tokens) |
 | `/var/lib/twinspark/` | state database, mods, sync key |
-| `/etc/systemd/system/twinspark-{privd,agent,controller}.service` | services (plus `twinspark-terminal.{socket,service}` when the terminal is on) |
+| `/etc/systemd/system/twinspark-{privd,agent,controller,gateway}.service` | services (the gateway as its own service on new installs; plus `twinspark-terminal.{socket,service}` when the terminal is on) |
 
 ## Everyday commands
 
@@ -215,6 +234,13 @@ tsm job <id>                   # what a job did; a failed start lists the saved 
 tsm job <id> --log FILE        # print one of those saved startup logs
 tsm headless status            # desktop, boot target and how you can reach each node remotely
 tsm headless headless-max      # stop the desktop session now, free its memory (asks first; -y skips)
+tsm bench run max-throughput   # peak tokens/s and the knee, through the gateway (docs/benchmarks.md)
+sudo tsm prometheus key        # read-only scrape key for /metrics (docs/metrics.md)
+tsm activate duo --half B      # split profiles: restart only node B's model; A keeps serving
+tsm gateway set --fallback default=alias:secondary   # answer from another alias while switching
+tsm keys create "OpenClaw" --alias coder   # one key per app (shown once); tsm usage: tokens per key
+tsm cookbook refresh           # new and corrected recipes from the catalog (never changes your profiles)
+tsm cookbook report glm-batch  # share how a recipe went: shows the exact document first, opt-in
 tsm link --mode rdma           # QSFP / NCCL link test (both nodes must be live, not dry-run)
 tsm rdma --apply               # write discovered RoCE devices into controller.yaml
 tsm qsfp status                # QSFP link on THIS node: both twins, addresses, MTU, RoCE (docs/qsfp-link.md)
@@ -289,6 +315,7 @@ switch it on, on that node.
 
 ```bash
 cd Twinspark-Manager && git pull && sudo ./install.sh --no-setup && sudo systemctl restart twinspark-agent twinspark-controller
+sudo systemctl restart twinspark-gateway   # node A, where the gateway runs as its own service (new in 0.7)
 sudo ./install.sh --uninstall            # stop services, remove the program; config, models and state stay
 sudo ./install.sh --uninstall --purge    # …and delete /etc/twinspark and /var/lib/twinspark
 ```
@@ -299,15 +326,46 @@ each node afterwards: it moves the terminal to its on-demand socket (until then 
 before). Update the client with `pipx upgrade twinspark-manager` (a git install:
 `pipx install --force git+https://github.com/ChopCookies/Twinspark-Manager`).
 
+## TwinSpark vs. general cluster managers
+
+General LLM cluster managers — [GPUStack](https://github.com/gpustack/gpustack) is a good one — run models on
+many nodes from many vendors for many users. TwinSpark does one thing: **two DGX Sparks**, as well as it can.
+If you have a rack of mixed GPUs, several teams and need quotas, use a general manager. If you have two
+Sparks on a QSFP cable, the narrow focus buys you:
+
+| | A general cluster manager (GPUStack, reviewed at `bac363f`) | TwinSpark |
+|---|---|---|
+| Memory planning | weights × a factor plus a constant, against the VRAM limit | per node, bucket by bucket for unified memory (OS, Docker, weights, drafter, first-prefill peak, CUDA graphs, NCCL, KV), each labelled measured / calibrated / estimated / unknown, and a verdict that names its numbers |
+| On the nodes | a server with PostgreSQL, a gateway, Prometheus and Grafana; Docker | about 100 MiB on node A and 50 MiB on node B; the heavy work (GUI, recipe research, benchmarks) runs on your computer |
+| Switching models | rollout and health recovery | drain → stop → reclaim memory → start → test → route, back to the known-good deployment on failure, a restart journal, start-up evidence and failure classes |
+| Two Sparks | a generic scheduler | GB10, QSFP twins and RoCE, unified memory, headless operation, both PCIe halves for NCCL |
+| Agent apps | integration guides | the same guides, and Hermes managed end to end (detect, preview, apply with a backup, validate, restore) |
+| Connecting | a server URL and a worker token | the workstation client: host-key confirmation, one-time key install, supervised SSH forwards |
+
+What TwinSpark took from GPUStack's ideas (not its code): the benchmark presets, per-key usage, session
+affinity and fallbacks, engines next to image families, recipe modes and a catalog, and leaving virtual
+interfaces out of the network discovery. What it deliberately leaves out: Kubernetes, multi-cloud, an
+embedded PostgreSQL, Prometheus or Grafana on the nodes, prefill/decode disaggregation, Ray by default.
+
 ## More documentation
+
+All of it as a site: **[chopcookies.github.io/Twinspark-Manager](https://chopcookies.github.io/Twinspark-Manager/)**.
 
 - [The workstation client: connect by address, local GUI, Hermes on your computer](docs/client.md)
 - [Recipe and split-model workflow](docs/recipe-workflow.md)
+- [The Cookbook: recipe modes, the recipe catalog, community results, the playground](docs/cookbook.md)
+- [Performance lab: what runs on two Sparks, and how fast](docs/perf-lab.md)
+- [Using the Sparks from your apps: Open WebUI, n8n, LiteLLM, Continue, Cherry Studio, Aider, OpenCode](docs/integrations/README.md)
 - [Automatic recipe imports and source updates](docs/recipe-automation.md)
 - [Agent clients and evaluation harnesses](docs/agent-integrations.md)
 - [Monitoring and coordinated maintenance](docs/maintenance.md)
 - [Remote management: terminal, logs, power, Wake-on-LAN, network boot](docs/remote-management.md)
 - [The QSFP link: both interfaces, addresses, MTU, verification](docs/qsfp-link.md)
+- [Validation records and the hardware matrix](docs/validation.md)
+- [Benchmarks: throughput, latency targets, context and quality, compared per revision](docs/benchmarks.md)
+- [Metrics: Prometheus export, Grafana dashboard, 24-hour history](docs/metrics.md)
+- [The gateway: one key per app and usage, routing, fallbacks while switching, its own process](docs/gateway.md)
+- [Engines (vLLM, SGLang) and the image check before a switch](docs/engines.md)
 - [Development, testing and the demo harness](docs/development.md)
 - [Security model and known limits](docs/security.md) · [Reporting a vulnerability](SECURITY.md)
 - [Changelog](CHANGELOG.md)

@@ -13,17 +13,28 @@ import re
 import secrets
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Optional
 
 from ..gateway.gateway import Gateway
-from ..metrics import MetricsSampler, combine_snapshots, scrape_metrics
-from ..schemas.config import ControllerConfig
+from ..metrics import (
+    HISTORY_KEYS,
+    NODE_KEYS,
+    MetricsHistory,
+    MetricsSampler,
+    combine_snapshots,
+    scrape_metrics,
+    windowed,
+)
+from ..schemas.config import ControllerConfig, GatewaySettings
 from ..schemas.enums import JobState
 from ..schemas.job import AuditEntry, Job
 from ..schemas.profile import _NAME_RE, ImmutableIdentity, Profile, ProfileDraft, ProfileRevision, _now
+from . import halves as split_halves
 from .agent_client import AgentActionError, AgentClient
 from .jobs import ActivationCoordinator
 from .launch import LaunchPlan, LaunchPlanner
+from .measurements import Measurements, resolve_kv
 from .planner import MemoryPlanner, ModelSpec
 from .state_machine import StageFailed
 from .store import Store
@@ -49,6 +60,18 @@ class BusyError(RuntimeError):
     """Another activation/stop is running."""
 
 
+
+
+def load_model_spec(store, repo: str, sha: Optional[str] = None) -> Optional[ModelSpec]:
+    """The registered spec of ``repo`` at commit ``sha`` (else the latest registered one). A KV size
+    stored on a spec by 0.6 is dropped: it belonged to one profile's settings, not to the model."""
+    d = (store.kv_get(f"model_spec:{repo}@{sha}") if sha else None) or store.kv_get(f"model_spec:{repo}")
+    if not d:
+        return None
+    fields = set(ModelSpec.__dataclass_fields__) - {"kv_bytes_per_token"}
+    return ModelSpec(**{k: v for k, v in d.items() if k in fields})
+
+
 class Controller:
     """Owns state, coordination and the desired-state loop for one cluster.
 
@@ -63,6 +86,7 @@ class Controller:
         self.gateway = gateway
         self.store = store or Store(config.db_path)
         self.planner = MemoryPlanner()
+        self.measurements = Measurements(self.store)      # fingerprinted KV sizes and startup calibrations
         self.planner.mem_total_provider = self._mem_total
         self.agents: dict[str, AgentClient] = dict(agents or {})
         self.poll_interval = poll_interval
@@ -74,7 +98,13 @@ class Controller:
         self._staging: dict[tuple[str, str], asyncio.Future] = {}
         self.current_job: Optional[str] = None
         self.busy_profile: Optional[str] = None      # profile named by the running activation/prepare
+        self.current_scope: Optional[dict] = None    # the halves the running switch touches (None = all)
+        self.gateway_link = None                     # gateway.state.GatewayLink with gateway_mode: standalone
         self.sampler = MetricsSampler()
+        self.half_samplers: dict[str, MetricsSampler] = {}   # split deployments: one per half (node)
+        self.history = MetricsHistory(self.store)             # minute averages, 24 h, kept across restarts
+        # the last raw scrape of every backend, for /metrics (controller.exporter) and windowed percentiles
+        self.backend_samples: dict[str, dict] = {}
         self.telemetry: dict[str, dict] = {}
         self.telemetry_history: dict[str, list] = {}
         from .maintenance import Maintenance
@@ -82,7 +112,82 @@ class Controller:
         self.maintenance = Maintenance(self)
         self.remote = RemoteService(self)
         self.watch_state: dict[str, Any] = {"unhealthy_streak": 0, "recoveries": [], "last": None}
+        self._apply_gateway_settings()
+        # named inference keys (master plan §4.1): 0.6's single key becomes the key "default"
+        from .keys import KeyStore, Usage
+        self.keys, self.usage = KeyStore(self.store), Usage(self.store)
+        if self.keys.migrate(self.gateway.inference_api_key):
+            self._audit("system", "keys.migrate", "keys/default", {"from": "inference_api_key"})
+        self._publish_keys()
+        # the recipe catalog (master plan §4.1), cached next to the state database
+        from ..cookbook import make_catalog
+        cb = config.cookbook
+        self.catalog = make_catalog(Path(config.db_path).parent / "catalog", cb.catalog_url,
+                                    refresh_hours=cb.catalog_refresh_hours)
         self._audit("system", "controller.init", "controller", {})
+
+    # ---- named keys and usage (master plan §4.1) ---------------------------------
+    def _publish_keys(self) -> None:
+        self.gateway.set_keys(self.keys.records(), managed=self.keys.managed())
+
+    def create_key(self, name: str, *, aliases: Optional[list[str]] = None, expires_in_days: Optional[int] = None,
+                   app: Optional[str] = None) -> tuple[str, dict]:
+        token, rec = self.keys.create(name, aliases=aliases, expires_in_days=expires_in_days, app=app)
+        self._publish_keys()
+        self._audit("user", "keys.create", f"keys/{rec['id']}", {"name": rec["name"], "aliases": rec["aliases"],
+                                                               "app": rec["app"], "expires_at": rec["expires_at"]})
+        return token, rec
+
+    def revoke_key(self, key_id: str) -> dict:
+        rec = self.keys.revoke(key_id)
+        self._publish_keys()
+        self._audit("user", "keys.revoke", f"keys/{key_id}", {"name": rec["name"]})
+        return rec
+
+    def delete_key(self, key_id: str) -> None:
+        self.keys.delete(key_id)
+        self._publish_keys()
+        self._audit("user", "keys.delete", f"keys/{key_id}", {})
+
+    def flush_usage(self) -> None:
+        """Move the gateway's counters into the daily totals (each metrics tick and at shutdown)."""
+        u = self.gateway.take_usage()
+        if u["rows"]:
+            self.usage.add(u["rows"])
+        if u["last_used"] and self.keys.touch(u["last_used"]):
+            self._publish_keys()
+
+    # ---- gateway routing settings (master plan §3.3) ------------------------------
+    def gateway_settings(self) -> GatewaySettings:
+        """controller.yaml's ``gateway:`` unless changed at runtime (GUI, `tsm gateway set`)."""
+        saved = self.store.kv_get("gateway_settings")
+        if saved:
+            try:
+                return GatewaySettings.model_validate(saved)
+            except ValueError:
+                log.warning("stored gateway settings are invalid; using controller.yaml's")
+        return self.config.gateway
+
+    def set_gateway_settings(self, settings: GatewaySettings) -> GatewaySettings:
+        self.store.kv_set("gateway_settings", settings.model_dump(mode="json"))
+        self._apply_gateway_settings()
+        self._audit("user", "gateway.settings", "gateway", settings.model_dump(mode="json"))
+        return settings
+
+    def set_fallback_key(self, key: str) -> None:
+        from ..security import SecretsVault
+        SecretsVault(self.config.secrets_dir).set("fallback_api_key", key)
+        self._apply_gateway_settings()
+        self._audit("user", "gateway.fallback_key", "gateway", {"set": bool(key)})
+
+    def _apply_gateway_settings(self) -> None:
+        key = ""
+        try:
+            from ..security import SecretsVault
+            key = SecretsVault(self.config.secrets_dir).get("fallback_api_key")
+        except Exception:  # noqa: BLE001 - an unreadable vault only means no key for the external fallback
+            log.debug("fallback key not readable", exc_info=True)
+        self.gateway.configure(self.gateway_settings().model_dump(mode="json"), fallback_api_key=key)
 
     # ---- audit ---------------------------------------------------------------
     def _audit(self, actor: str, action: str, resource: str, detail: dict) -> None:
@@ -231,14 +336,16 @@ class Controller:
             self.store.kv_set(f"observed:{revision_id}", merged)
 
     # ---- model specs for the memory planner ------------------------------------
-    def set_model_spec(self, repo: str, spec: ModelSpec) -> None:
-        self.store.kv_set(f"model_spec:{repo}", spec.__dict__)
+    def set_model_spec(self, repo: str, spec: ModelSpec, sha: Optional[str] = None) -> None:
+        """Architecture and weight size of ``repo`` (at commit ``sha``). Never a KV measurement: those are
+        kept per experiment (controller.measurements), not per repository."""
+        doc = {**spec.__dict__, "kv_bytes_per_token": None}
+        if sha:
+            self.store.kv_set(f"model_spec:{repo}@{sha}", doc)
+        self.store.kv_set(f"model_spec:{repo}", doc)          # the latest registered, for unpinned drafts
 
-    def model_spec(self, repo: str) -> Optional[ModelSpec]:
-        d = self.store.kv_get(f"model_spec:{repo}")
-        if not d:
-            return None
-        return ModelSpec(**{k: v for k, v in d.items() if k in ModelSpec.__dataclass_fields__})
+    def model_spec(self, repo: str, sha: Optional[str] = None) -> Optional[ModelSpec]:
+        return load_model_spec(self.store, repo, sha)
 
     def profile_fit(self, name: str, ref: Optional[str] = None) -> dict[str, Any]:
         """Will this profile fit, and roughly how many KV tokens does it leave?
@@ -263,8 +370,11 @@ class Controller:
         same = obs_rev is not None and (rev is not None or obs_rev.draft == d)
         observed = self.store.kv_get(f"observed:{obs_rev.revision_id}") if obs_rev is not None else None
         startup_obs = self.store.kv_get(f"observed_startup:{obs_rev.revision_id}") if same else None
+        # the pinned identity the measurements are keyed by: a working draft that differs has none yet
+        identity = rev.identity if rev else (d.identity if d.identity is not None else
+                                             (obs_rev.identity if same and obs_rev is not None else None))
         if d.secondary:
-            fits = {node: self._draft_fit(part, [node], recipe_kv=True, observed_startup=startup_obs)
+            fits = {node: self._draft_fit(part, [node], identity=part.identity, legacy_startup=startup_obs)
                     for node, part in zip(("A", "B"), d.parts(), strict=True)}
             out = {"profile": name, "topology": "split", "nodes": fits,
                    "known": all(f["known"] for f in fits.values()),
@@ -273,8 +383,8 @@ class Controller:
                 out["observed"] = {**(observed or {}), "startup": startup_obs}
             return out
         kv_tokens = ((observed or {}).get("kv") or {}).get("kv_cache_tokens") if same else None
-        out = self._draft_fit(d, rev.required_nodes() if rev else None, observed_startup=startup_obs,
-                              observed_kv_tokens=kv_tokens if isinstance(kv_tokens, int) else None)
+        out = self._draft_fit(d, rev.required_nodes() if rev else None, identity=identity, legacy_startup=startup_obs,
+                              legacy_kv_tokens=kv_tokens if isinstance(kv_tokens, int) else None)
         out["profile"] = name
         if obs_rev is not None:
             obs = dict(observed) if isinstance(observed, dict) else None
@@ -283,37 +393,45 @@ class Controller:
             out["observed"] = obs
         return out
 
-    def _draft_fit(self, d: ProfileDraft, nodes=None, recipe_kv=False, *,
-                   observed_startup: Optional[dict] = None, observed_kv_tokens: Optional[int] = None) -> dict:
+    def _draft_fit(self, d: ProfileDraft, nodes=None, *, identity=None, legacy_startup: Optional[dict] = None,
+                   legacy_kv_tokens: Optional[int] = None) -> dict:
+        """``identity`` keys the measurements (controller.measurements); ``legacy_*`` are the 0.6 per-revision
+        observations, used only when no measurement of these exact settings exists yet."""
         from .planner import drafter_inputs
         s, a = d.simple, d.advanced
         out = {"model": s.model, "known": False}
-        spec = self.model_spec(s.model)
+        spec = self.model_spec(s.model, identity.model_revision if identity is not None else None)
         if spec is None:
             out["note"] = "model size unknown — pin the profile (or Resolve the model) first"
             return out
-        if recipe_kv:
-            spec = replace(spec, kv_bytes_per_token=d.source.get("kv_bytes_per_token"))
+        if nodes is None:
+            t = s.topology.value
+            nodes = ["A"] if t == "single-a" else ["B"] if t == "single-b" else ["A", "B"]
+        kv = {n: resolve_kv(self.measurements, d, identity, n) for n in nodes}
+        cal = {n: self.measurements.startup(d, identity, n) for n in nodes}
+        spec = replace(spec, kv_bytes_per_token=kv[nodes[0]][0])
         ctx, conc = s.planning_context(), a.max_num_seqs or s.concurrency
         budget = self.planner.estimate(spec=spec, quant=s.quantization, context_length=ctx,
                                        concurrency=conc, topology=s.topology,
                                        kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
                                        mem_total_gib=self._mem_total(nodes))
         util = a.gpu_memory_utilization or self.planner.gpu_memory_utilization(budget)
-        if nodes is None:
-            t = s.topology.value
-            nodes = ["A"] if t == "single-a" else ["B"] if t == "single-b" else ["A", "B"]
         drafters = drafter_inputs(a, self.model_spec)
         backend = "ray" if str(getattr(d.distributed_backend, "value", d.distributed_backend)) == "ray" else "native"
         plans = {}
         for n in nodes:
             facts = self.store.kv_get(f"hardware:{n}") or {}
+            if cal[n]:
+                observed, kv_tokens = {"nodes": {n: cal[n]}, "at": cal[n]["at"]}, cal[n].get("kv_tokens")
+            else:
+                observed, kv_tokens = legacy_startup, legacy_kv_tokens
             plans[n] = self.planner.plan_node(
-                spec=spec, quant=s.quantization, context_length=ctx, concurrency=conc, topology=s.topology,
+                spec=replace(spec, kv_bytes_per_token=kv[n][0]), kv_source=(kv[n][1], kv[n][2]),
+                quant=s.quantization, context_length=ctx, concurrency=conc, topology=s.topology,
                 node_id=n, backend=backend, kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode,
                 gpu_memory_utilization=util, facts=facts if isinstance(facts, dict) else {}, drafters=drafters,
                 max_num_batched_tokens=a.max_num_batched_tokens, chunked_prefill=a.chunked_prefill,
-                observed=observed_startup, observed_kv_tokens=observed_kv_tokens)
+                observed=observed, observed_kv_tokens=kv_tokens)
         # the 0.5 keys, now from the per-node plans: the worst node decides
         startup = min((p.startup for p in plans.values()), key=lambda v: v["margin_gib"])
         one = [p.one_context for p in plans.values()]
@@ -345,6 +463,11 @@ class Controller:
             "est_full_context_seqs": min(seqs) if seqs else None,
             "context_length": ctx, "concurrency": conc,
             "kv_bytes_per_token_source": "measured" if spec.kv_bytes_per_token else "formula",
+            "kv_source": {n: {"source": v[1], "note": v[2], "bytes_per_token": v[0]} for n, v in kv.items()},
+            # which measurements back this forecast (shown on the plan): none, or N starts of these exact settings
+            "calibration": {n: ({k: c[k] for k in ("samples", "worst_gib", "median_gib", "spread_gib", "margin_gib",
+                                                   "at")} if c else None) for n, c in cal.items()},
+            "fingerprinted": identity is not None,
             "budget": budget.as_dict(),
             "plan": {n: p.as_dict() for n, p in plans.items()},
             "verdicts": {
@@ -422,6 +545,15 @@ class Controller:
             "telemetry": self.telemetry,
             "maintenance": self.maintenance.state(),
             "routes": [st.to_payload() for st in self.gateway.routes.values()],
+            "halves": self.halves_status(),
+            "gateway": {k: self.gateway.settings.get(k) for k in ("balance", "affinity", "weights", "fallbacks")},
+            "gateway_process": self.gateway_link.status() if self.gateway_link is not None else {"mode": "in-process"},
+            # what the running switch touches: a client measuring another half's alias is not disturbed
+            "switch": None if not (self.busy() and self.current_job) else {
+                "job": self.current_job, "nodes": (self.current_scope or {}).get("nodes"),
+                "aliases": (self.current_scope or {}).get("aliases")},
+            "drain": {"policy": self.config.runtime.drain_policy, "timeout_s": self.config.runtime.drain_timeout_s,
+                      "wait_max_s": self.config.runtime.drain_wait_max_s},
             "metrics": self.sampler.latest(),
             "watchdog": {"enabled": self.config.watchdog.enabled,
                          "unhealthy_streak": self.watch_state["unhealthy_streak"],
@@ -431,6 +563,7 @@ class Controller:
     # ---- activation ---------------------------------------------------------------
     async def activate(self, profile_name: str, ref: str = "latest", *,
                        request_id: Optional[str] = None, expected_active: Any = _ANY,
+                       drain: Optional[dict] = None, nodes: Optional[list[str]] = None,
                        _rollback_of: Optional[str] = None, _recovery: bool = False,
                        _maintenance: bool = False) -> Job:
         """Validate synchronously, then run the activation in the background.
@@ -439,7 +572,18 @@ class Controller:
         (a client that lost its connection mid-request can safely send it again). ``expected_active``
         is the revision id the caller saw as active (None = nothing active); when the deployment changed
         since, the request is refused instead of switching on a stale view (two clients racing).
+        ``drain`` is ``{"policy": "abort"|"wait"|"force", "timeout_s": n}`` for requests still running when
+        the switch starts (default: ``runtime.drain_policy``). Switches the controller makes itself (a
+        rollback, a recovery, maintenance) force: the model they replace has already failed or must go.
+        ``nodes`` restarts only those halves of the active split revision; without it a switch between
+        revisions of a split profile touches only the halves that changed (controller.halves).
         """
+        if drain is not None:
+            if not isinstance(drain, dict) or drain.get("policy") not in (None, "abort", "wait", "force"):
+                raise ValueError("drain policy must be abort, wait or force")
+            t = drain.get("timeout_s")
+            if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 <= t <= 86400):
+                raise ValueError("drain timeout_s must be between 0 and 86400 seconds")
         if request_id is not None:
             if not isinstance(request_id, str) or not _REQUEST_ID_RE.match(request_id):
                 raise ValueError("request_id must be 8-80 characters: letters, digits and . _ : -")
@@ -469,30 +613,56 @@ class Controller:
         if missing:
             raise RuntimeError(f"{rev.draft.simple.topology.value} needs node(s) {missing}, "
                                f"which are not configured")
+        scope = split_halves.decide_scope(active=self.active(), active_rev=self.active_revision(), rev=rev,
+                                          nodes=nodes, serving=self._half_serving)
         kind = "rollback" if _rollback_of else ("recovery" if _recovery else "activation")
         job = Job(
             job_id=f"act-{secrets.token_hex(5)}", kind=kind,
             profile_revision=rev.revision_id,
             payload={"profile": profile_name, "revision_id": rev.revision_id,
                      "label": rev.label, "alias": rev.draft.simple.api_alias,
-                     "rollback_of": _rollback_of},
+                     "rollback_of": _rollback_of, "scope": scope,
+                     "drain": self._drain_settings(drain, controller_made=bool(_rollback_of or _recovery
+                                                                                   or _maintenance))},
         )
         self.store.save_job(job)
         await self._lock.acquire()           # taken now so a second request gets 409
         self.current_job = job.job_id
         self.busy_profile = profile_name
+        self.current_scope = scope
         if request_id is not None:
             self.store.kv_set(f"activation_request:{request_id}", {"job_id": job.job_id, "profile": profile_name,
                                                                    "at": time.time()})
         # the journal: what a controller restart in the middle of this switch has to clean up
         self.store.kv_set(JOURNAL_KEY, {"job_id": job.job_id, "profile": profile_name,
                                         "revision_id": rev.revision_id, "previous": self.active(),
-                                        "rollback_of": _rollback_of, "accepted_at": time.time()})
+                                        "rollback_of": _rollback_of, "scope": scope, "accepted_at": time.time()})
         self._spawn(self._run_activation(job, rev))
         self._audit("controller" if (_rollback_of or _recovery) else "user", "profile.activate",
                     f"profile/{profile_name}", {"revision": rev.revision_id, "job": job.job_id,
-                                                "kind": kind})
+                                                "kind": kind, "nodes": scope["nodes"] if scope else None})
         return job
+
+    def _half_serving(self, node: str) -> bool:
+        """Every alias of the active revision's half on ``node`` has a route that is up."""
+        aliases = split_halves.half_aliases(self.active_revision(), [node])
+        return bool(aliases) and all(
+            (st := self.gateway.routes.get(a)) is not None and st.backends and not st.down_reason
+            and not st.draining for a in aliases)
+
+    def serving_plan(self, rev: ProfileRevision) -> LaunchPlan:
+        """The launch plan of ``rev`` as it really runs: halves kept from an earlier revision under their
+        container names, halves that are down left out."""
+        return split_halves.serving_plan(self.launch_plan(rev), rev, self.active())
+
+    def _drain_settings(self, drain: Optional[dict], *, controller_made: bool) -> dict:
+        rt = self.config.runtime
+        if controller_made:
+            return {"policy": "force", "timeout_s": rt.drain_timeout_s}
+        drain = drain or {}
+        timeout = drain.get("timeout_s")
+        return {"policy": drain.get("policy") or rt.drain_policy,
+                "timeout_s": rt.drain_timeout_s if timeout is None else timeout}
 
     def cancel_job(self, job_id: str) -> dict:
         job = self.store.load_job(job_id)
@@ -534,14 +704,16 @@ class Controller:
         from .state_machine import ActivationStateMachine
 
         previous = self.active()
+        scope = job.payload.get("scope") or None
         rollback_target: Optional[tuple[str, str]] = None
         cancel_check = lambda: job.job_id in self._cancel   # noqa: E731
         try:
             coord = ActivationCoordinator(
                 config=self.config, agents=self.agents, gateway=self.gateway,
                 planner=self.planner, persist=self._persist,
-                model_spec=self.model_spec(rev.identity.model_repo),
-                model_specs={part.identity.model_repo: self.model_spec(part.identity.model_repo)
+                model_spec=self.model_spec(rev.identity.model_repo, rev.identity.model_revision),
+                model_specs={part.identity.model_repo: self.model_spec(part.identity.model_repo,
+                                                                       part.identity.model_revision)
                              for part in rev.parts()},
                 poll_interval=self.poll_interval, cancel_check=cancel_check,
                 staging_wait=self._staging_wait, store=self.store,
@@ -553,14 +725,24 @@ class Controller:
                 await ActivationStateMachine(job, coord.handle, self._persist,
                                              cancel_check=cancel_check).run()
                 job.state = JobState.COMPLETED
-                self.store.kv_set("active", {"profile": rev.profile_name,
-                                             "revision_id": rev.revision_id, "label": rev.label,
-                                             "alias": rev.draft.simple.api_alias,
-                                             "aliases": rev.draft.aliases,
-                                             "since": time.time()})
+                if scope and previous:
+                    # the kept half is still the container an earlier revision started
+                    self.store.kv_set("active", split_halves.merged_record(previous, rev, scope, time.time()))
+                else:
+                    self.store.kv_set("active", {"profile": rev.profile_name,
+                                                 "revision_id": rev.revision_id, "label": rev.label,
+                                                 "alias": rev.draft.simple.api_alias,
+                                                 "aliases": rev.draft.aliases,
+                                                 "since": time.time()})
+                models = job.payload.get("models")
+                if scope and previous:
+                    # what the kept half's start observed, under this revision too
+                    kept_from = (previous.get("half_revisions") or {}).get(scope["kept"][0], previous["revision_id"])
+                    models = {**((self.store.kv_get(f"observed:{kept_from}") or {}).get("models") or {}),
+                              **(models or {})}
                 self._mark_known_good(rev.profile_name, rev.revision_id, {
                     "kv": job.payload.get("kv"), "max_model_len": job.payload.get("max_model_len"),
-                    "models": job.payload.get("models"),
+                    "models": models,
                     "load_seconds": _stage_seconds(job, "loading"), "at": time.time()})
                 self.watch_state["unhealthy_streak"] = 0
             except StageFailed as exc:
@@ -585,8 +767,14 @@ class Controller:
                         why = (f"took longer than {EVIDENCE_TIMEOUT_S} s" if isinstance(cap_exc, asyncio.TimeoutError)
                                else f"{type(cap_exc).__name__}: {cap_exc}")
                         job.payload.setdefault("evidence_error", f"startup logs not saved: {why}"[:300])
-                    await self._stop_everything(coord.drained)
-                    self.store.kv_set("active", None)
+                    if scope and previous:
+                        # only this switch's halves are cleaned up: the kept half goes on serving
+                        await self._stop_everything(coord.drained, nodes=scope["nodes"])
+                        self.store.kv_set("active", split_halves.down_record(previous, scope["nodes"],
+                                                                             job.error or str(exc)))
+                    else:
+                        await self._stop_everything(coord.drained)
+                        self.store.kv_set("active", None)
                     if (self.config.auto_rollback and previous and not job.payload.get("rollback_of")
                             and previous.get("revision_id") != rev.revision_id):
                         rollback_target = (previous["profile"], previous["revision_id"])
@@ -607,6 +795,7 @@ class Controller:
             self._cancel.discard(job.job_id)
             self.current_job = None
             self.busy_profile = None
+            self.current_scope = None
             self._lock.release()
         if rollback_target:
             try:
@@ -712,17 +901,21 @@ class Controller:
         except OSError:
             log.exception("could not prune old startup evidence")
 
-    async def _stop_everything(self, aliases: list[str],
-                               failed_nodes: Optional[list[str]] = None) -> list[str]:
+    async def _stop_everything(self, aliases: list[str], failed_nodes: Optional[list[str]] = None,
+                               nodes: Optional[list[str]] = None) -> list[str]:
+        """Stop TwinSpark's containers and close their routes. With ``nodes`` only those nodes (the halves a
+        failed switch touched) and only ``aliases``: the other half of a split goes on serving."""
         stopped: list[str] = []
         for n, client in self.agents.items():
+            if nodes is not None and n not in nodes:
+                continue
             try:
                 stopped += (await client.call("containers_stop_owned", timeout=180))["stopped"]
             except Exception:  # noqa: BLE001
                 log.exception("stop on node %s failed", n)
                 if failed_nodes is not None:
                     failed_nodes.append(n)
-        for a in set(aliases) | set(self.gateway.routes):
+        for a in set(aliases) | (set() if nodes is not None else set(self.gateway.routes)):
             self.gateway.clear_route(a)
             self.gateway.cancel_drain(a)
         return stopped
@@ -808,12 +1001,22 @@ class Controller:
             self.current_job, self.busy_profile = job.job_id, journal.get("profile")
             try:
                 down = await self._wait_for_agents(self.config.startup_wait_s)
-                stopped = await self._stop_everything([])
-                self.store.kv_set("active", None)
+                scope = journal.get("scope") or None
+                previous_rec = journal.get("previous") or None
+                if scope and previous_rec:
+                    # a switch of one half: only that half was being replaced, the other one kept serving
+                    stopped = await self._stop_everything(list(scope.get("aliases") or []), nodes=scope["nodes"])
+                    self.store.kv_set("active", split_halves.down_record(
+                        previous_rec, scope["nodes"], "the controller restarted during the switch of this half"))
+                else:
+                    stopped = await self._stop_everything([])
+                    self.store.kv_set("active", None)
                 # cleared only now: a restart during the wait or the stop runs this recovery again
                 self.store.kv_set(JOURNAL_KEY, None)
             finally:
                 self.current_job, self.busy_profile = None, None
+        if journal.get("scope") and journal.get("previous"):
+            await self._adopt_running(self.active())      # the kept half: its container kept running
         previous = journal.get("previous") or None
         target = journal.get("revision_id")
         restore = bool(self.config.auto_rollback and previous and not journal.get("rollback_of")
@@ -837,12 +1040,22 @@ class Controller:
         """Start-up without an interrupted switch: re-attach what still runs, autostart otherwise."""
         active = self.active()
         if not active:
+            for alias in list(self.gateway.routes):  # a standalone gateway may still route a stopped model
+                self.gateway.remove_route(alias)
             return None
         await self._wait_for_agents(self.config.startup_wait_s)
         if self.busy() or self.active() != active:
             return None
-        if await self._adopt_running(active):
-            return None
+        missing: list[str] = []
+        if await self._adopt_running(active, missing=missing):
+            if not missing or not self.config.autostart or self.busy():
+                return None
+            # one half of a split came back, the other did not: restart only that one
+            try:
+                return await self.activate(active["profile"], active["revision_id"], nodes=missing, _recovery=True)
+            except Exception:  # noqa: BLE001
+                log.exception("restarting node(s) %s of %s failed", missing, active)
+                return None
         if self.busy() or self.active() != active:
             return None
         if not self.config.autostart:
@@ -872,38 +1085,58 @@ class Controller:
                 return down
             await asyncio.sleep(min(3.0, max(0.05, self.poll_interval)))
 
-    async def _adopt_running(self, active: dict) -> bool:
+    async def _adopt_running(self, active: dict, missing: Optional[list[str]] = None) -> bool:
         """Controller restarted but the containers kept running: re-attach routes
-        instead of restarting a healthy model."""
+        instead of restarting a healthy model.
+
+        A split deployment is adopted half by half: a half that still runs gets its routes back even when
+        the other one is gone; the nodes of the halves that are not healthy are added to ``missing``."""
         p = self.get_profile(active["profile"])
         rev = p.get_revision(active["revision_id"]) if p else None
         if rev is None:
             return False
+        bad: set[str] = set()
         try:
-            plan = self.launch_plan(rev)
+            plan = split_halves.serving_plan(self.launch_plan(rev), rev, active)
             for c in plan.containers:
-                r = await self.agents[c.node].call("health_probe", name=c.name, url=c.health_url)
+                try:
+                    r = await self.agents[c.node].call("health_probe", name=c.name, url=c.health_url)
+                except Exception:  # noqa: BLE001 - that node is away: for a split, only its half
+                    r = {}
                 if not r.get("healthy"):
-                    return False
+                    bad.add(c.node)
         except Exception:  # noqa: BLE001
             return False
+        if bad:
+            if not split_halves.is_split(rev) or bad >= set(plan.nodes):
+                return False
+            plan = split_halves.scoped_plan(plan, [n for n in plan.nodes if n not in bad])
+            if missing is not None:
+                missing.extend(sorted(bad))
         # Startup probes run while the GUI is available. Respect a stop, switch
         # or maintenance request that arrived while waiting for node health.
         if self.busy() or self.active() != active:
             return False
         observed = self.store.kv_get(f"observed:{rev.revision_id}") or {}
+        started = active.get("half_revisions") or {}
+        node_of = {c.health_url: c.node for c in plan.containers if c.health_url}
         for alias, backends in plan.routes.items():
             model = plan.route_models.get(alias, plan.served_model_name)
-            self.gateway.set_route(alias, backends, model, rev.revision_id,
+            # a kept half's route names the revision that started its container
+            served_by = started.get(next((node_of[b] for b in backends if b in node_of), ""), rev.revision_id)
+            self.gateway.set_route(alias, backends, model, served_by,
                                    max_model_len=(observed.get("models") or {}).get(model, {}).get(
-                                       "max_model_len", observed.get("max_model_len")))
-        self._audit("controller", "deployment.adopt", f"profile/{rev.profile_name}", {})
+                                       "max_model_len", observed.get("max_model_len")), nodes=node_of)
+        self._audit("controller", "deployment.adopt", f"profile/{rev.profile_name}",
+                    {"halves_missing": sorted(bad)} if bad else {})
         return True
 
     # ---- background: watchdog + metrics ------------------------------------------
     def start_background(self) -> None:
         if self._background:
             return
+        if self.gateway_link is not None:
+            self.gateway_link.start()
         if self.config.watchdog.enabled:
             self._background.append(asyncio.create_task(self._watchdog_loop()))
         self._background.append(asyncio.create_task(self._metrics_loop()))
@@ -924,7 +1157,9 @@ class Controller:
         rev = self.active_revision()
         if rev is None:
             return None
-        plan = self.launch_plan(rev)
+        plan = self.serving_plan(rev)          # a half that is down (its switch failed) is not watched
+        if not plan.containers:
+            return None
         problem = None
         unhealthy = False
         unreachable = False
@@ -973,7 +1208,7 @@ class Controller:
             if not scoped or urls & set(backends):
                 self.gateway.mark_down(alias, problem)
         incident = {"at": time.time(), "profile": rev.profile_name, "revision": rev.revision_id,
-                    "problem": problem, "action": "none"}
+                    "problem": problem, "action": "none", "nodes": sorted({c.node for c in bad})}
         wd = self.config.watchdog
         now = time.time()
         recent = [t for t in self.watch_state["recoveries"] if now - t < 3600]
@@ -993,9 +1228,14 @@ class Controller:
             self.watch_state["waiting_on"] = waiting_on
         elif wd.auto_recover and len(recent) < wd.max_recoveries_per_hour:
             self.watch_state["recoveries"].append(now)
+            # a split deployment restarts only the half that failed; the other one keeps serving
+            failed = sorted({c.node for c in bad})
+            half = (failed if split_halves.is_split(rev) and bad and None not in urls
+                    and len(failed) < len(split_halves.HALF_NODES) else None)
             try:
-                job = await self.activate(rev.profile_name, rev.revision_id, _recovery=True)
-                incident["action"] = f"restarting ({job.job_id})"
+                job = await self.activate(rev.profile_name, rev.revision_id, nodes=half, _recovery=True)
+                incident["action"] = (f"restarting node {', '.join(half)}'s half ({job.job_id})" if half
+                                      else f"restarting ({job.job_id})")
             except Exception as exc:  # noqa: BLE001
                 incident["action"] = f"restart failed: {exc}"
         elif wd.auto_recover:
@@ -1016,6 +1256,10 @@ class Controller:
                 log.exception("metrics tick failed")
 
     async def metrics_tick(self, refresh_nodes: bool = True) -> Optional[dict]:
+        try:
+            self.flush_usage()
+        except Exception:  # noqa: BLE001 - usage is bookkeeping: never stop the metrics loop
+            log.exception("usage could not be saved")
         if refresh_nodes:
             async def sample_node(name, agent):
                 try:
@@ -1030,15 +1274,132 @@ class Controller:
                 except Exception as exc:  # noqa: BLE001
                     self.telemetry[name] = {**self.telemetry.get(name, {}), "error": str(exc), "stale": True}
             await asyncio.gather(*(sample_node(name, agent) for name, agent in self.agents.items()))
+        nodes = {f"{n}.{k}": (t.get("gpu") or {}).get("power_w") if k == "gpu_power_w" else t.get(k)
+                 for n, t in self.telemetry.items() if isinstance(t, dict) and not t.get("stale") for k in NODE_KEYS}
         act = self.active()
-        if not act or self.busy():
+        # while one half of a split switches, the other half goes on being measured
+        switching = set((self.current_scope or {}).get("nodes") or []) if self.busy() else set()
+        if not act or (self.busy() and not switching):
+            self.history.add(nodes)
             return None
-        backends = {b for alias in act.get("aliases", [act.get("alias", "default")])
-                    if alias in self.gateway.routes for b in self.gateway.routes[alias].backends}
-        if not backends:
+        groups = [g for g in self._metric_groups(act) if g["key"] not in switching]
+        if switching:
+            for g in groups:
+                if g["key"] != "all":
+                    await self._scrape_group(g, act)
+            self.history.add(nodes)
             return None
-        snaps = [await scrape_metrics(b, headers=self.gateway.backend_headers()) for b in sorted(backends)]
-        return self.sampler.add(combine_snapshots(snaps), act.get("revision_id"))
+        every: list[dict] = []
+        all_pairs: list[tuple] = []
+        seen: set[str] = set()
+        result: Optional[dict] = None
+        for g in groups:
+            snaps, pairs, combined = await self._scrape_group(g, act)
+            seen.update(g["backends"])
+            all_pairs += pairs
+            every += snaps
+            if g["key"] == "all":
+                result = self.sampler.add(combined, act.get("revision_id"))
+        for b in [b for b in self.backend_samples if b not in seen]:
+            self.backend_samples.pop(b, None)
+        if not any(g["key"] == "all" for g in groups):
+            for node in [n for n in self.half_samplers if n not in {g["key"] for g in groups}]:
+                self.half_samplers.pop(node, None)
+            if every:
+                combined = combine_snapshots(every)
+                if combined.get("ok"):
+                    combined.update(windowed(all_pairs))
+                result = self.sampler.add(combined, act.get("revision_id"))
+        else:
+            self.half_samplers.clear()
+        point = self.sampler.latest() if result is not None else None
+        self.history.add({**nodes, **({k: point.get(k) for k in HISTORY_KEYS} if point else {})})
+        return result
+
+    async def _scrape_group(self, g: dict, act: dict) -> tuple[list[dict], list[tuple], dict]:
+        """Scrape one group's backends; keeps their raw samples for /metrics. A split half's numbers go to
+        its own sampler (its own model, alias and revision, so its own history)."""
+        snaps, pairs = [], []
+        for b, labels in g["backends"].items():
+            snap = await scrape_metrics(b, headers=self.gateway.backend_headers(), raw=True)
+            samples = snap.pop("samples", None)
+            if samples is not None:
+                prev = self.backend_samples.get(b)
+                # a window only spans scrapes of the same model: a switch starts a new one
+                pairs.append((prev["samples"] if prev and prev["labels"] == labels else None, samples))
+                self.backend_samples[b] = {"samples": samples, "ts": snap["ts"], "labels": labels}
+            snaps.append(snap)
+        combined = combine_snapshots(snaps)
+        if combined.get("ok"):
+            combined.update(windowed(pairs))
+        if g["key"] != "all":
+            self.half_samplers.setdefault(g["key"], MetricsSampler()).add(combined, g["revision"])
+        return snaps, pairs, combined
+
+    def _metric_groups(self, act: dict) -> list[dict]:
+        """What to scrape: one group per split half (``key`` = its node), else one for the deployment
+        (``key`` "all"). ``backends`` maps each backend URL to the labels its samples carry on /metrics."""
+        rev = self.active_revision()
+        node_of: dict[str, str] = {}
+        if rev is not None:
+            try:
+                node_of = {c.health_url: c.node for c in self.serving_plan(rev).containers if c.health_url}
+            except Exception:  # noqa: BLE001 - labels are best effort; the scrape itself must not fail
+                node_of = {}
+
+        def group(key: str, aliases: list[str], revision: Optional[str]) -> Optional[dict]:
+            backends: dict[str, dict] = {}
+            for alias in aliases:
+                st = self.gateway.routes.get(alias)
+                for b in (st.backends if st else []):
+                    backends.setdefault(b, {"alias": alias, "node": node_of.get(b, ""), "model": st.served_model or "",
+                                            "revision": st.revision_id or revision or ""})
+            return {"key": key, "aliases": aliases, "revision": revision, "backends": backends} if backends else None
+
+        parts = split_halves.halves(rev)
+        if parts:
+            started = act.get("half_revisions") or {}
+            out = [group(n, part.draft.simple.aliases, started.get(n, act.get("revision_id")))
+                   for n, part in parts.items()]
+        else:
+            out = [group("all", act.get("aliases") or [act.get("alias", "default")], act.get("revision_id"))]
+        return [g for g in out if g]
+
+    def halves_status(self) -> Optional[list[dict]]:
+        """Each half of the active split deployment on its own: what runs, since when, and how it is."""
+        act, rev = self.active(), self.active_revision()
+        parts = split_halves.halves(rev)
+        if not parts or not act:
+            return None
+        p = self.get_profile(rev.profile_name)
+        started = act.get("half_revisions") or {}
+        down = set(act.get("halves_down") or [])
+        since = act.get("half_since") or {}
+        switching = set((self.current_scope or {}).get("nodes") or (split_halves.HALF_NODES if self.busy() else []))
+        out = []
+        for node, part in parts.items():
+            rid = started.get(node, rev.revision_id)
+            started_rev = p.get_revision(rid) if p else None
+            routes = [self.gateway.routes.get(a) for a in part.draft.simple.aliases]
+            route_down = next((r.down_reason for r in routes if r is not None and r.down_reason), None)
+            if node in down:
+                state = "down"
+            elif node in switching and self.busy():
+                state = "switching"
+            elif route_down:
+                state = "unhealthy"
+            elif all(r is not None and r.backends for r in routes):
+                state = "serving"
+            else:
+                state = "starting"
+            sampler = self.half_samplers.get(node)
+            out.append({"node": node, "name": part.profile_name, "model": part.identity.model_repo,
+                        "model_revision": part.identity.model_revision, "image": part.identity.image_ref,
+                        "aliases": part.draft.simple.aliases, "revision_id": rid,
+                        "label": started_rev.label if started_rev else None, "since": since.get(node, act.get("since")),
+                        "state": state, "reason": (act.get("down_reasons") or {}).get(node) or route_down,
+                        "metrics": sampler.latest() if sampler else None})
+        return out
 
     # ---- delegated feature areas ---------------------------------------------------
     async def run_link_test(self, mode: str = "tcp", duration_s: float = 5.0, port: int = 29511,
@@ -1099,6 +1460,14 @@ class Controller:
         return await remove_mod(self, name)
 
     async def aclose(self) -> None:
+        if self.gateway_link is not None:
+            await self.gateway_link.poll()          # the last usage counters before the controller stops
+            await self.gateway_link.stop()
+        self.history.flush()
+        try:
+            self.flush_usage()
+        except Exception:  # noqa: BLE001
+            log.exception("usage could not be saved at shutdown")
         for t in self._background + list(self._tasks):
             t.cancel()
         self._background = []

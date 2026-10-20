@@ -22,6 +22,31 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pytest -q -rs
 ```
 
+## Continuous integration and dependency sets
+
+`.github/workflows/ci.yml` runs on every push to `main` and `release/**` and on every pull request:
+
+| Job | What |
+|---|---|
+| tests (minimum dependencies) | pytest against the oldest versions `pyproject.toml` allows, pinned in `constraints/minimum.txt` |
+| tests (newest dependencies) | pytest against today's releases |
+| GUI tests | `node --test tests/*.test.cjs`, and `web/dist` must equal a fresh `scripts/build_web.py` |
+| lint | `ruff check .` |
+| wheel + install smoke test | builds the wheel, installs it with `constraints/release.txt` in a clean venv and starts the demo cluster from it |
+
+`pyproject.toml` only sets lower bounds, so a library install takes the newest versions. A Spark install
+(`install.sh`) uses `constraints/release.txt`: the exact set this release was tested with
+(`TSM_UNPINNED=1` takes the newest instead). Regenerate it before a release:
+
+```bash
+python3.12 -m venv /tmp/rel && /tmp/rel/bin/pip install ".[hf]"
+/tmp/rel/bin/pip freeze --exclude twinspark-manager > constraints/release.txt   # keep the two header lines
+```
+
+Raise a bound in `constraints/minimum.txt` only together with `pyproject.toml`. Tests must pass on both
+sets: where a library changed behaviour between them (Starlette before 0.39 wraps stream errors in an
+`ExceptionGroup`), the test accepts both forms rather than narrowing the range.
+
 HF-cache symlink tests skip when Windows denies link creation. Linux PTYs, Unix sockets,
 root ownership, executable bits and atomic directory exchange have separate platform checks;
 their remaining workflow and error tests still run on Windows. Installer tests use Bash with

@@ -71,6 +71,8 @@ class ModelSpec:
     # config.json's num_hidden_layers; ``layers`` carries the same number for the KV formula. Kept as
     # its own field so specs registered before 0.6 (which lack it) still load.
     num_hidden_layers: int = 0
+    # config.json's "architectures" (e.g. ["Qwen3MoeForCausalLM"]): checked against what the image can serve
+    architectures: tuple = ()
 
     def __post_init__(self) -> None:
         if not self.num_hidden_layers:
@@ -230,6 +232,20 @@ class MemoryPlanner:
         headroom = min(budget.headroom_gib(), pool_headroom)
         return headroom >= 0, headroom
 
+    def explain(self, budget: NodeBudget, util: Optional[float] = None) -> str:
+        """The numbers behind :meth:`fits`, for a verdict a person can check: which limit binds, what vLLM
+        may use and what this setup needs from it, bucket by bucket."""
+        util = util if util is not None else self.gpu_memory_utilization(budget)
+        pool = util * budget.mem_total
+        parts = [("weights", budget.model_weights), ("KV cache", budget.kv_cache), ("CUDA graphs", budget.cuda_graphs),
+                 ("activations", budget.activations), ("NCCL", budget.nccl + budget.distributed_backend)]
+        needs = ", ".join(f"{name} {gib:.1f}" for name, gib in parts if gib >= 0.05)
+        if pool - budget.vllm_needed <= budget.headroom_gib():
+            return (f"with --gpu-memory-utilization={util:.2f} vLLM may use {pool:.1f} of {budget.mem_total:.1f} GiB "
+                    f"per node and needs {budget.vllm_needed:.1f} GiB ({needs})")
+        return (f"the node has {budget.mem_total:.1f} GiB; the OS, Docker and TwinSpark keep {budget.non_vllm:.1f} GiB "
+                f"and vLLM needs {budget.vllm_needed:.1f} GiB ({needs})")
+
     @staticmethod
     def classify_headroom(headroom_gib: float) -> str:
         if headroom_gib >= 4.0:
@@ -274,12 +290,14 @@ class MemoryPlanner:
         observed: Optional[dict] = None,
         observed_kv_tokens: Optional[int] = None,
         mem_total_gib: Optional[float] = None,
+        kv_source: Optional[tuple[str, str]] = None,
     ) -> "NodePlan":
         """Everything one node holds for this deployment, bucket by bucket, and three verdicts.
 
-        ``facts`` are the node's last ``hardware_facts``; ``observed`` is the revision's observed startup
-        (``{"nodes": {node: timeline summary}}``) and ``observed_kv_tokens`` the KV pool vLLM reported
-        on its last successful start. See docs/memory-planning.md for every formula.
+        ``facts`` are the node's last ``hardware_facts``; ``observed`` is the observed startup of these
+        exact settings (``{"nodes": {node: calibration}}``, see controller.measurements) and
+        ``observed_kv_tokens`` the KV pool vLLM reported. ``kv_source`` is ``(source, note)`` for a
+        ``spec.kv_bytes_per_token`` that was resolved for this setup. See docs/memory-planning.md.
         """
         return _plan_node(self, spec=spec, quant=quant, context_length=context_length,
                           concurrency=concurrency, topology=topology, node_id=node_id,
@@ -288,7 +306,7 @@ class MemoryPlanner:
                           facts=facts or {}, drafters=list(drafters),
                           batched_tokens=max_num_batched_tokens, chunked_prefill=chunked_prefill,
                           observed=observed or {}, observed_kv_tokens=observed_kv_tokens,
-                          mem_total_gib=mem_total_gib)
+                          mem_total_gib=mem_total_gib, kv_source=kv_source)
 
 
 # ---- per-node plan ------------------------------------------------------------------------------
@@ -613,7 +631,8 @@ def _plan_node(planner: MemoryPlanner, *, spec: ModelSpec, quant: Quantization, 
                concurrency: int, topology: Topology, node_id: str, backend: DistributedBackend,
                kv_dtype: Optional[str], using_cuda_graphs: bool, util: Optional[float], facts: dict,
                drafters: list[DrafterInput], batched_tokens: Optional[int], chunked_prefill: Optional[bool],
-               observed: dict, observed_kv_tokens: Optional[int], mem_total_gib: Optional[float]) -> NodePlan:
+               observed: dict, observed_kv_tokens: Optional[int], mem_total_gib: Optional[float],
+               kv_source: Optional[tuple[str, str]] = None) -> NodePlan:
     notes: list[str] = []
     sharded = topology in _SHARDED
     shards = 2 if sharded else 1
@@ -691,13 +710,16 @@ def _plan_node(planner: MemoryPlanner, *, spec: ModelSpec, quant: Quantization, 
     kv_elem = _KV_BYTES.get((kv_dtype or "auto").lower(), 2.0)
     if spec.kv_bytes_per_token:
         per_tok = float(spec.kv_bytes_per_token)
-        kv_src, kv_note = "measured", "KV bytes per token measured by the recipe (per node, as served)"
+        kv_src, kv_note = kv_source or ("measured", "KV bytes per token measured by the recipe (per node, as served)")
     else:
         per_tok = _kv_bytes_per_token(spec, kv_elem)
         if (topology == Topology.PP2 or (topology in (Topology.TP2, Topology.TP_EP) and not spec.is_mla
                                          and spec.num_kv_heads >= 2)):
             per_tok /= 2
         kv_src, kv_note = "estimated", f"textbook KV formula ({kv_dtype or 'auto'} cache)"
+        if kv_source and kv_source[1]:
+            # say why no measurement was used, e.g. "the recipe measured its KV size with other settings"
+            kv_note += f"; {kv_source[1]}"
     if per_tok > 0:
         kv_one = per_tok * context_length / 1024 ** 3
         kv_full = kv_one * concurrency
@@ -755,7 +777,20 @@ def _plan_node(planner: MemoryPlanner, *, spec: ModelSpec, quant: Quantization, 
     margin = mem_total - peak
     startup.update(margin_gib=_r(margin), margin_low_gib=_r(mem_total - peak_hi),
                    margin_high_gib=_r(mem_total - peak_lo), ok=margin >= 0, level=_level(margin))
-    if startup["source"] == "calibrated":
+    if startup["source"] == "calibrated" and isinstance(obs.get("samples"), int):
+        n = obs["samples"]
+        startup.update(calibration_samples=n, calibration_median_gib=_r(_num(obs.get("median_gib"))),
+                       calibration_spread_gib=_r(_num(obs.get("spread_gib"))),
+                       calibration_margin_gib=_r(_num(obs.get("margin_gib"))))
+        extra = (f" + {obs['margin_gib']:.1f} GiB allowance while there are fewer than 3 starts"
+                 if _num(obs.get("margin_gib")) else "")
+        worst, median = _num(obs.get("worst_gib")) or footprint, _num(obs.get("median_gib")) or footprint
+        spread = _num(obs.get("spread_gib")) or 0.0
+        startup["note"] = (f"{n} earlier start(s) with exactly these settings took up to {worst:.1f} GiB here at their "
+                           f"lowest MemAvailable (median {median:.1f}, spread {spread:.1f}){extra}; with what is "
+                           f"resident now that peaks at {peak:.1f} of {mem_total:.1f} GiB "
+                           f"(estimate: {est['peak']:.1f} GiB)")
+    elif startup["source"] == "calibrated":
         startup["note"] = (f"last startup of this revision took {footprint:.1f} GiB here at its lowest MemAvailable; "
                            f"with what is resident now that peaks at {peak:.1f} of {mem_total:.1f} GiB "
                            f"(estimate: {est['peak']:.1f} GiB)")
@@ -793,7 +828,7 @@ def _plan_node(planner: MemoryPlanner, *, spec: ModelSpec, quant: Quantization, 
             cal = observed_kv_tokens / context_length
             full.update(source="calibrated", est_kv_tokens=int(observed_kv_tokens),
                         est_full_length_seqs=round(cal, 1), ok=cal >= concurrency, estimate_kv_tokens=int(tokens_fit),
-                        note=f"vLLM reported {observed_kv_tokens:,} KV tokens on its last start of this revision: "
+                        note=f"vLLM reported {observed_kv_tokens:,} KV tokens on its last start with these settings: "
                              f"about {cal:.1f} full-length sequences, {concurrency} requested")
             full["level"] = "SAFE" if full["ok"] else ("LOW" if cal >= 1 else "CRITICAL")
             one_ctx.update(source="calibrated", ok=cal >= 1, level="SAFE" if cal >= 1 else "CRITICAL")
@@ -868,4 +903,5 @@ def make_spec_from_hf(config: dict, weight_bytes: Optional[int] = None) -> Model
         kv_lora_rank=_cfg_int(cfg, "kv_lora_rank"),
         qk_rope_head_dim=_cfg_int(cfg, "qk_rope_head_dim"),
         hidden_size=hidden, num_hidden_layers=layers,
+        architectures=tuple(str(a)[:120] for a in (config.get("architectures") or [])[:8] if isinstance(a, str)),
     )

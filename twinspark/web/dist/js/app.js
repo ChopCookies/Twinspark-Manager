@@ -68,10 +68,29 @@ async function api(method, path, body) {
   return data;
 }
 /** Body for an activation: an id that makes a retried request harmless, and the deployment we decided on. */
-function activationBody() {
+/** Requests still running when a switch starts: ask what to do with them. null = do not switch. */
+async function drainChoice(aliases = null) {
+  let st;
+  try { st = await GET("/api/v1/status"); } catch (e) { return {}; }
+  // restarting one half of a split: only that half's requests are in the way
+  const routes = (st.routes || []).filter(r => r.inflight > 0 && (!aliases || aliases.includes(r.alias)));
+  const busy = routes.reduce((n, r) => n + r.inflight, 0);
+  if (!busy) return {};
+  const longest = Math.max(...routes.map(r => r.oldest_inflight_s || 0));
+  const { value } = await modal({
+    title: `${busy} request${busy === 1 ? " is" : "s are"} still running`,
+    body: `<p>${esc(routes.map(r => `${r.alias}: ${r.inflight}`).join(", "))}${longest ? ` — the longest for ${esc(Math.round(longest))} s` : ""}.</p>
+      <p class="small muted">An agent may be in the middle of a long task. By default the switch waits ${esc((st.drain || {}).timeout_s ?? 30)} s and is then <b>aborted</b>: the old model keeps serving and nothing is stopped.</p>`,
+    actions: [{ label: "Cancel", value: null }, { label: "Wait for them", value: "wait" },
+      { label: "End them and switch", value: "force", cls: "danger" }, { label: "Switch, abort if they take longer", value: "abort", cls: "primary" }],
+  });
+  if (value === null || value === undefined) return null;
+  return value === "abort" ? {} : value === "force" ? { drain_policy: "force", drain_timeout_s: 0 } : { drain_policy: "wait" };
+}
+function activationBody(extra = {}) {
   const rnd = (globalThis.crypto && crypto.getRandomValues) ? Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, "0")).join("")
     : Math.random().toString(16).slice(2, 18).padEnd(16, "0");
-  const body = { request_id: "gui-" + rnd };
+  const body = { request_id: "gui-" + rnd, ...extra };
   if (S.seenActive !== undefined) body.expected_active = S.seenActive;
   return body;
 }
@@ -483,14 +502,38 @@ async function viewDashboard() {
   onAct({
     activate: async (el) => {
       const name = $("#qs-profile").value; if (!name) return;
-      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(name)}/activate`, activationBody()));
+      const drain = await drainChoice(); if (drain === null) return;
+      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(name)}/activate`, activationBody(drain)));
       toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
     },
     stop: async (el) => { if (await stopFlow(el)) draw().catch(() => { }); },
     cancel: async (el) => { const r = await POST(`/api/v1/jobs/${enc(el.dataset.id)}/cancel`); toast(r.note); },
+    routing: async () => { await routingFlow(); draw().catch(() => { }); },
+    "half-restart": async (el) => {
+      const node = el.dataset.node, aliases = (el.dataset.aliases || "").split(",").filter(Boolean);
+      if (!await confirmBox(`Restart node ${node}'s model?`, `Only this half is drained, stopped and started again: ${esc(aliases.join(", "))} answers 503 meanwhile. The other half keeps serving and its running requests are not touched.`, { label: "Restart this half" })) return;
+      const drain = await drainChoice(aliases); if (drain === null) return;
+      const job = await busy(el, () => POST(`/api/v1/profiles/${enc(el.dataset.profile)}/activate${qs({ revision: el.dataset.revision })}`, activationBody({ ...drain, nodes: [node] })));
+      toast(`restarting node ${node}'s half`); go("#/jobs/" + enc(job.job_id));
+    },
   });
   await draw();
   poll(draw, 5000);
+}
+/** a split deployment: each half on its own — what runs, since when, how it is doing, and a restart */
+function halvesHtml(st) {
+  const act = st.active, halves = st.halves || [];
+  if (!act || !halves.length) return "";
+  const cls = { serving: "good", starting: "info", switching: "warn", unhealthy: "bad", down: "bad" };
+  return `<div class="grid cols-2" style="margin-top:14px">${halves.map(h => {
+    const m = h.metrics || {};
+    return `<div class="card" data-key="half:${esc(h.node)}"><div class="card-head"><h2>Node ${esc(h.node)} · ${h.aliases.map(a => tag(a, "info")).join(" ")}</h2>${tag(h.state, cls[h.state] || "muted")}</div>
+      <div class="model mono small">${esc(h.model)}@${esc(sha(h.model_revision, 12))}</div>
+      <p class="small muted">started by ${esc(h.label || h.revision_id)}${h.revision_id !== act.revision_id ? " (kept across later revisions)" : ""} · ${esc(ago(h.since))}</p>
+      ${h.reason ? `<p class="small err">${esc(h.reason)}</p>` : ""}
+      ${m.ok ? `<div class="kv small"><b>Decode</b><span>${num(m.decode_tok_s, 1)} tok/s</span><b>KV cache</b><span>${num(m.kv_cache_usage_pct, 1)} %</span><b>Running / waiting</b><span>${num(m["requests-running"])} / ${num(m["requests-waiting"])}</span></div>` : ""}
+      <div class="row end"><button class="btn sm" data-act="half-restart" data-node="${esc(h.node)}" data-aliases="${esc(h.aliases.join(","))}" data-profile="${esc(act.profile)}" data-revision="${esc(act.revision_id)}" ${st.busy ? "disabled" : ""}>${h.state === "down" ? "Start this half" : "Restart this half"}</button></div></div>`;
+  }).join("")}</div>`;
 }
 /** Drain and stop the active model (dashboard, profile list and profile page share this). */
 async function stopFlow(el) {
@@ -518,6 +561,8 @@ function dashboardHtml(st, series, profs, job) {
   if (job) html += jobBanner(job);
   if (!act && !job) html += `<div class="callout info"><div><b>New here?</b> The <a href="#/start">Get started</a> checklist shows what is set up and what is next.</div></div>`;
   if (["running", "failed"].includes(st.maintenance?.state)) html += `<div class="callout warn"><div><b>Cluster reserved for maintenance</b> · ${esc(st.maintenance.phase)}${st.maintenance.error ? ` · ${esc(st.maintenance.error)}` : ""} <a href="#/updates">Open update progress</a></div></div>`;
+  const gp = st.gateway_process || {};
+  if (gp.mode === "standalone" && gp.reachable === false && gp.error) html += `<div class="callout bad"><div><b>The gateway does not answer:</b> apps cannot reach the model. ${esc(gp.error || "")} — on node A: <span class="mono">sudo systemctl status twinspark-gateway</span></div></div>`;
   if (down) html += `<div class="callout bad"><div><b>Model is down:</b> ${esc(down.down_reason)}${inc && inc.action ? ` — ${esc(inc.action)}` : ""}</div></div>`;
   else if (inc && Date.now() / 1000 - inc.at < 3600) html += `<div class="callout warn"><div><b>Incident ${esc(ago(inc.at))}:</b> ${esc(inc.problem)} → ${esc(inc.action)}</div></div>`;
 
@@ -538,13 +583,13 @@ function dashboardHtml(st, series, profs, job) {
         ${tile("Prefill", m.prefill_tok_s, "tok/s", series.prefill_tok_s, "#9d7bff", 0)}
         ${tile("Running / waiting", m.ok ? `${num(m["requests-running"])} / ${num(m["requests-waiting"])}` : null, "", series["requests-running"], "#4ade80")}
         ${tile("KV cache used", m.kv_cache_usage_pct, "%", series.kv_cache_usage_pct, "#fbbf24", 1)}
-        ${tile("TTFT (avg)", m.avg_ttft_ms, "ms", null)}
-        ${tile("Inter-token (avg)", m.avg_itl_ms, "ms", null)}
+        ${m.ttft_p95_ms != null ? tile("TTFT p95 (last interval)", m.ttft_p95_ms, "ms", series.ttft_p95_ms) : tile("TTFT (avg)", m.avg_ttft_ms, "ms", null)}
+        ${m.itl_p95_ms != null ? tile("Inter-token p95 (last interval)", m.itl_p95_ms, "ms", null, "", 1) : tile("Inter-token (avg)", m.avg_itl_ms, "ms", null)}
         ${m.spec_mean_accept_len ? tile("Spec. acceptance", m.spec_accept_len_now ?? m.spec_mean_accept_len, "tok/step", null) : ""}
         ${m.prefix_hit_rate_pct != null ? tile("Prefix-cache hits", m.prefix_hit_rate_pct, "%", null) : ""}
       </div>
       ${m.ok === false || !st.metrics ? `<p class="small muted" style="margin:10px 0 0">Serving metrics appear after the first scrape (every ${esc(10)} s).</p>` : ""}
-    </div>`;
+    </div>${halvesHtml(st)}`;
   } else {
     html += `<div class="card"><div class="empty"><b>Nothing is serving</b>${pinned.length ? "Pick a profile above and switch." : "Import a recipe from the Cookbook, pin it, then switch."}</div>
       <div class="row" style="justify-content:center">${pinned.length ? "" : `<a class="btn primary" href="#/cookbook">Open the cookbook</a>`}</div></div>`;
@@ -562,12 +607,44 @@ function dashboardHtml(st, series, profs, job) {
   html += `<div class="card"><div class="card-head"><h2>Gateway routes</h2><span class="small muted">OpenAI-compatible endpoint · port 8000 by default</span></div>`;
   html += routes.length ? `<div class="table-wrap"><table><thead><tr><th>Model name</th><th>Status</th><th>Serves</th><th class="num">In flight</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Max len</th></tr></thead><tbody>
     ${routes.map(r => `<tr data-key="route:${esc(r.alias)}"><td class="mono">${esc(r.alias)}</td><td>${tag(r.status, r.status === "serving" ? "good" : r.status === "down" ? "bad" : "warn")}${r.down_reason ? `<div class="sub">${esc(r.down_reason)}</div>` : ""}</td>
-      <td>${esc(r.model || "—")}</td><td class="num">${num(r.inflight)}</td><td class="num">${num(r.requests)}</td>
+      <td>${esc(r.model || "—")}</td><td class="num">${num(r.inflight)}${r.oldest_inflight_s ? `<div class="sub">longest ${esc(Math.round(r.oldest_inflight_s))} s</div>` : ""}</td><td class="num">${num(r.requests)}</td>
       <td class="num">${num(r.errors)}${r.last_error ? `<div class="sub">${esc(r.last_error)}</div>` : ""}</td><td class="num">${num(r.max_model_len)}</td></tr>`).join("")}
     </tbody></table></div>` : empty("No routes", "The gateway returns 404 until a model is activated.");
-  html += `</div>`;
+  html += routingHtml(st.gateway) + `</div>`;
   if (st.staging && st.staging.length) html += `<div class="callout info">Staging weights in the background: ${st.staging.map(s => `<span class="mono">${esc(s)}</span>`).join(", ")} — <a href="#/jobs">jobs</a></div>`;
   return html + `</div>`;
+}
+/** how the gateway picks a backend and what answers while an alias switches (master plan §3.3) */
+function routingHtml(g) {
+  if (!g) return "";
+  const w = Object.entries(g.weights || {}).map(([n, v]) => `node ${n} × ${v}`).join(", ");
+  const fb = Object.entries(g.fallbacks || {}).map(([a, f]) => `${tag(a, "info")} → ${f.alias ? `alias <span class="mono">${esc(f.alias)}</span>` : `<span class="mono">${esc(f.url)}</span> (${esc(f.model)})`}`).join(" · ");
+  return `<div class="row between small" style="margin-top:10px"><span class="muted">Routing: ${esc(g.balance)}${w ? " · " + esc(w) : ""} · session affinity ${g.affinity ? "on" : "off"} · fallback while switching: ${fb || "none (503)"}</span><button class="btn sm" data-act="routing">Routing…</button></div>`;
+}
+async function routingFlow() {
+  const v = await GET("/api/v1/gateway"), s = v.settings;
+  const fbText = Object.entries(s.fallbacks || {}).map(([a, f]) => f.alias ? `${a}=alias:${f.alias}` : `${a}=url:${f.url},model:${f.model}`).join("\n");
+  const vals = await formBox("Gateway routing", [
+    { id: "balance", label: "Replicated models: which copy gets a request", type: "select", value: s.balance, options: [["least-inflight", "the one with fewer requests in flight"], ["round-robin", "in turn"]] },
+    { id: "wa", label: "Share of node A (weight)", value: String((s.weights || {}).A ?? 1) },
+    { id: "wb", label: "Share of node B (weight)", value: String((s.weights || {}).B ?? 1) },
+    { id: "affinity", label: "Keep a session on one copy (session-id header or prompt_cache_key): its prefix cache stays warm", type: "check", value: s.affinity },
+    { id: "fallbacks", label: "While an alias is switching or down, answer from (one per line)", type: "textarea", rows: 3, value: fbText, placeholder: "default=alias:secondary\ndefault=url:https://api.example.com/v1,model:small-model", help: "Responses from a fallback carry the header X-TwinSpark-Fallback. An external endpoint gets the key set with `tsm gateway fallback-key`, never the cluster's own keys." },
+  ], { label: "Save", wide: true, intro: `<p class="small muted">Applies to the next request; requests in flight keep their backend. Settings from ${esc(v.source)}.</p>`,
+    validate: (x) => {
+      const weight = (t, n) => { const f = Number(t); if (!isFinite(f) || f < 0 || f > 100) throw new Error(`weight of node ${n}: 0 to 100`); return f; };
+      const fallbacks = {};
+      for (const line of x.fallbacks.split("\n").map(l => l.trim()).filter(Boolean)) {
+        const m = line.match(/^([^=\s]+)=(alias:(\S+)|url:([^,\s]+),model:(\S+))$/);
+        if (!m) throw new Error(`"${line}": use ALIAS=alias:OTHER or ALIAS=url:URL,model:NAME`);
+        fallbacks[m[1]] = m[3] ? { alias: m[3] } : { url: m[4], model: m[5] };
+      }
+      x.body = { balance: x.balance, affinity: x.affinity, weights: { A: weight(x.wa, "A"), B: weight(x.wb, "B") }, fallbacks };
+      return true;
+    } });
+  if (!vals) return;
+  await PUT("/api/v1/gateway", vals.body);
+  toast("routing saved", "good");
 }
 function tile(k, v, unit, series, color, digits = 0) {
   return `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${v == null ? "—" : (typeof v === "number" ? num(v, digits) : esc(v))}${v != null && unit ? `<small>${esc(unit)}</small>` : ""}</div>${series ? spark(series, color) : ""}</div>`;
@@ -632,14 +709,30 @@ async function viewSystem() {
   const draw = async () => {
     if (loading) return; loading = true;
     try {
-      const [data, status] = await Promise.all([GET("/api/v1/system/telemetry"), GET("/api/v1/status")]);
+      const [data, status, hist] = await Promise.all([GET("/api/v1/system/telemetry"), GET("/api/v1/status"),
+        GET("/api/v1/system/metrics/history?hours=24").catch(() => null)]);
       if (!current(g)) return;
       const names = [...new Set([...Object.keys(status.nodes || {}), ...Object.keys(data.nodes)])].sort();
-      $("#system-content").innerHTML = `<p class="small muted">Sampled every ${num(data.interval_s)} s · recent history stays in memory · — means unavailable, not zero.</p>` + (names.length ? `<div class="grid cols-2">${names.map(n => systemNode(n, data.nodes[n] || {}, data.history[n] || [], data.interval_s)).join("")}</div>` : empty("No nodes connected", "Configure node A and B to see their system readings."));
+      $("#system-content").innerHTML = `<p class="small muted">Sampled every ${num(data.interval_s)} s · recent history stays in memory · — means unavailable, not zero.</p>` + (names.length ? `<div class="grid cols-2">${names.map(n => systemNode(n, data.nodes[n] || {}, data.history[n] || [], data.interval_s)).join("")}</div>` : empty("No nodes connected", "Configure node A and B to see their system readings.")) + historyCard(hist, names);
     } catch (e) { if (current(g)) $("#system-content").innerHTML = `<div class="callout warn">${esc(e.message)} · Retrying automatically.</div>`; }
     finally { loading = false; }
   };
   await draw(); every(draw, 5000);
+}
+/** the last 24 hours as minute averages (kept on node A across restarts); Prometheus keeps more (docs/metrics.md) */
+function historyCard(h, nodes) {
+  if (!h || !(h.ts || []).length) return "";
+  const last = (k) => { const v = (h[k] || []).filter(x => x != null); return v.length ? v[v.length - 1] : null; };
+  const peak = (k) => { const v = (h[k] || []).filter(x => x != null); return v.length ? Math.max(...v) : null; };
+  const low = (k) => { const v = (h[k] || []).filter(x => x != null); return v.length ? Math.min(...v) : null; };
+  const hours = Math.max(1, Math.round((h.ts[h.ts.length - 1] - h.ts[0]) / 3600));
+  const tiles = [
+    tile("Decode (peak " + num(peak("decode_tok_s")) + ")", last("decode_tok_s"), "tok/s", h.decode_tok_s, "#6aa7ff", 1),
+    tile("KV cache (peak " + num(peak("kv_cache_usage_pct"), 1) + " %)", last("kv_cache_usage_pct"), "%", h.kv_cache_usage_pct, "#fbbf24", 1),
+    tile("TTFT p95", last("ttft_p95_ms"), "ms", h.ttft_p95_ms, "#9d7bff"),
+    ...nodes.map(n => tile(`Node ${n} MemAvailable (low ${gib(low(n + ".mem_available_gib"))})`, last(n + ".mem_available_gib"), "GiB", h[n + ".mem_available_gib"], "#4ade80", 1)),
+  ];
+  return `<div class="card" style="margin-top:14px"><div class="card-head"><h2>Last ${esc(hours)} h</h2><span class="small muted">minute averages, kept on node A across restarts · longer history: Prometheus (/metrics)</span></div><div class="tiles">${tiles.join("")}</div></div>`;
 }
 function maintenanceProgress(s) {
   if (s.state === "idle") return empty("No maintenance running", "Check the nodes to review available package updates and their permissions.");
@@ -736,7 +829,8 @@ async function viewProfiles() {
 }
 
 async function activateFlow(name, revision = "latest", btn = null) {
-  const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/activate${qs({ revision })}`, activationBody()));
+  const drain = await drainChoice(); if (drain === null) return;
+  const job = await busy(btn, () => POST(`/api/v1/profiles/${enc(name)}/activate${qs({ revision })}`, activationBody(drain)));
   toast(`switching to ${name}`); go("#/jobs/" + enc(job.job_id));
 }
 async function splitFlow(rows) {
@@ -861,12 +955,14 @@ async function viewProfile(name, tab) {
       <button class="btn ${last ? "" : "primary"}" data-act="pin">${icon("pin")}${last ? "Re-pin" : "Pin"}</button>
       <button class="btn" data-act="duplicate">Duplicate</button>
       ${d?.source?.receipt ? '<button class="btn" data-act="recipe-update">Check recipe updates</button>' : ''}
+      ${last && String(d?.source?.receipt?.ref || "").startsWith("builtin:") ? '<button class="btn" data-act="share-result">Share result…</button>' : ''}
       <button class="btn danger" data-act="delete" ${isActive ? "disabled" : ""}>Delete</button>
     </div></div>
     ${hasEdits ? `<div class="callout warn"><div><b>Your draft has unpinned changes.</b> Re-pin to run these settings. Switching to the latest revision uses the previously pinned settings.</div></div>` : ""}
     <div class="tabs">${tabs.map(([id, l]) => `<a href="#/profiles/${enc(name)}/${id}" class="${tab === id ? "active" : ""}">${esc(l)}</a>`).join("")}</div>`;
   const common = {
     'recipe-update': el => checkRecipeUpdate(name, el),
+    'share-result': el => shareResultFlow(name, el),
     prepare: async (el) => {
       if (!last || hasEdits) await automateRecipe(name, el);
       else await prepareFlow(name, el);
@@ -910,7 +1006,7 @@ async function profileOverview(name, p, d) {
   html += `<div class="grid cols-2"><div class="card"><h2>What gets served</h2><div class="kv">
     <b>Model</b><span class="mono">${esc(s.model)}${d.identity ? "@" + esc(sha(d.identity.model_revision, 12)) : ""}</span>
     <b>Image</b><span class="mono">${esc(d.identity ? d.identity.image + " @ " + sha(d.identity.image_digest, 12) + " (" + d.identity.image_source + ")" : (d.image_hint || "—"))}</span>
-    <b>Topology</b><span>${esc(s.topology)} · ${esc(d.distributed_backend)} · ${esc(s.quantization)}</span>
+    <b>Topology</b><span>${esc(s.topology)} · ${esc(d.distributed_backend)} · ${esc(s.quantization)}${d.engine === "sglang" ? " · SGLang" : ""}</span>
     <b>Context</b><span>${esc(s.context_length)} ${s.context_length === "auto" ? '<span class="muted">(vLLM picks the largest that fits)</span>' : "tokens"}</span>
     <b>Parallel seqs</b><span>${esc(a.max_num_seqs || s.concurrency)}</span>
     <b>Model names</b><span>${[s.api_alias, ...(s.extra_aliases || [])].map(x => tag(x, "info")).join(" ")}</span>
@@ -971,6 +1067,21 @@ function planNodeHtml(node, p) {
   for (const n of p.notes || []) h += `<p class="small muted">${esc(n)}</p>`;
   return h;
 }
+/** which measurements back the forecast, per node: the KV size's source and the starts with these exact settings */
+function forecastBacking(fit) {
+  const nodes = [...new Set([...Object.keys(fit.kv_source || {}), ...Object.keys(fit.calibration || {})])].sort();
+  if (!nodes.length) return "";
+  const kvLabel = { measured: "measured", estimated: "estimated (formula)" };
+  const rows = nodes.map(n => {
+    const kv = (fit.kv_source || {})[n], cal = (fit.calibration || {})[n];
+    const kvText = kv ? `${tag(kvLabel[kv.source] || kv.source, kv.source === "measured" ? "good" : "warn")} <span class="muted">${esc(kv.note || "")}</span>` : "—";
+    const calText = cal && cal.samples
+      ? `${tag(`${cal.samples} start${cal.samples === 1 ? "" : "s"}`, cal.samples >= 3 ? "good" : "info")} worst ${gib(cal.worst_gib)}, median ${gib(cal.median_gib)}, spread ${gib(cal.spread_gib)}, safety margin ${gib(cal.margin_gib)}${cal.samples < 3 ? " <span class=\"muted\">(+0.5 GiB until 3 starts)</span>" : ""}`
+      : `${tag("not yet", "muted")} <span class="muted">no start with exactly these settings: the startup peak is estimated</span>`;
+    return `<b>Node ${esc(n)} · KV size</b><span>${kvText}</span><b>Node ${esc(n)} · startup</b><span>${calText}</span>`;
+  }).join("");
+  return `<div class="section-title">What backs this forecast</div><div class="kv small" data-key="forecast-backing">${rows}</div>${fit.fingerprinted === false ? `<p class="small muted">Not pinned yet: measurements are only matched to a pinned revision's exact settings.</p>` : ""}`;
+}
 function fitHtml(fit) {
   if (!fit) return empty("Unavailable");
   if (fit.nodes) return Object.entries(fit.nodes).map(([node, detail]) => `<div class="section-title">Node ${esc(node)} · ${esc(detail.model)}</div>${fitHtml(detail)}`).join('<hr class="sep">');
@@ -980,7 +1091,8 @@ function fitHtml(fit) {
     const v = fit.verdicts || {};
     h += `<div class="row between small"><span>${tag(v.startup?.ok ? "starts" : "startup does not fit", v.startup?.ok ? "good" : "bad")} ${tag(v.one_context?.ok === false ? "one request does not fit" : "one request fits", v.one_context?.ok === false ? "bad" : "good")} ${v.full_concurrency?.ok === false ? tag("fewer parallel full-length sequences", "warn") : ""}</span><span class="muted">${esc(fit.confidence || "")}</span></div>`;
     h += Object.entries(fit.plan).map(([node, p]) => planNodeHtml(node, p)).join("");
-    h += `<p class="small muted">Every number is per node. The startup peak and the steady state are separate figures; a calibrated figure comes from this revision's last startup timeline.</p>`;
+    h += forecastBacking(fit);
+    h += `<p class="small muted">Every number is per node. The startup peak and the steady state are separate figures; a calibrated figure comes only from earlier starts with exactly these settings (model commit, image, KV format, context, concurrency, batch size, memory share).</p>`;
   } else {
     const pool = fit.kv_pool_gib_per_node, w = fit.weights_gib_per_node, total = fit.budget.mem_total;
     h += `<div class="row between small"><span>${fit.fits ? tag("fits", "good") : tag("does not fit", "bad")} ${fit.full_concurrency_fits ? "" : tag("fewer parallel full-length sequences", "warn")}</span><span class="muted">gpu_memory_utilization ${esc(fit.gpu_memory_utilization)}</span></div>
@@ -1015,6 +1127,7 @@ function profileSettings(name, p, d) {
       ${f("spec", "Speculative tokens", spec.num_speculative_tokens ?? "", spec.method ? `method ${spec.method}` : "no speculative config", "—")}
       ${f("aliases", "Extra model names", (s.extra_aliases || []).join(", "), `primary: ${s.api_alias}`)}
       ${f("temp", "Temperature", b.temperature ?? "", "", "model default")}
+      <label class="field"><span>Engine</span><select id="q-engine">${[["vllm", "vLLM"], ["sglang", "SGLang (experimental)"]].map(([v, l]) => `<option value="${v}" ${(d.engine || "vllm") === v ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">what the container serves with; the same settings become its flags. Before a switch the image is asked whether it knows them.</span></label>
     </div>
     <div class="row" style="margin-top:14px">
       <label class="check"><input type="checkbox" id="q-think" ${s.thinking ? "checked" : ""}/> thinking</label>
@@ -1085,6 +1198,7 @@ function profileActions(name, p, d) {
     x.behaviour.temperature = v("temp") ? parseFloat(v("temp")) : null;
     x.simple.thinking = $("#q-think").checked; x.simple.tool_calling = $("#q-tools").checked;
     x.advanced.eager_mode = $("#q-eager").checked; x.advanced.prefix_cache = $("#q-prefix").checked;
+    x.engine = $("#q-engine").value || "vllm";
     return x;
   };
   return {
@@ -1473,7 +1587,7 @@ async function viewJobs() {
     const jobs = await GET("/api/v1/jobs" + qs({ limit: 60, kind }));
     if (!fresh()) return;
     renderLive(g, `<div class="view" data-live="jobs"><div class="view-head"><div><h1>Jobs</h1><p>Recipe preparation, connection checks and deployment changes — newest first.</p></div>
-      <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "compatibility", "evaluation", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
+      <div class="row"><select id="job-kind" style="width:auto">${["", "integration", "prepare", "compatibility", "evaluation", "benchmark", "activation", "rollback", "recovery", "stage", "stop"].map(k => `<option value="${k}" ${k === kind ? "selected" : ""}>${k || "all kinds"}</option>`).join("")}</select><a class="btn" href="#/audit">Audit log</a></div></div>
       <div class="card">${jobs.length ? `<div class="table-wrap"><table><thead><tr><th>Job</th><th>Kind</th><th>Target</th><th>State</th><th>Stage</th><th>Started</th><th>Took</th></tr></thead><tbody>
       ${jobs.map(j => `<tr class="clickable" data-key="job:${esc(j.job_id)}" data-act="open" data-id="${esc(j.job_id)}"><td class="mono">${esc(j.job_id)}</td><td>${esc(j.kind)}</td><td>${esc(j.payload.alias || (j.payload.profile ? j.payload.profile + " " + (j.payload.label || "") : j.payload.repo || ""))}</td>
         <td>${tag(j.state, { completed: "good", failed: "bad", running: "info" }[j.state] || "muted")}${j.error ? `<div class="sub">${esc(j.error.slice(0, 120))}</div>` : ""}</td><td>${esc(j.stage || "")}</td><td>${esc(ago(j.created_at))}</td><td>${esc(dur(j.created_at, ["running", "pending"].includes(j.state) ? null : j.updated_at))}</td></tr>`).join("")}
@@ -1501,7 +1615,9 @@ async function viewCookbook(tab) {
   const acts = {
     import: async (el) => {
       const name = el.dataset.name;
-      const pv = await busy(el, () => GET(`/api/v1/cookbook/recipes/${enc(name)}`));
+      const mode = await chooseRecipeMode(recipeIndex.get(name));
+      if (mode === null || !current(g)) return;
+      const pv = await busy(el, () => GET(`/api/v1/cookbook/recipes/${enc(name)}` + qs({ mode })));
       if (current(g)) await importDraft(pv, el.dataset.suggest || name);
     },
     details: async (el) => {
@@ -1509,6 +1625,12 @@ async function viewCookbook(tab) {
       await modal({ title: r.title || r.name, wide: true, body: reportHtml(r.report, r.draft) + `<div class="section-title">Recipe file · ${esc(r.file)}</div>${codeBlock(r.text)}` });
     },
     preview: (el) => busy(el, () => previewImport({ url: el.dataset.url })),
+    "catalog-refresh": async (el) => {
+      const r = await busy(el, () => POST("/api/v1/cookbook/catalog/refresh"));
+      const parts = ["added", "updated", "removed"].filter(k => r[k]?.length).map(k => `${r[k].length} ${k}`);
+      toast(parts.length ? "Recipe catalog: " + parts.join(", ") : "No new recipes", "good");
+      route();
+    },
     refresh: () => viewCookbookCommunity(g, head, true),
     "paste-preview": (el) => busy(el, () => previewImport(pasteBody(), $("#paste-name").value.trim())),
   };
@@ -1529,18 +1651,81 @@ async function viewCookbook(tab) {
     return;
   }
   const data = await GET("/api/v1/cookbook");
-  const card = (r) => r.error ? `<div class="card danger"><b>${esc(r.name)}</b><p class="small">${esc(r.error)}</p></div>` : `<div class="card recipe">
-    <div class="row between"><div class="row">${verifTag(r.verification)} ${tag(r.topology, "muted")} ${tag(r.quantization, "muted")} ${tag(r.format, "muted")}</div>${(r.imported_as || []).map(n => `<a href="#/profiles/${enc(n)}">${tag("→ " + n, "good")}</a>`).join(" ")}</div>
+  recipeIndex = new Map(data.recipes.map(r => [r.name, r]));
+  let stats = {};
+  const card = (r) => r.error ? `<div class="card ${r.needs_twinspark ? "" : "danger"}"><b>${esc(r.title || r.name)}</b> ${r.needs_twinspark ? tag("needs TwinSpark " + r.needs_twinspark, "warn") : ""}<p class="small">${esc(r.error)}</p></div>` : `<div class="card recipe">
+    <div class="row between"><div class="row">${verifTag(r.verification)} ${tag(r.topology, "muted")} ${tag(r.quantization, "muted")} ${tag(r.format, "muted")}${r.catalog === "new" ? " " + tag("new in catalog", "info") : r.catalog === "updated" ? " " + tag("updated in catalog", "info") : ""}</div>${(r.imported_as || []).map(n => `<a href="#/profiles/${enc(n)}">${tag("→ " + n, "good")}</a>`).join(" ")}</div>
     <h2 style="margin:10px 0 4px">${esc(r.title)}</h2><div class="mono small muted">${esc(r.model)}</div>
     <p class="small" style="color:var(--ink-2)">${esc(r.description)}</p>
     ${Object.keys(r.measured || {}).length ? `<div class="measured">${Object.entries(r.measured).slice(0, 5).map(([k, v]) => tag(`${k.replace(/_/g, " ")}: ${v}`, "muted")).join("")}</div>` : ""}
+    ${(r.modes || []).length > 1 ? `<div class="row small" style="gap:6px;margin-top:6px"><span class="muted">Modes</span>${r.modes.map(m => tag(m.title + (m.name === r.default_mode ? " · default" : ""), m.name === r.default_mode ? "info" : "muted")).join("")}</div>` : ""}
     ${(r.requirements || []).length ? `<details><summary>Needs (${r.requirements.length})</summary><ul class="plain">${r.requirements.map(x => `<li>${esc(x)}</li>`).join("")}</ul></details>` : ""}
     ${(r.notes || []).length ? `<details><summary>Notes (${r.notes.length})</summary><ul class="plain">${r.notes.map(x => `<li>${esc(x)}</li>`).join("")}</ul></details>` : ""}
+    ${r.catalog_note ? `<p class="small muted">${esc(r.catalog_note)}</p>` : ""}
+    <div data-community="${esc(r.name)}">${communityLine((stats.recipes || {})[r.name])}</div>
     <div class="row end" style="margin-top:12px">${webUrl(r.url) ? `<a class="btn sm ghost" href="${esc(r.url)}" target="_blank" rel="noopener">Source</a>` : ""}<button class="btn sm" data-act="details" data-name="${esc(r.name)}">Details</button><button class="btn sm primary" data-act="import" data-name="${esc(r.name)}" data-suggest="${esc((r.imported_as || []).length ? r.name + "-2" : r.name)}">Import</button></div></div>`;
   if (!render(g, `<div class="view">${head}
+    ${catalogLine(data.catalog)}
     ${libraryToolbar("recipes", "Search model, recipe or quantization…", [["all", "All topologies"], ...[...new Set(data.recipes.map(r => r.topology).filter(Boolean))].sort().map(t => [t, t])])}
     <div class="grid cols-2" id="recipes-items"></div></div>`)) return;
   bindLibrary("recipes", data.recipes, card, (r, filter) => filter === "all" || r.topology === filter, empty("No recipes available"));
+  if (data.community?.enabled) {
+    // totals come from the community server; the cards show them once they arrive (cached 30 min on node A)
+    GET("/api/v1/cookbook/community-stats").then(st => {
+      if (!current(g) || !st?.recipes) return;
+      stats = st;
+      $$("[data-community]").forEach(el => { el.innerHTML = communityLine(st.recipes[el.dataset.community]); });
+    }).catch(() => {});
+  }
+}
+let recipeIndex = new Map();
+/** Share how a Cookbook recipe went: choose, preview the exact document, then send (only when switched on). */
+async function shareResultFlow(name, el) {
+  const v = await formBox(`Share how ${name} went`, [
+    { id: "outcome", label: "How did it go?", type: "select", value: "", options: [["", "As the last switch went"], ["works", "Works as the recipe says"], ["works-with-changes", "Works with my changes"], ["fails", "Does not work"]] },
+    { id: "comment", label: "Note (optional)", type: "textarea", rows: 3, placeholder: "What you changed and why, what to watch out for", help: "Up to 500 characters. No addresses or paths." },
+    { id: "anonymous", label: "Without this installation's random id (a later report then counts again instead of replacing this one)", type: "check" },
+  ], { label: "Preview", intro: `<p class="small">The Cookbook's community totals come from results people share. You see exactly what would be sent before anything leaves node A.</p>` });
+  if (!v) return;
+  const pv = await busy(el, () => GET(`/api/v1/cookbook/report/${enc(name)}` + qs({ outcome: v.outcome, comment: v.comment.slice(0, 500), anonymous: v.anonymous ? "true" : "" })));
+  const { value } = await modal({
+    title: "Everything that would be sent", wide: true,
+    body: (pv.enabled ? `<p class="small">To <span class="mono">${esc(pv.url)}</span>. The recipe, its mode, how it went, the versions, benchmark numbers and the tuning settings you changed — no host names, addresses, paths, model names or keys.</p>`
+      : `<div class="callout warn"><div>Community reports are off. Set <span class="mono">cookbook.community_url</span> in controller.yaml to send results. This is what would be sent.</div></div>`) + codeBlock(JSON.stringify(pv.report, null, 2)),
+    actions: pv.enabled ? [{ label: "Cancel", value: null }, { label: "Send", value: "sent", cls: "primary", validate: async () => { await POST("/api/v1/cookbook/report", { report: pv.report }); return true; } }]
+      : [{ label: "Close", value: null }],
+  });
+  if (value === "sent") toast("Shared — thank you", "good");
+  return value;
+}
+function communityLine(st) {
+  if (!st || !st.reports) return "";
+  const rate = st.success_rate == null ? "" : ` · ${Math.round(st.success_rate * 100)} % work`;
+  const tok = st.median_tok_s ? ` · median ${num(Math.round(st.median_tok_s))} tok/s` : "";
+  const top = (st.top_changes || []).slice(0, 3).map(c => `${c.field.replace(/^advanced\.|^simple\.|^behaviour\./, "")} = ${c.value} (${c.count}×)`);
+  return `<div class="small muted community-line">Community: ${num(st.reports)} report${st.reports === 1 ? "" : "s"}${rate}${tok}${top.length ? `<br>Often changed: ${esc(top.join(", "))}` : ""}</div>`;
+}
+function catalogLine(cat) {
+  if (!cat || !cat.enabled) return `<p class="small muted">The recipe catalog is off (<span class="mono">cookbook.catalog_url</span>): recipes come with TwinSpark updates.</p>`;
+  const when = cat.fetched_at ? new Date(cat.fetched_at * 1000).toLocaleString() : "not yet";
+  const parts = [cat.new?.length ? `${cat.new.length} new` : "", cat.updated?.length ? `${cat.updated.length} updated` : ""].filter(Boolean).join(", ");
+  return `<div class="row between small catalog-line"><span class="muted">Recipe catalog: ${parts ? esc(parts) + " since this TwinSpark version" : "nothing newer than this TwinSpark's recipes"} · read ${esc(when)}${cat.last_error ? ` · <span class="warn-text">${esc(cat.last_error)}</span>` : ""}</span><button class="btn sm ghost" data-act="catalog-refresh">Check for new recipes</button></div>`;
+}
+/** the mode to import a recipe in: "" for a recipe without modes, null when cancelled */
+async function chooseRecipeMode(recipe) {
+  const modes = recipe?.modes || [];
+  if (modes.length < 2) return "";
+  const measured = (m) => Object.entries(m.measured || {}).slice(0, 4).map(([k, v]) => tag(`${k.replace(/_/g, " ")}: ${v}`, "muted")).join("");
+  const { value, root } = await modal({
+    title: `Import ${recipe.title || recipe.name}`,
+    body: `<p class="small">This recipe comes in ${modes.length} modes. Each one becomes a profile of its own; you can import the other later.</p>
+      <div class="mode-choice">${modes.map(m => `<label class="option"><input type="radio" name="recipe-mode" value="${esc(m.name)}" ${m.name === recipe.default_mode ? "checked" : ""}/>
+        <div><b>${esc(m.title)}</b>${m.name === recipe.default_mode ? " " + tag("default", "info") : ""}<p class="small muted" style="margin:2px 0">${esc(m.description)}</p>
+        ${Object.keys(m.measured || {}).length ? `<div class="measured">${measured(m)}</div>` : `<div class="small muted">Not measured yet — run a benchmark after the switch.</div>`}</div></label>`).join("")}</div>`,
+    actions: [{ label: "Cancel", value: null }, { label: "Continue", value: "go", cls: "primary" }],
+  });
+  if (value !== "go") return null;
+  return $('input[name="recipe-mode"]:checked', root)?.value || recipe.default_mode || "";
 }
 async function viewCookbookCommunity(g, head, refresh) {
   render(g, `<div class="view">${head}<div class="card"><div class="loading"><span class="spin"></span> reading GitHub…</div></div></div>`);

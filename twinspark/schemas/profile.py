@@ -336,6 +336,8 @@ class ProfileDraft(BaseModel):
     behaviour: BehaviourSettings = Field(default_factory=BehaviourSettings)
     advanced: AdvancedSettings = Field(default_factory=AdvancedSettings)
     runtime_adapter: RuntimeAdapter = RuntimeAdapter.EUGR
+    # the program the container serves with (master plan §3.1); the image family is runtime_adapter
+    engine: Literal["vllm", "sglang"] = "vllm"
     distributed_backend: DistributedBackend = DistributedBackend.AUTO
     verification: VerificationStatus = VerificationStatus.EXPERIMENTAL
     tags: list[str] = Field(default_factory=list)

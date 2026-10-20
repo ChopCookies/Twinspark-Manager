@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..controller.controller import BusyError, Controller, DuplicateProfileError, StaleViewError
 from ..controller.launch import LaunchError
@@ -202,6 +202,21 @@ def fit(name: str, revision: Optional[str] = None, ctrl: Controller = Depends(co
         raise HTTPException(404, str(e))
 
 
+@router.get("/{name}/validation")
+def validation_record(name: str, revision: Optional[str] = None, job: Optional[str] = None,
+                      format: str = "json", ctrl: Controller = Depends(controller_dep)):
+    """What was tested, with what, and what came out: a record a third party can reproduce from."""
+    from fastapi.responses import PlainTextResponse
+
+    from ..controller.validation import build_record, to_markdown
+    _profile(ctrl, name)
+    try:
+        rec = build_record(ctrl, name, revision, job)
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from None
+    return PlainTextResponse(to_markdown(rec), media_type="text/markdown") if format == "markdown" else rec
+
+
 # ---- transparency (spec §2.4) ------------------------------------------------
 @router.get("/{name}/revisions/{ref}/effective")
 def effective_config(name: str, ref: str, ctrl: Controller = Depends(controller_dep)):
@@ -263,9 +278,14 @@ async def prepare(name: str, revision: str = "latest", ctrl: Controller = Depend
 
 
 class ActivateRequest(BaseModel):
-    """Optional body. ``expected_active``: the revision id the caller saw as active (null = nothing)."""
+    """Optional body. ``expected_active``: the revision id the caller saw as active (null = nothing).
+    ``drain_policy``: what to do with requests still running (abort the switch, wait, or force).
+    ``nodes``: restart only these halves of the active split revision (the other half keeps serving)."""
     request_id: Optional[str] = None
     expected_active: Optional[str] = None
+    drain_policy: Optional[Literal["abort", "wait", "force"]] = None
+    drain_timeout_s: Optional[int] = Field(None, ge=0, le=86400)
+    nodes: Optional[list[Literal["A", "B"]]] = Field(None, min_length=1, max_length=2)
 
 
 @router.post("/{name}/activate", response_model=Job, status_code=202)
@@ -274,8 +294,12 @@ async def activate(name: str, revision: str = "latest", req: Optional[ActivateRe
     kw: dict = {}
     if req is not None:
         kw["request_id"] = req.request_id
+        if req.drain_policy or req.drain_timeout_s is not None:
+            kw["drain"] = {"policy": req.drain_policy, "timeout_s": req.drain_timeout_s}
         if "expected_active" in req.model_fields_set:
             kw["expected_active"] = req.expected_active
+        if req.nodes:
+            kw["nodes"] = list(req.nodes)
     try:
         return await ctrl.activate(name, revision, **kw)
     except (BusyError, StaleViewError) as e:

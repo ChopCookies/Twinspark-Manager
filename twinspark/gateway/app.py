@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import anyio
 import httpx
@@ -55,6 +56,31 @@ def _error(status: int, message: str, code: str, headers: dict | None = None, **
     return JSONResponse(body, status_code=status, headers=headers)
 
 
+_SESSION_HEADERS = ("session-id", "x-session-id", "x-twinspark-session")
+_TAIL = 16 * 1024
+_PROMPT_RE = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
+_COMPLETION_RE = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
+
+
+def _usage(tail: bytes, events: int) -> tuple[int, int, bool]:
+    """Tokens of one response from its ``usage`` (a JSON body, or the last chunk of a stream that asked for
+    ``stream_options.include_usage``); otherwise the number of streamed events, marked estimated."""
+    p, c = _PROMPT_RE.findall(tail), _COMPLETION_RE.findall(tail)
+    if c:
+        return (int(p[-1]) if p else 0), int(c[-1]), False
+    return 0, max(0, events - 1), True             # the last event is [DONE]
+
+
+def _affinity_key(request: Request, body: dict) -> str | None:
+    """A session key: the same session goes to the same replica, whose prefix cache has its history."""
+    for h in _SESSION_HEADERS:
+        v = request.headers.get(h)
+        if v:
+            return v[:256]
+    v = body.get("prompt_cache_key")
+    return v[:256] if isinstance(v, str) and v else None
+
+
 def _model_entry(st: RouteState) -> dict:
     entry = {"id": st.alias, "object": "model", "owned_by": "twinspark",
              "root": st.served_model, "twinspark": st.to_payload()}
@@ -71,28 +97,32 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
                                            or not isinstance(max_response_bytes, int) or max_response_bytes < 1):
         raise ValueError("max_response_bytes must be a positive integer or None")
     async def list_models(request: Request):
-        if not gateway.check_key(request.headers.get("authorization")):
+        key = gateway.authenticate(request.headers.get("authorization"))
+        if key is None:
             return _error(401, "invalid api key", "invalid_api_key")
         return JSONResponse({
             "object": "list",
             "data": [_model_entry(st) for st in gateway.routes.values()
-                     if st.backends or st.draining],
+                     if (st.backends or st.draining) and gateway.allows(key, st.alias)],
         })
 
     async def get_model(request: Request):
-        if not gateway.check_key(request.headers.get("authorization")):
+        key = gateway.authenticate(request.headers.get("authorization"))
+        if key is None:
             return _error(401, "invalid api key", "invalid_api_key")
         st = gateway.resolve(request.path_params["model"])
-        if st is None or not (st.backends or st.draining):
+        if st is None or not (st.backends or st.draining) or not gateway.allows(key, st.alias):
             return _error(404, "unknown model", "model_not_found")
         return JSONResponse(_model_entry(st))
 
     async def status(request: Request):
-        if not gateway.check_key(request.headers.get("authorization")):
+        key = gateway.authenticate(request.headers.get("authorization"))
+        if key is None:
             return _error(401, "invalid api key", "invalid_api_key")
+        # a key limited to some aliases sees only those
         return JSONResponse({"routes": [
             {k: v for k, v in st.to_payload().items() if k not in ("last_error",)}
-            for st in gateway.routes.values()]})
+            for st in gateway.routes.values() if gateway.allows(key, st.alias)]})
 
     async def health(request: Request):
         serving = any(st.status == "serving" for st in gateway.routes.values())
@@ -103,7 +133,8 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
         path = request.path_params["path"]
         if path not in _FORWARDED:
             return _error(404, f"unsupported endpoint /v1/{path}", "not_found")
-        if not gateway.check_key(request.headers.get("authorization")):
+        key = gateway.authenticate(request.headers.get("authorization"))
+        if key is None:
             return _error(401, "invalid api key", "invalid_api_key")
         raw = await _read_bounded(request, max_request_bytes)
         if raw is None:
@@ -122,21 +153,29 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
         st = gateway.resolve(model)
         if st is None:
             return _error(404, f"unknown model/alias: {str(model)[:120]!r}", "model_not_found")
+        if not gateway.allows(key, st.alias):
+            return _error(403, f"this key may not use {st.alias!r}", "permission_denied")
+        target, served, backend_base_headers, fallback = st, st.served_model, gateway.backend_headers(), None
         if st.draining or not st.backends or st.down_reason:
-            msg = ("model is down: " + st.down_reason) if st.down_reason else \
-                "model is switching or not loaded; retry shortly"
-            return _error(503, msg, "twinspark_unavailable",
-                          headers={"Retry-After": str(st.retry_after)}, state=st.to_payload())
+            fb = gateway.fallback_for(st.alias)
+            if fb is None:
+                msg = ("model is down: " + st.down_reason) if st.down_reason else \
+                    "model is switching or not loaded; retry shortly"
+                return _error(503, msg, "twinspark_unavailable",
+                              headers={"Retry-After": str(st.retry_after)}, state=st.to_payload())
+            # answered elsewhere while this alias switches: the drain does not wait for these requests
+            target, served, backend_base_headers, fallback = fb
 
-        body["model"] = st.served_model
+        body["model"] = served
         payload = json.dumps(body).encode()
-        st.acquire()
+        tok = target.acquire()
         upstream = None
+        backend = None
         last_exc: Exception | None = None
         try:
-            candidates = st.candidates()
+            candidates = gateway.order(target, _affinity_key(request, body))
             for i, backend in enumerate(candidates):
-                backend_headers = gateway.backend_headers()
+                backend_headers = dict(backend_base_headers)
                 if max_response_bytes is not None:
                     backend_headers["Accept-Encoding"] = "identity"
                 req = gateway._client.build_request(
@@ -144,7 +183,7 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
                 try:
                     resp = await gateway._client.send(req, stream=True)
                 except _RETRYABLE_CONNECT_ERRORS as exc:
-                    st.backend_failed(backend)
+                    target.backend_failed(backend)
                     last_exc = exc
                 except httpx.HTTPError as exc:
                     # Do not replay potentially accepted inference/tool requests.
@@ -152,7 +191,7 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
                     break
                 else:
                     if resp.status_code in _FAILOVER_STATUS and i + 1 < len(candidates):
-                        st.backend_failed(backend)
+                        target.backend_failed(backend)
                         try:
                             with anyio.CancelScope(shield=True):
                                 await resp.aclose()
@@ -163,18 +202,33 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
                     break
         except BaseException:
             # Cancellation before upstream headers must not block future drains.
-            st.release()
+            target.release(tok)
             raise
+        extra = {"X-TwinSpark-Fallback": fallback} if fallback else {}
         if upstream is None:
-            st.errors += 1
-            st.last_error = f"backend request failed: {type(last_exc).__name__}"
-            st.release()
+            target.errors += 1
+            target.last_error = f"backend request failed: {type(last_exc).__name__}"
+            target.release(tok)
             status_code = 504 if isinstance(last_exc, httpx.TimeoutException) else 502
-            return _error(status_code, st.last_error, "backend_error")
+            return _error(status_code, target.last_error, "backend_error", headers=extra or None)
+        target.backend_started(backend)
         if upstream.status_code >= 500:
-            st.errors += 1
-            st.last_error = f"backend returned {upstream.status_code}"
-            st.backend_failed(backend)
+            target.errors += 1
+            target.last_error = f"backend returned {upstream.status_code}"
+            target.backend_failed(backend)
+
+        released = False
+        tail = bytearray()                      # the end of the response: where the usage numbers are
+        events = 0                              # SSE data events: the estimate when no usage is reported
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                target.backend_done(backend)
+                target.release(tok)
+                prompt, completion, estimated = _usage(bytes(tail), events)
+                gateway.record_usage(key.get("id") or "?", st.alias, prompt, completion, estimated)
 
         if (max_response_bytes is not None
                 and upstream.headers.get("content-encoding", "identity").lower() != "identity"):
@@ -185,33 +239,37 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
             except httpx.HTTPError:
                 pass
             finally:
-                st.release()
+                release()
             return _error(502, "compatibility checks require uncompressed upstream responses", "backend_error")
 
         connection_headers = {h.strip().lower() for h in upstream.headers.get("connection", "").split(",")}
         headers = {k: v for k, v in upstream.headers.items()
                    if k.lower() not in _HOP_BY_HOP | connection_headers}
-        released = False
+        headers.update(extra)
 
         async def body_iter():
             # the in-flight counter only drops once the client got the last byte,
             # the client went away, or the backend stream broke — exactly once
-            nonlocal released
+            nonlocal events
             total = 0
             try:
                 async for chunk in upstream.aiter_raw():
                     total += len(chunk)
                     if max_response_bytes is not None and total > max_response_bytes:
                         raise _ResponseLimitExceeded("backend response exceeded the compatibility check size limit")
+                    events += chunk.count(b"data: ")
+                    tail.extend(chunk)
+                    if len(tail) > _TAIL:
+                        del tail[:-_TAIL]
                     yield chunk
             except httpx.CloseError as exc:
                 # httpx also closes after the last byte; a cleanup error does
                 # not invalidate a response that was already fully delivered.
-                st.errors += 1
-                st.last_error = f"stream close failed: {type(exc).__name__}"
+                target.errors += 1
+                target.last_error = f"stream close failed: {type(exc).__name__}"
             except httpx.HTTPError as exc:
-                st.errors += 1
-                st.last_error = f"stream interrupted: {type(exc).__name__}"
+                target.errors += 1
+                target.last_error = f"stream interrupted: {type(exc).__name__}"
                 # Headers have already been sent; abort the response instead of
                 # presenting incomplete tool arguments as a successful stream.
                 raise
@@ -222,12 +280,10 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
                     with anyio.CancelScope(shield=True):
                         await upstream.aclose()
                 except httpx.HTTPError as exc:
-                    st.errors += 1
-                    st.last_error = f"stream close failed: {type(exc).__name__}"
+                    target.errors += 1
+                    target.last_error = f"stream close failed: {type(exc).__name__}"
                 finally:
-                    if not released:
-                        released = True
-                        st.release()
+                    release()
 
         is_sse = headers.get("content-type", "").lower().startswith("text/event-stream")
         if max_response_bytes is not None and not is_sse:

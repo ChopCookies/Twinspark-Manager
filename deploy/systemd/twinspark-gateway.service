@@ -1,0 +1,21 @@
+[Unit]
+Description=TwinSpark stable gateway (the OpenAI-compatible endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=twinspark
+SupplementaryGroups=twinspark
+ExecStart=/opt/twinspark/venv/bin/tsm serve gateway --config /etc/twinspark/controller.yaml
+Restart=always
+RestartSec=2
+RuntimeDirectory=twinspark-gateway
+RuntimeDirectoryMode=0750
+MemoryMax=384M
+OOMScoreAdjust=-600
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (${{ matrix.deps }} dependencies)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        deps: [minimum, newest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (${{ matrix.deps }})
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.deps }}" = minimum ]; then
+            # the oldest versions pyproject.toml allows
+            pip install -c constraints/minimum.txt -e ".[dev]"
+          else
+            pip install --upgrade -e ".[dev,hf,client]"
+          fi
+          pip list
+      - name: pytest
+        # no hardware: dry-run agents, loopback servers, fake host tools; browser tests skip without Chromium
+        run: |
+          set -o pipefail
+          # -v and unbuffered: if the run ends abruptly, the end of the log names the test that was running
+          PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -v -p no:cacheprovider -rs \
+            --junitxml=pytest.xml 2>&1 | tee pytest.log
+      - name: Failures as annotations
+        if: failure()
+        run: |
+          pip freeze > pip-freeze.txt
+          python scripts/ci_annotate.py pytest.xml pytest.log pip-freeze.txt
+
+  web:
+    name: GUI tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: node --test tests/*.test.cjs
+      - name: dist matches src
+        run: |
+          python scripts/build_web.py
+          git diff --exit-code -- twinspark/web/dist || { echo "run scripts/build_web.py and commit dist/"; exit 1; }
+          test -z "$(git status --porcelain -- twinspark/web/dist)"
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  catalog:
+    name: recipe catalog
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      # every recipe imports in each of its modes, and catalog/index.json matches the recipe folder
+      - run: python scripts/build_catalog.py --check
+      - name: PHP endpoint (community/strato) parses
+        run: for f in community/strato/*.php; do php -l "$f"; done
+
+  package:
+    name: wheel + install smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        run: pip wheel --no-deps . --wheel-dir dist
+      - name: Install it with the release constraints, in a clean venv
+        run: |
+          python -m venv /tmp/tsm
+          /tmp/tsm/bin/pip install -c constraints/release.txt "$(ls dist/twinspark_manager-*.whl)[hf]"
+      - name: Smoke test
+        run: |
+          cd /tmp
+          /tmp/tsm/bin/tsm --version
+          /tmp/tsm/bin/tsm client --help >/dev/null
+          /tmp/tsm/bin/python -I - <<'PY'
+          import asyncio, httpx
+          from twinspark.demo import DemoCluster
+          async def main():
+              async with DemoCluster() as d:
+                  async with httpx.AsyncClient() as c:
+                      r = await c.get(d.url + "/api/v1/health")
+                      r.raise_for_status()
+                      assert r.json()["api"] == 2, r.json()
+                      r = await c.get(d.url + "/")
+                      assert "TwinSpark" in r.text
+              print("demo cluster from the wheel: ok")
+          asyncio.run(main())
+          PY

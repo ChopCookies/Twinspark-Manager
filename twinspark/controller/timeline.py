@@ -112,7 +112,8 @@ def summarize(samples: list[dict], marks: list[dict]) -> dict[str, Any]:
             ts = float(start["t"])
             before = [a for a in avail if a[0] <= ts + 1e-6]
             after = [a for a in avail if a[0] >= ts - 1e-6]
-            base = before[-1] if before else (after[0] if after else None)
+            # by time, not by list order: a sample can arrive after a later one
+            base = max(before, key=lambda a: a[0]) if before else (min(after, key=lambda a: a[0]) if after else None)
             if base is not None and after:
                 low = min(after, key=lambda x: x[1])
                 # what this deployment took at the startup's lowest point, relative to just before it started
@@ -120,6 +121,13 @@ def summarize(samples: list[dict], marks: list[dict]) -> dict[str, Any]:
                            footprint_gib=round(max(0.0, base[1] - low[1]), 2),
                            startup_min_available_gib=round(low[1], 2), startup_min_stage=low[2].get("stage"),
                            startup_min_at_s=round(low[0], 1))
+                # serving, not starting: what the deployment holds once it answers (the healthy mark)
+                ready = next((m for m in marks if isinstance(m, dict) and m.get("stage") == "healthy"
+                              and _num(m.get("t")) is not None), None)
+                if ready is not None:
+                    at_ready = [a for a in avail if a[0] >= float(ready["t"]) - 1e-6]
+                    if at_ready:
+                        out["steady_footprint_gib"] = round(max(0.0, base[1] - at_ready[0][1]), 2)
     free = [_num(s.get("mem_free_gib")) for s in pts]
     free = [v for v in free if v is not None]
     if free:
@@ -158,7 +166,7 @@ def observation(summaries: dict[str, dict], job_id: str) -> dict[str, Any]:
     """What a successful start leaves for the planner: per node, the startup footprint and its lowest point."""
     keep = ("footprint_gib", "baseline_available_gib", "startup_min_available_gib", "min_mem_available_gib",
             "min_stage", "startup_min_stage", "mem_total_gib", "max_psi_full_avg10", "peak_swap_out_pps",
-            "simulated")
+            "steady_footprint_gib", "simulated")
     return {"job_id": job_id, "at": time.time(),
             "nodes": {n: {k: s.get(k) for k in keep} for n, s in summaries.items() if isinstance(s, dict)}}
 

@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import yaml
+
 from . import __version__
 from .remote.policy import FEATURES as REMOTE_FEATURES
 from .remote.policy import write_policy
@@ -33,6 +35,7 @@ from .security import SecretsVault
 
 JOIN_PREFIX = "tsm1."
 UNIT_NAMES = ("twinspark-privd.service", "twinspark-agent.service", "twinspark-controller.service",
+              "twinspark-gateway.service",
               "twinspark-terminal.service", "twinspark-terminal.socket")
 # the terminal starts on the first connection and exits after this long without a shell
 TERMINAL_IDLE_EXIT_S = 900
@@ -110,6 +113,8 @@ class Answers:
     mgmt_port: int = 8443
     gateway_bind: str = "0.0.0.0"
     gateway_port: int = 8000
+    # new installs run the gateway as its own service (master plan §3.2); the demo keeps one process
+    gateway_mode: str = "standalone"
     agent_port: int = 9443
     terminal_port: int = 9444
     vllm_port: int = 8100
@@ -251,6 +256,11 @@ secrets_dir: {lay.secrets}
 listener: {{bind: {a.mgmt_bind}, port: {a.mgmt_port}}}
 # Stable OpenAI-compatible endpoint for your clients (needs the inference_api_key).
 gateway_listener: {{bind: {a.gateway_bind}, port: {a.gateway_port}}}
+# standalone: the gateway is its own service (twinspark-gateway.service), so a controller restart or update
+# does not cut running streams. in-process: inside the controller, as before 0.7.
+gateway_mode: {a.gateway_mode}
+gateway_state_path: {lay.state}/gateway-state.json
+gateway_control_socket: {lay.p("run/twinspark-gateway")}/control.sock
 
 nodes:
 {chr(10).join(nodes)}
@@ -320,8 +330,11 @@ def _rw_paths(a: Answers, lay: Layout, controller: bool) -> str:
     return " ".join(str(p) for p in dict.fromkeys(paths))
 
 
-def render_units(a: Answers, lay: Layout) -> dict[str, str]:
-    """systemd units for this node, pinned to the service user and the paths in the configs."""
+def render_units(a: Answers, lay: Layout, gateway_mode: Optional[str] = None) -> dict[str, str]:
+    """systemd units for this node, pinned to the service user and the paths in the configs.
+
+    ``gateway_mode`` is what controller.yaml says (a kept 0.6 file has none: in-process); the gateway's own
+    unit is written only for standalone, so two processes never compete for the gateway port."""
     tsm = lay.tsm_bin
     policy_args = f"--remote-policy {lay.etc}/remote-policy.json" + (" --unsafe-policy-owner" if lay.sandbox else "")
     privd = f"""[Unit]
@@ -363,7 +376,7 @@ PrivateTmp=true
 WantedBy=multi-user.target
 """
     controller = f"""[Unit]
-Description=TwinSpark controller + stable gateway
+Description=TwinSpark controller (management API, GUI; and the gateway unless gateway_mode is standalone)
 After=network-online.target twinspark-agent.service
 Wants=network-online.target twinspark-agent.service
 
@@ -386,10 +399,40 @@ WantedBy=multi-user.target
     units = {"twinspark-privd.service": privd, "twinspark-agent.service": agent}
     if a.role in ("controller", "single"):
         units["twinspark-controller.service"] = controller
+        if (gateway_mode or a.gateway_mode) == "standalone":
+            units["twinspark-gateway.service"] = render_gateway_unit(a, lay)
     if a.remote.get("terminal"):
         units["twinspark-terminal.service"] = render_terminal_unit(a, lay)
         units["twinspark-terminal.socket"] = render_terminal_socket(a, lay)
     return units
+
+
+def render_gateway_unit(a: Answers, lay: Layout) -> str:
+    """The stable gateway on its own (``tsm serve gateway``): small, always restarted, read-only except its
+    control socket. It reads the state file the controller writes and keeps serving while the controller
+    restarts."""
+    return f"""[Unit]
+Description=TwinSpark stable gateway (the OpenAI-compatible endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={a.service_user}
+SupplementaryGroups={a.group}
+ExecStart={lay.tsm_bin} serve gateway --config {lay.controller_yaml}
+Restart=always
+RestartSec=2
+RuntimeDirectory=twinspark-gateway
+RuntimeDirectoryMode=0750
+MemoryMax=384M
+OOMScoreAdjust=-600
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+"""
 
 
 def render_terminal_unit(a: Answers, lay: Layout) -> str:
@@ -769,7 +812,14 @@ class Provisioner:
 
     def units(self) -> list[str]:
         written = []
-        for name, text in render_units(self.a, self.lay).items():
+        mode = None
+        if self.a.role in ("controller", "single"):
+            try:                            # a kept controller.yaml decides, not this run's default
+                doc = yaml.safe_load(self.lay.controller_yaml.read_text(encoding="utf-8")) or {}
+                mode = doc.get("gateway_mode") or "in-process"
+            except (OSError, yaml.YAMLError):
+                mode = None
+        for name, text in render_units(self.a, self.lay, gateway_mode=mode).items():
             self._write(self.lay.systemd / name, text, label=name)
             written.append(name)
         return written

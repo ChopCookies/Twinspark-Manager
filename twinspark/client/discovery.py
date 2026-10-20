@@ -268,7 +268,18 @@ def parse_controller_yaml(text: str) -> dict[str, Any]:
         # where the client browses community recipes (the node's configured list; default as on the node)
         "recipe_sources": [str(x) for x in doc.get("recipe_sources") or [] if isinstance(x, str)][:20]
         or ["eugr/spark-vllm-docker:recipes"],
+        # the recipe catalog and the community server, as node A uses them (the client reads them itself)
+        "cookbook": _cookbook(doc.get("cookbook")),
     }
+
+
+def _cookbook(raw: Any) -> dict[str, Any]:
+    from ..schemas.config import CookbookSettings
+    try:
+        cb = CookbookSettings.model_validate(raw if isinstance(raw, dict) else {})
+    except ValueError:
+        cb = CookbookSettings()
+    return cb.model_dump()
 
 
 async def read_controller_nodes(conn: Connection, *, home: Path, run: Run = run_remote,

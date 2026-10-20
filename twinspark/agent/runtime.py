@@ -100,6 +100,19 @@ class DockerRuntime:
     def pull(self, image_ref: str) -> None:
         self._run([self.docker, "pull", image_ref], timeout=3600)
 
+    def probe(self, image_ref: str, script: str, timeout: int = 240) -> str:
+        """Run TwinSpark's fixed probe script in the image: no network, no GPU, no mounts, removed after."""
+        argv = [self.docker, "run", "--rm", "--network", "none", "--entrypoint", "python3",
+                "--env", "HF_HUB_OFFLINE=1", "--memory", "6g", "--pids-limit", "512",
+                image_ref, "-c", script]
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError_(f"the image probe did not finish within {timeout} s") from exc
+        except FileNotFoundError as exc:
+            raise RuntimeError_(f"{argv[0]} not found — is Docker installed?") from exc
+        return (p.stdout or "")[-400_000:] + ("\n" + p.stderr[-2000:] if p.returncode and p.stderr else "")
+
     def start(self, spec: ContainerSpec, env_overrides: dict[str, str]) -> str:
         if not env_overrides:
             return self._run(docker_run_argv(spec, self.docker)).strip()
@@ -214,6 +227,13 @@ class DryRunRuntime:
 
     def pull(self, image_ref: str) -> None:
         self.history.append([self.docker, "pull", image_ref])
+
+    probe_result: Optional[dict] = None          # test hook: what a probe of any image answers
+
+    def probe(self, image_ref: str, script: str, timeout: int = 240) -> str:
+        self.history.append([self.docker, "run", "--rm", "--network", "none", image_ref, "<probe>"])
+        doc = self.probe_result if self.probe_result is not None else {"simulated": True}
+        return "TWINSPARK-PROBE " + json.dumps(doc)
 
     def start(self, spec: ContainerSpec, env_overrides: dict[str, str]) -> str:
         argv = docker_run_argv(spec, self.docker, redact=True)

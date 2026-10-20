@@ -401,6 +401,10 @@ def create_client_app(session: ClientSession, local_key: str, *, web_dir: Option
     from .cookbook_local import add_cookbook_routes
     add_cookbook_routes(app, session, connected)
 
+    # ---- client: benchmarks from this computer --------------------------------------------------
+    from .bench_local import add_bench_routes
+    add_bench_routes(app, session, connected)
+
     # ---- everything else: node A --------------------------------------------------------------------
     @app.websocket("/api/v1/remote/terminal/ws")
     async def terminal_ws(ws: WebSocket):

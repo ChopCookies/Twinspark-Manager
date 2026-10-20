@@ -1,0 +1,79 @@
+# The documentation site: https://chopcookies.github.io/Twinspark-Manager/ (built by .github/workflows/docs.yml)
+site_name: TwinSpark Manager
+site_description: Run, switch and measure LLMs on two NVIDIA DGX Sparks
+site_url: https://chopcookies.github.io/Twinspark-Manager/
+repo_url: https://github.com/ChopCookies/Twinspark-Manager
+repo_name: ChopCookies/Twinspark-Manager
+edit_uri: edit/main/docs/
+docs_dir: docs
+strict: true
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: {icon: material/weather-night, name: Dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: {icon: material/weather-sunny, name: Light mode}
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc: {permalink: true}
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.details
+
+# links from docs/ to files outside it (the README, catalog/, community/) point at GitHub
+hooks:
+  - scripts/mkdocs_hooks.py
+
+exclude_docs: |
+  notes/examples/
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - The workstation client: client.md
+      - The QSFP link: qsfp-link.md
+      - Security model: security.md
+  - Models and recipes:
+      - The Cookbook (modes, catalog, community, playground): cookbook.md
+      - Recipe and split-model workflow: recipe-workflow.md
+      - Automatic imports and source updates: recipe-automation.md
+      - Memory planning: memory-planning.md
+      - Engines (vLLM, SGLang): engines.md
+  - Measuring:
+      - Performance lab: perf-lab.md
+      - Benchmarks: benchmarks.md
+      - Validation records: validation.md
+      - Metrics, Prometheus, Grafana: metrics.md
+  - Apps:
+      - Using the Sparks from your apps: integrations/README.md
+      - Open WebUI: integrations/open-webui.md
+      - n8n: integrations/n8n.md
+      - LiteLLM: integrations/litellm.md
+      - Continue: integrations/continue.md
+      - Cherry Studio: integrations/cherry-studio.md
+      - Aider: integrations/aider.md
+      - OpenCode: integrations/opencode.md
+      - Agent clients and harnesses: agent-integrations.md
+      - The gateway (keys, routing, fallbacks): gateway.md
+  - Operations:
+      - Monitoring and maintenance: maintenance.md
+      - Remote management: remote-management.md
+  - Development: development.md
+  - Field notes:
+      - Overview: notes/README.md
+      - First hardware validation: notes/small-model-validation-2026-09-28.md
+      - DeepSeek V4 two-node start-up: notes/deepseek-v4-flash-two-node-startup.md
+      - GLM MTP research: notes/glm-mtp-research.md
+      - Researched profiles: notes/researched-profiles.md
+      - Review of 0.2 (German): notes/review-0.2-alpha.de.md

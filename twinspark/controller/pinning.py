@@ -121,7 +121,7 @@ async def _register_extra_spec(ctrl: "Controller", repo: str, sha: str, token: O
         spec = spec_from_resolved(resolved)
     except Exception as exc:  # noqa: BLE001 - the pin itself must not depend on the drafter's metadata
         return f"{repo}: memory spec not registered ({str(exc)[:160]}); the planner shows its size as unknown"
-    ctrl.set_model_spec(repo, spec)
+    ctrl.set_model_spec(repo, spec, sha)
     return f"{repo}: memory spec registered ({(spec.weight_bytes or 0) / 1024 ** 3:.1f} GiB weights)"
 
 
@@ -143,7 +143,7 @@ async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
     if r_repo != repo:
         raise PinError(f"model_ref {r_repo!r} does not match the profile's model {repo!r} — "
                        f"edit the draft to change models")
-    spec_registered = ctrl.model_spec(repo) is not None
+    spec_registered = ctrl.model_spec(repo, branch if _SHA40.match(branch or "") else None) is not None
     if _SHA40.match(branch or "") and spec_registered:
         sha = branch
     else:
@@ -152,10 +152,8 @@ async def _pin_draft(ctrl: "Controller", draft: ProfileDraft, model_ref=None,
             sha = resolved["revision"]
             try:
                 spec = spec_from_resolved(resolved)
-                kvb = draft.source.get("kv_bytes_per_token") if draft.source else None
-                if kvb:
-                    spec.kv_bytes_per_token = float(kvb)
-                ctrl.set_model_spec(repo, spec)
+                # the architecture of this commit; the recipe's KV size stays with the recipe's settings
+                ctrl.set_model_spec(repo, spec, sha)
                 notes.append(f"memory spec registered ({(spec.weight_bytes or 0) / 1024**3:.1f} GiB weights)")
             except ValueError as exc:
                 notes.append(f"memory spec not registered: {exc}")

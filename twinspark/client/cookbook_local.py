@@ -15,7 +15,16 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 
-from ..cookbook import RecipeImportError, build_draft, import_text, list_recipes, recipe_detail
+from ..cookbook import (
+    RecipeImportError,
+    build_draft,
+    catalog,
+    import_text,
+    list_recipes,
+    make_catalog,
+    recipe_detail,
+)
+from ..cookbook import community as reports
 from ..cookbook.remote import RemoteError, fetch_text, list_source
 from .app import ImportIn  # module level: FastAPI resolves the (string) annotation from here
 from .session import ClientSession
@@ -40,7 +49,26 @@ async def _create(session: ClientSession, draft) -> dict:
     raise HTTPException(status if status in (409, 422) else 502, detail or f"node A answered {status}")
 
 
+def _settings(session: ClientSession) -> dict[str, Any]:
+    cb = session.node_cfg.get("cookbook")
+    return cb if isinstance(cb, dict) else {"catalog_url": catalog.DEFAULT_URL, "catalog_refresh_hours": 24.0,
+                                            "community_url": None}
+
+
 def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callable[[], None]) -> None:
+    cached: dict[str, catalog.Catalog] = {}
+
+    def client_catalog() -> catalog.Catalog:
+        """This computer's copy of the catalog (in the client's folder), with node A's settings."""
+        cb = _settings(session)
+        key = f"{cb.get('catalog_url')}|{cb.get('catalog_refresh_hours')}"
+        if key not in cached:
+            cached.clear()
+            cached[key] = make_catalog(session.home / "catalog", cb.get("catalog_url"),
+                                       refresh_hours=float(cb.get("catalog_refresh_hours") or 0))
+        catalog.configure(cached[key])
+        return cached[key]
+
     @app.get("/api/v1/cookbook")
     async def index() -> dict:
         connected()
@@ -48,24 +76,51 @@ def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callabl
         if status != 200:
             raise HTTPException(502, f"node A did not list its profiles ({status})")
         existing = {p.get("name"): (p.get("source") or {}).get("recipe") for p in profiles if isinstance(p, dict)}
+        cat = client_catalog()
+        if cat.stale():
+            asyncio.get_running_loop().run_in_executor(None, cat.refresh_if_stale)
         recipes = list_recipes()
         for r in recipes:
             r["imported_as"] = sorted(n for n, src in existing.items() if src == r["name"])
         return {"recipes": recipes, "sources": session.node_cfg.get("recipe_sources")
-                or ["eugr/spark-vllm-docker:recipes"], "where": "client"}
+                or ["eugr/spark-vllm-docker:recipes"], "where": "client", "catalog": cat.status(),
+                "community": {"enabled": bool(_settings(session).get("community_url"))}}
+
+    @app.get("/api/v1/cookbook/catalog")
+    def catalog_status() -> dict:
+        return client_catalog().status()
+
+    @app.post("/api/v1/cookbook/catalog/refresh")
+    async def catalog_refresh() -> dict:
+        cat = client_catalog()
+        try:
+            changes = await asyncio.to_thread(cat.refresh)
+        except catalog.CatalogError as e:
+            raise HTTPException(502, str(e)) from None
+        return {"ok": True, **changes, "status": cat.status()}
+
+    @app.get("/api/v1/cookbook/community-stats")
+    async def stats(refresh: bool = False) -> dict:
+        return await asyncio.to_thread(reports.community_stats, _settings(session).get("community_url"), None,
+                                       refresh)
 
     @app.get("/api/v1/cookbook/recipes/{name}")
-    def recipe(name: str):
-        d = recipe_detail(name)
+    def recipe(name: str, mode: Optional[str] = None):
+        client_catalog()
+        try:
+            d = recipe_detail(name, mode)
+        except RecipeImportError as e:
+            raise HTTPException(422, str(e)) from None
         if d is None:
             raise HTTPException(404, f"no such recipe: {name}")
         return d
 
     @app.post("/api/v1/cookbook/import/{name}")
-    async def import_recipe(name: str, profile_name: Optional[str] = None):
+    async def import_recipe(name: str, profile_name: Optional[str] = None, mode: Optional[str] = None):
         connected()
+        client_catalog()
         try:
-            draft = build_draft(name, profile_name)
+            draft = build_draft(name, profile_name, mode)
         except (RecipeImportError, ValueError) as e:
             raise HTTPException(422, str(e)) from None
         if draft is None:

@@ -124,7 +124,7 @@ def alias_rows(ctrl) -> list[dict]:
 
 def catalog(ctrl) -> dict:
     return {"gateway": {"suggested_base_url": gateway_url(ctrl),
-                        "auth_required": ctrl.gateway.inference_api_key is not None},
+                        "auth_required": ctrl.gateway.requires_key()},
             "clients": CLIENTS, "aliases": alias_rows(ctrl)}
 
 

@@ -157,6 +157,8 @@ def cmd_serve(args, api=None):
 
     if args.what == "controller":
         asyncio.run(serve.run_controller(args.config))
+    elif args.what == "gateway":
+        serve.run_gateway(args.config)
     elif args.what == "agent":
         serve.run_agent(args.config)
     elif args.what == "termd":
@@ -184,8 +186,19 @@ def cmd_status(args, api: Api):
             print(f"kv pool   {kv['kv_cache_tokens']:,} tokens{conc}")
         if obs.get("max_model_len"):
             print(f"context   {obs['max_model_len']:,} tokens")
+        for h in st.get("halves") or []:
+            m = h.get("metrics") or {}
+            perf = (f", decode {m.get('decode_tok_s', '-')} tok/s, KV {m.get('kv_cache_usage_pct', '-')}%"
+                    if m.get("ok") else "")
+            reason = f" — {h['reason']}" if h.get("reason") else ""
+            print(f"half {h['node']}    {h['state']:9} {h['model']} as {', '.join(h['aliases'])}, started by "
+                  f"{h.get('label') or h['revision_id']} {_ago(h.get('since'))}{perf}{reason}")
     else:
         print("active    -")
+    gp = st.get("gateway_process") or {}
+    if gp.get("mode") == "standalone":
+        print("gateway   own process, " + (f"applied state {gp.get('applied_version')}" if gp.get("reachable")
+                                          else f"NOT ANSWERING ({gp.get('error') or 'no answer'})"))
     if st.get("current_job"):
         print(f"job       {st['current_job']} (running)")
     if st.get("staging"):
@@ -278,6 +291,20 @@ def cmd_show(args, api: Api):
         print(f"  memory       weights {fit['weights_gib_per_node']} GiB/node, KV pool ≈ "
               f"{fit['kv_pool_gib_per_node']} GiB/node ≈ {fit['est_kv_tokens']:,} tokens "
               f"({fit['kv_bytes_per_token_source']} KV size){'' if fit['fits'] else '  — DOES NOT FIT'}")
+
+
+def cmd_validation(args, api: Api):
+    params = {k: v for k, v in (("revision", args.revision), ("job", args.job)) if v}
+    if args.markdown:
+        params["format"] = "markdown"
+        text = api("GET", f"/api/v1/profiles/{args.profile}/validation", params=params)   # text/markdown
+    else:
+        text = json.dumps(api("GET", f"/api/v1/profiles/{args.profile}/validation", params=params), indent=2)
+    if args.output:
+        Path(args.output).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        print(f"wrote {args.output}")
+    else:
+        print(text)
 
 
 def cmd_fit(args, api: Api):
@@ -498,8 +525,14 @@ def cmd_activate(args, api: Api):
     import secrets as _secrets
     # an id per invocation: if the connection drops while the request is in flight, sending it again
     # (e.g. by the client's retry) returns the same job instead of starting a second switch
-    job = api("POST", f"/api/v1/profiles/{args.profile}/activate", params={"revision": args.revision},
-              json={"request_id": f"cli-{_secrets.token_hex(8)}"})
+    body = {"request_id": f"cli-{_secrets.token_hex(8)}"}
+    if args.drain:
+        body["drain_policy"] = args.drain
+    if args.drain_timeout is not None:
+        body["drain_timeout_s"] = args.drain_timeout
+    if getattr(args, "half", None):
+        body["nodes"] = [args.half]
+    job = api("POST", f"/api/v1/profiles/{args.profile}/activate", params={"revision": args.revision}, json=body)
     print(f"job {job['job_id']}  (Ctrl-C stops watching, not the switch; `tsm cancel {job['job_id']}`)")
     if args.no_wait:
         return
@@ -583,19 +616,34 @@ def cmd_cookbook(args, api: Api):
         data = api("GET", "/api/v1/cookbook")
         if _out(api, data):
             return
+        marks = {"new": "NEW ", "updated": "UPD "}
         for r in data["recipes"]:
+            mark = marks.get(r.get("catalog") or "", "    ")
             if "error" in r:
-                print(f"{r['name']:36} ERROR {r['error']}")
+                print(f"{mark}{r['name']:36} ERROR {r['error']}")
                 continue
             imp = f"  → profile {', '.join(r['imported_as'])}" if r.get("imported_as") else ""
-            print(f"{r['name']:36} {r['verification']:12} {r['topology']:7} {r['model']}{imp}")
-            print(f"    {r['title']}")
-        print("\ncommunity sources: " + ", ".join(data.get("sources", [])) + "  (`tsm cookbook community`)")
+            modes = f"  modes: {', '.join(m['name'] for m in r['modes'])}" if len(r.get("modes") or []) > 1 else ""
+            print(f"{mark}{r['name']:36} {r['verification']:12} {r['topology']:7} {r['model']}{imp}")
+            print(f"        {r['title']}{modes}")
+            if r.get("catalog_note"):
+                print(f"        note: {r['catalog_note']}")
+        cat = data.get("catalog") or {}
+        if cat.get("enabled"):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(cat["fetched_at"])) if cat.get("fetched_at") \
+                else "not yet"
+            err = f" — {cat['last_error']}" if cat.get("last_error") else ""
+            print(f"\nrecipe catalog: {len(cat.get('new') or [])} new, {len(cat.get('updated') or [])} updated "
+                  f"(read {when}; `tsm cookbook refresh`){err}")
+        print("community sources: " + ", ".join(data.get("sources", [])) + "  (`tsm cookbook community`)")
     elif args.action == "show":
-        r = api("GET", f"/api/v1/cookbook/recipes/{args.name}")
+        r = api("GET", f"/api/v1/cookbook/recipes/{args.name}", params={"mode": args.mode} if args.mode else None)
         if _out(api, r):
             return
         print(f"{r['name']} — {r['title']}  [{r['verification']}]\n{r['description']}\n")
+        for m in r.get("modes") or []:
+            mark = "*" if m["name"] == r.get("mode") else " "
+            print(f"mode       {mark} {m['name']:12} {m.get('title') or ''} — {m.get('description') or ''}")
         for k in ("url", "author", "image_hint"):
             if r.get(k):
                 print(f"{k:12} {r[k]}")
@@ -612,10 +660,53 @@ def cmd_cookbook(args, api: Api):
             print(f"dropped      {', '.join(rep['dropped'])} (TwinSpark wires these itself)")
     elif args.action == "import":
         if not args.name:
-            sys.exit("usage: tsm cookbook import <recipe> [--as NAME]")
-        res = api("POST", f"/api/v1/cookbook/import/{args.name}",
-                  params={"profile_name": args.as_name} if args.as_name else None)
+            sys.exit("usage: tsm cookbook import <recipe> [--as NAME] [--mode MODE]")
+        params = {k: v for k, v in (("profile_name", args.as_name), ("mode", args.mode)) if v}
+        res = api("POST", f"/api/v1/cookbook/import/{args.name}", params=params or None)
         print(f"imported profile {res['profile']['name']} — next: `tsm pin {res['profile']['name']}`")
+    elif args.action == "refresh":
+        res = api("POST", "/api/v1/cookbook/catalog/refresh")
+        if _out(api, res):
+            return
+        parts = [f"{len(res[k])} {k}: {', '.join(res[k])}" for k in ("added", "updated", "removed") if res.get(k)]
+        print(f"recipe catalog: {res.get('recipes', 0)} recipes — " + ("; ".join(parts) or "nothing changed"))
+        for name, needs in (res.get("status") or {}).get("needs_newer", {}).items():
+            print(f"  {name} needs TwinSpark {needs} (update TwinSpark to import it)")
+    elif args.action == "stats":
+        data = api("GET", "/api/v1/cookbook/community-stats", params={"refresh": str(args.refresh).lower()})
+        if _out(api, data):
+            return
+        if not data:
+            sys.exit("no community server configured (cookbook.community_url in controller.yaml)")
+        if data.get("error"):
+            sys.exit(data["error"])
+        for name, st in sorted((data.get("recipes") or {}).items()):
+            rate = f"{st['success_rate']:.0%}" if st.get("success_rate") is not None else "—"
+            tok = f"  median {st['median_tok_s']:,.0f} tok/s" if st.get("median_tok_s") else ""
+            print(f"{name:40} {st['reports']:4} reports  {rate:>5} work{tok}")
+            for ch in st.get("top_changes") or []:
+                print(f"    {ch['count']}× {ch['field']} = {ch['value']}")
+    elif args.action == "report":
+        if not args.name:
+            sys.exit("usage: tsm cookbook report <profile> [--outcome works|works-with-changes|fails] [--comment …]")
+        params = {k: v for k, v in (("outcome", args.outcome), ("failure_stage", args.failure_stage),
+                                    ("comment", args.comment)) if v}
+        if args.anonymous:
+            params["anonymous"] = "true"
+        pv = api("GET", f"/api/v1/cookbook/report/{args.name}", params=params)
+        print("This is everything that would be sent:\n")
+        print(json.dumps(pv["report"], indent=2))
+        if not pv.get("enabled"):
+            print("\nCommunity reports are off: set cookbook.community_url in /etc/twinspark/controller.yaml "
+                  "to send it.")
+            return
+        print(f"\nto {pv['url']}")
+        if not args.yes and input("Send it? [y/N] ").strip().lower() != "y":
+            print("not sent")
+            return
+        res = api("POST", "/api/v1/cookbook/report", json={"report": pv["report"]})
+        print("sent — thank you" + (f" ({res['server'].get('message')})" if (res.get("server") or {}).get("message")
+                                    else ""))
     elif args.action == "community":
         data = api("GET", "/api/v1/cookbook/community", params={"refresh": str(args.refresh).lower()})
         if _out(api, data):
@@ -962,6 +1053,8 @@ def cmd_metrics(args, api: Api):
                   f"running {r.get('requests-running', 0):.0f}  waiting {r.get('requests-waiting', 0):.0f}  "
                   f"KV {r.get('kv_cache_usage_pct', '-')}%  TTFT {r.get('avg_ttft_ms', '-')} ms  "
                   f"ITL {r.get('avg_itl_ms', '-')} ms"
+                  + (f"  (last interval: TTFT p95 {r['ttft_p95_ms']} ms, ITL p95 {r.get('itl_p95_ms', '-')} ms)"
+                     if r.get("ttft_p95_ms") is not None else "")
                   + (f"  accept {r['spec_mean_accept_len']}" if r.get("spec_mean_accept_len") else "")
                   + (f"  prefix-hit {r['prefix_hit_rate_pct']}%" if r.get("prefix_hit_rate_pct") else ""))
         if not args.watch:
@@ -1084,7 +1177,7 @@ def cmd_hardware(args, api: Api):
 
 # ---- argument parsing -----------------------------------------------------------------------
 def _add_serve_args(s: argparse.ArgumentParser) -> None:
-    s.add_argument("what", choices=["controller", "agent", "privd", "termd"])
+    s.add_argument("what", choices=["controller", "gateway", "agent", "privd", "termd"])
     s.add_argument("--config", help="controller.yaml / agent.yaml")
     s.add_argument("--socket", default="/run/twinspark/privd.sock")
     s.add_argument("--group", default="twinspark")
@@ -1107,8 +1200,8 @@ def _serve_main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="tsm serve", description="run a service (used by systemd)")
     _add_serve_args(p)
     args = p.parse_args(argv)
-    if args.what in ("controller", "agent", "termd") and not args.config:
-        p.error("serve controller|agent|termd needs --config")
+    if args.what in ("controller", "gateway", "agent", "termd") and not args.config:
+        p.error("serve controller|gateway|agent|termd needs --config")
     cmd_serve(args)
     return 0
 
@@ -1143,6 +1236,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("profile")
     s = cmd("fit", cmd_fit, "memory fit and estimated KV pool")
     s.add_argument("profile")
+    v = sub.add_parser("validation", help="validation records: what was tested, with what, and the results")
+    vs = v.add_subparsers(dest="validation_cmd", metavar="<action>", required=True)
+    s = vs.add_parser("export", help="a record of a revision's activation (JSON, or Markdown for docs)")
+    s.set_defaults(fn=cmd_validation)
+    s.add_argument("profile")
+    s.add_argument("--revision", help="revision label or id (default: the pinned one)")
+    s.add_argument("--job", help="a specific activation job (default: the latest completed one)")
+    s.add_argument("--markdown", action="store_true", help="a Markdown table instead of JSON")
+    s.add_argument("-o", "--output", help="write to this file")
     s = cmd("pin", cmd_pin, "resolve the draft to a commit sha + image digest (activatable revision)")
     s.add_argument("profile")
     s.add_argument("--model-ref", help="branch, 40-char sha or org/repo@ref (default: keep / main)")
@@ -1168,6 +1270,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("profile")
     s.add_argument("revision", nargs="?", default="latest")
     s.add_argument("--no-wait", action="store_true")
+    s.add_argument("--drain", choices=["abort", "wait", "force"],
+                   help="requests still running when the switch starts: abort the switch (default: keep the old "
+                        "model), wait for them, or force (end them)")
+    s.add_argument("--drain-timeout", type=int, metavar="S", help="seconds before abort/force (default 30)")
+    s.add_argument("--half", type=str.upper, choices=["A", "B"],
+                   help="split profiles: restart only this node's half of the active revision; the other keeps "
+                        "serving (a switch to a new revision touches only the halves that changed by itself)")
     s = cmd("prepare", cmd_prepare, "check images/patches and stage a recipe without switching")
     s.add_argument("profile")
     s.add_argument("revision", nargs="?", default="latest")
@@ -1195,13 +1304,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tail", type=int, default=200)
 
     s = cmd("cookbook", cmd_cookbook, "recipes: built-in, community (eugr), import")
-    s.add_argument("action", choices=["list", "show", "import", "community", "import-recipe"])
-    s.add_argument("name", nargs="?", help="recipe name, or a file/URL for import-recipe")
+    s.add_argument("action", choices=["list", "show", "import", "community", "import-recipe", "refresh", "report",
+                                      "stats"])
+    s.add_argument("name", nargs="?", help="recipe name, a file/URL for import-recipe, a profile for report")
     s.add_argument("--as", dest="as_name", help="profile name to create")
+    s.add_argument("--mode", help="show/import: one of the recipe's modes (e.g. latency, throughput)")
     s.add_argument("--preview", action="store_true", help="import-recipe: show the mapping only")
     s.add_argument("-e", "--set", action="append", metavar="KEY=VALUE",
                    help="import-recipe: override an eugr template default (like run-recipe -e)")
-    s.add_argument("--refresh", action="store_true", help="community: bypass the 10 min cache")
+    s.add_argument("--refresh", action="store_true", help="community/stats: bypass the cache")
+    s.add_argument("--outcome", choices=["works", "works-with-changes", "fails"],
+                   help="report: how it went (default: from the last activation)")
+    s.add_argument("--stage", dest="failure_stage",
+                   choices=["download", "pull", "plan", "start", "health", "smoke", "serving", "other"],
+                   help="report --outcome fails: where it failed")
+    s.add_argument("--comment", default="", help="report: a short note (500 characters; shown before sending)")
+    s.add_argument("--anonymous", action="store_true", help="report: without this installation's random id")
+    s.add_argument("-y", "--yes", action="store_true", help="report: send without asking (after the preview)")
 
     s = cmd("models", cmd_models, "model files on both nodes: ls, stage, rm")
     s.add_argument("action", choices=["ls", "stage", "rm"])
@@ -1251,7 +1370,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_client, cli_qsfp, cli_remote, cli_setup
+    from . import cli_bench, cli_client, cli_gateway, cli_keys, cli_metrics, cli_qsfp, cli_remote, cli_setup
+    cli_bench.add_parsers(sub, cmd)
+    cli_gateway.add_parsers(sub, cmd)
+    cli_keys.add_parsers(sub, cmd)
+    cli_metrics.add_parsers(sub, cmd)
     cli_client.add_parsers(sub, cmd)
     cli_setup.add_parsers(sub, cmd)
     cli_remote.add_parsers(sub, cmd)

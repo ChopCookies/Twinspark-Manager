@@ -16,6 +16,7 @@ from ..schemas.job import Job, JobStep
 from ..schemas.profile import ProfileRevision
 from .agent_client import AgentActionError, AgentClient
 from .launch import LaunchError, LaunchPlan, LaunchPlanner
+from .measurements import Measurements, kv_memory_from_log, resolve_kv
 from .planner import MemoryPlanner, ModelSpec
 from .staging import StageError, WeightsStager
 from .timeline import STAGES as TIMELINE_STAGES
@@ -43,6 +44,10 @@ _PHASES = [
 ]
 _KV_TOKENS = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens", re.I)
 _MAX_CONC = re.compile(r"Maximum concurrency for\s*([\d,]+)\s*tokens per request:\s*([\d.]+)x", re.I)
+# SGLang: "KV Cache is allocated. #tokens: 123456, K size: 9.42 GB, V size: 9.42 GB" / "max_total_num_tokens=123456"
+_SGL_KV = re.compile(r"KV Cache is allocated\.\s*#tokens:\s*([\d,]+),\s*K size:\s*([\d.]+)\s*GB,"
+                     r"\s*V size:\s*([\d.]+)\s*GB")
+_SGL_TOKENS = re.compile(r"max_total_num_tokens=(\d+)")
 
 
 def phase_from_log(tail: str) -> Optional[str]:
@@ -63,6 +68,19 @@ def kv_facts_from_log(text: str) -> dict:
     if m:
         out["max_concurrency"] = float(m.group(2))
         out["max_concurrency_at_tokens"] = int(m.group(1).replace(",", ""))
+    pool = kv_memory_from_log(text)
+    if pool is not None:
+        out["kv_memory_gib"] = pool          # with the token count: the KV bytes per token as served
+    if "kv_cache_tokens" not in out:
+        found = _SGL_KV.findall(text or "")
+        if found:
+            tokens, k, v = found[-1]
+            out["kv_cache_tokens"] = int(tokens.replace(",", ""))
+            out["kv_memory_gib"] = round((float(k) + float(v)) * 1e9 / 1024 ** 3, 2)    # SGLang logs GB
+        else:
+            m = _SGL_TOKENS.findall(text or "")
+            if m:
+                out["kv_cache_tokens"] = int(m[-1])
     return out
 
 
@@ -93,7 +111,10 @@ class ActivationCoordinator:
         # Where a successful start's observed startup peak is kept for the planner. The controller hands
         # over its bound ``_persist``; until it passes ``store=`` itself, its store is taken from there.
         self.store = store if store is not None else getattr(getattr(persist, "__self__", None), "store", None)
+        self.measurements = Measurements(self.store) if self.store is not None else None
         self.timeline: Optional[StartupTimeline] = None
+        # a switch that touches only some halves of a split deployment (controller.halves.decide_scope)
+        self.scope: Optional[dict] = None
 
     def agent(self, node: str) -> AgentClient:
         if node not in self.agents:
@@ -102,6 +123,7 @@ class ActivationCoordinator:
 
     async def handle(self, job: Job, stage: ActivationStage, step: JobStep) -> Optional[str]:
         rev: ProfileRevision = job.payload["_revision"]
+        self.scope = job.payload.get("scope") or None
         handler = {
             ActivationStage.VALIDATING: self._validate,
             ActivationStage.RESOLVING: self._resolve,
@@ -124,8 +146,34 @@ class ActivationCoordinator:
             await self._timeline_failed()
             raise
         if stage == ActivationStage.HEALTHY:
-            await self._timeline_success(job, rev)
+            summaries = await self._timeline_success(job, rev)
+            self._record_measurements(job, rev, summaries or {})
         return message
+
+    def _record_measurements(self, job: Job, rev: ProfileRevision, summaries: dict) -> None:
+        """Keep what this start measured under the fingerprint of its settings (controller.measurements):
+        the KV bytes per token vLLM's pool implies and each node's startup footprint. Simulated (dry-run)
+        readings are not kept: they would calibrate real plans with invented numbers."""
+        if self.measurements is None or self.dry_run:
+            return
+        try:
+            for part in rev.parts():
+                nodes = part.required_nodes()
+                if self.scope and not set(nodes) & set(self.scope["nodes"]):
+                    continue                   # a half that kept running: this start measured nothing of it
+                model = (self.plan.route_models or {}).get(part.draft.simple.api_alias) if self.plan else None
+                kv = (((job.payload.get("models") or {}).get(model) or {}).get("kv")
+                      or (job.payload.get("kv") if not rev.draft.secondary else None) or {})
+                self.measurements.record_kv(part.draft, part.identity, nodes, kv, revision_id=rev.revision_id,
+                                            job_id=job.job_id)
+                for n in nodes:
+                    summary = summaries.get(n) if isinstance(summaries.get(n), dict) else None
+                    if summary and not summary.get("simulated"):
+                        self.measurements.record_startup(part.draft, part.identity, n, summary,
+                                                         revision_id=rev.revision_id, job_id=job.job_id,
+                                                         kv_tokens=kv.get("kv_cache_tokens"))
+        except Exception:  # noqa: BLE001 - a measurement must never fail the activation
+            log.exception("could not keep this start's measurements")
 
     # ---- startup memory timeline (best effort: never fails the activation) ------------------------
     async def _timeline_mark(self, job: Job, rev: ProfileRevision, stage: ActivationStage) -> None:
@@ -156,9 +204,9 @@ class ActivationCoordinator:
         except Exception:  # noqa: BLE001
             log.exception("startup timeline could not be stopped")
 
-    async def _timeline_success(self, job: Job, rev: ProfileRevision) -> None:
+    async def _timeline_success(self, job: Job, rev: ProfileRevision) -> Optional[dict]:
         if self.timeline is None:
-            return
+            return None
         try:
             summaries = await self.timeline.finish_success()
             if summaries:
@@ -168,10 +216,12 @@ class ActivationCoordinator:
                     # its own key: the revision's observed:{id} record is rewritten when the job completes
                     self.store.kv_set(f"observed_startup:{rev.revision_id}", obs)
             self.persist(job)
+            return obs["nodes"] if summaries else None
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.exception("startup timeline could not be kept")
+            return None
 
     # ---- helpers -------------------------------------------------------------
     def _models(self, rev: ProfileRevision):
@@ -199,8 +249,10 @@ class ActivationCoordinator:
             mem_total = min(totals) if totals else job.payload.get("mem_total_gib")
             util = self._util(part, mem_total)
             if spec is not None:
-                if rev.draft.secondary:
-                    spec = replace(spec, kv_bytes_per_token=part.draft.source.get("kv_bytes_per_token"))
+                # the KV size of exactly this setup: never one that another profile of the model measured
+                kvb, kv_src, kv_note = resolve_kv(self.measurements, part.draft, part.identity, nodes[0])
+                spec = replace(spec, kv_bytes_per_token=kvb)
+                job.payload.setdefault("kv_sources", {})[part.profile_name] = {"source": kv_src, "note": kv_note}
                 if s.topology.value in ("tp2", "tp-ep") and spec.num_attention_heads % 2:
                     raise RuntimeError(f"{part.profile_name}: {spec.num_attention_heads} attention heads "
                                        "cannot split over TP2 — use pp2 or a single node")
@@ -219,11 +271,13 @@ class ActivationCoordinator:
                     single = self.planner.estimate(context_length=one_ctx, concurrency=1, **common)
                     ok1, head1 = self.planner.fits(single, util)
                     if not ok1:
-                        raise RuntimeError(f"{part.profile_name}: estimated not to fit: weights "
-                                           f"{single.model_weights:.1f} GiB/node + one sequence are "
-                                           f"{-head1:.1f} GiB short per node (out of memory expected)")
-                    notes.append(f"{part.profile_name}: KV estimate exceeds pool by {-headroom:.1f} "
-                                 "GiB/node — vLLM fits fewer parallel sequences")
+                        raise RuntimeError(f"{part.profile_name}: estimated not to fit: for one {one_ctx:,}-token "
+                                           f"sequence, {self.planner.explain(single, util)} — {-head1:.1f} GiB short "
+                                           "per node (out of memory expected)")
+                    seqs = a.max_num_seqs or s.concurrency
+                    notes.append(f"{part.profile_name}: {seqs} sequence(s) of {s.planning_context():,} tokens need "
+                                 f"{budget.kv_cache:.1f} GiB of KV cache per node, {-headroom:.1f} GiB more than "
+                                 f"fits ({self.planner.explain(budget, util)}) — vLLM serves fewer in parallel")
                 notes.append(f"{part.profile_name}: estimated headroom {headroom:.1f} GiB/node")
                 startup = self._startup_verdicts(part, spec, util, nodes)
                 if startup:
@@ -245,6 +299,12 @@ class ActivationCoordinator:
         except LaunchError as exc:
             raise RuntimeError(str(exc)) from exc
         job.payload["launch_plan"] = self.plan.model_dump(mode="json")
+        if self.scope:
+            # only these halves are drained, stopped and started; the others keep serving untouched
+            from .halves import scoped_plan
+            self.plan = scoped_plan(self.plan, self.scope["nodes"])
+            notes.append(f"only node {', '.join(self.scope['nodes'])}'s half changes; node "
+                         f"{', '.join(self.scope['kept'])}'s half keeps serving")
         job.payload["warnings"] = ([n for n in self.plan.notes if n.startswith("WARNING")]
                                    + list(job.payload.get("startup_warnings") or []))
         return "plan ready (" + ", ".join(f"{n}: gpu_memory_utilization={u:.2f}"
@@ -255,19 +315,22 @@ class ActivationCoordinator:
         hardware facts the controller saw. Empty when the store is not available."""
         if self.store is None:
             return {}
+        from .controller import load_model_spec
         from .planner import drafter_inputs
 
-        def lookup(repo: str) -> Optional[ModelSpec]:
-            d = self.store.kv_get(f"model_spec:{repo}")
-            return ModelSpec(**{k: v for k, v in d.items() if k in ModelSpec.__dataclass_fields__}) if d else None
         s, a = part.draft.simple, part.draft.advanced
         try:
-            drafters = drafter_inputs(a, lookup)
+            drafters = drafter_inputs(a, lambda repo: load_model_spec(self.store, repo))
             out = {}
             for n in nodes:
                 facts = self.store.kv_get(f"hardware:{n}") or {}
+                kvb, kv_src, kv_note = resolve_kv(self.measurements, part.draft, part.identity, n)
+                cal = self.measurements.startup(part.draft, part.identity, n) if self.measurements else None
                 plan = self.planner.plan_node(
-                    spec=spec, quant=s.quantization, context_length=s.planning_context(),
+                    spec=replace(spec, kv_bytes_per_token=kvb), kv_source=(kv_src, kv_note),
+                    observed={"nodes": {n: cal}, "at": cal["at"]} if cal else None,
+                    observed_kv_tokens=cal.get("kv_tokens") if cal else None,
+                    quant=s.quantization, context_length=s.planning_context(),
                     concurrency=a.max_num_seqs or s.concurrency, topology=s.topology, node_id=n,
                     backend="ray" if self.launch.resolve_backend(part).value == "ray" else "native",
                     kv_dtype=a.kv_dtype, using_cuda_graphs=not a.eager_mode, gpu_memory_utilization=util,
@@ -308,9 +371,11 @@ class ActivationCoordinator:
             if len({d for d in drivers.values() if d}) > 1:
                 warnings.append(f"NVIDIA driver differs between nodes {drivers} — mismatched "
                                 f"drivers have cost 2x+ throughput on dual-Spark setups")
-            if multi and self.plan.mods:
-                st = {n: (await self.agent(n).call("mods_status", names=self.plan.mods))["status"]
-                      for n in nodes}
+        if self.plan.mods:
+            st = {n: (await self.agent(n).call("mods_status", names=self.plan.mods))["status"] for n in nodes}
+            # what ran, for the validation record (tsm validation export)
+            job.payload["mods"] = {m: {n: (st[n].get(m) or {}).get("hash") for n in nodes} for m in self.plan.mods}
+            if multi:
                 for m in self.plan.mods:
                     hashes = {st[n][m]["hash"] for n in nodes}
                     if len(hashes) > 1:
@@ -337,6 +402,8 @@ class ActivationCoordinator:
             phase(job, key, kind="image", label=label, state="done" if pulled else "reused",
                   detail="pulled from the registry" if pulled else "already on the node")
         self.persist(job)
+        from .imagecheck import check_plan
+        warnings += await check_plan(self, job, rev, step)      # before anything is stopped
         if rev.identity.image_source == "local" and len(nodes) > 1 and not rev.draft.secondary:
             ids = {n: (await self.agent(n).call("image_inspect", ref=rev.identity.image_ref)).get("id")
                    for n in nodes}
@@ -403,18 +470,48 @@ class ActivationCoordinator:
         # alias, so every serving alias is drained.
         aliases = [a for a, st in self.gateway.routes.items() if st.backends]
         aliases = sorted(set(aliases) | set(rev.draft.aliases))
+        if self.scope:
+            aliases = list(self.scope["aliases"])          # the kept half's requests are not waited for
         for a in aliases:
             self.gateway.begin_drain(a, retry_after=30)
         self.drained = aliases
-        timeout = self.config.runtime.drain_timeout_s
-        idle = await asyncio.gather(*(self.gateway.wait_idle(a, timeout) for a in aliases))
-        forced = [a for a, ok in zip(aliases, idle, strict=True) if not ok]
-        return "drained " + ", ".join(aliases) + (f" (forced after {timeout}s: {forced})" if forced else "")
+        rt = self.config.runtime
+        drain = job.payload.get("drain") or {}
+        policy = drain.get("policy") or rt.drain_policy
+        timeout = float(drain.get("timeout_s") or rt.drain_timeout_s)
+        limit = float(rt.drain_wait_max_s) if policy == "wait" else timeout
+        started = time.monotonic()
+        while True:
+            busy, oldest = self.gateway.inflight(aliases)
+            if busy == 0:
+                waited = time.monotonic() - started
+                return "drained " + ", ".join(aliases) + (f" after {waited:.0f}s" if waited >= 1 else "")
+            waited = time.monotonic() - started
+            if self.cancel_check():
+                # nothing was stopped: the old model is reopened (non-destructive failure)
+                raise RuntimeError(f"cancelled while {busy} request(s) were still running; the old model keeps serving")
+            if waited >= limit:
+                break
+            step.message = (f"waiting for {busy} running request(s)"
+                            + (f", the longest for {oldest:.0f}s" if oldest is not None else "")
+                            + (f" — {policy} after {limit:.0f}s" if policy != "wait" else
+                               f" — waits up to {limit:.0f}s, cancel the switch to keep the old model"))
+            step.progress = min(0.95, waited / max(limit, 1.0))
+            self.persist(job)
+            await asyncio.sleep(min(0.5, self.poll) if self.poll else 0.5)
+        longest = f" (the longest running for {oldest:.0f}s)" if oldest is not None else ""
+        if policy == "force":
+            return (f"drained {', '.join(aliases)}: forced after {waited:.0f}s with {busy} request(s) still running"
+                    f"{longest}; they end with the old model")
+        raise RuntimeError(
+            f"switch aborted: {busy} request(s) still running on {', '.join(aliases)} after {waited:.0f}s{longest}. "
+            f"The old model keeps serving. Switch again when they are done, or choose drain 'wait' (waits for "
+            f"them, up to {rt.drain_wait_max_s}s) or 'force' (ends them).")
 
     async def _stop(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         stopped = []
         skipped = []
-        for n in sorted(self.agents):
+        for n in sorted(self.scope["nodes"] if self.scope else self.agents):
             try:
                 res = await self.agent(n).call("containers_stop_owned", timeout=180)
             except AgentActionError:
@@ -588,21 +685,26 @@ class ActivationCoordinator:
         return "test completion ok (" + ", ".join(out) + ")"
 
     async def _route(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
+        node_of = {c.health_url: c.node for c in self.plan.containers if c.health_url}   # for per-node weights
         for alias, backends in self.plan.routes.items():
             model = self.plan.route_models.get(alias, self.plan.served_model_name)
             self.gateway.set_route(alias, backends, model, rev.revision_id,
                                    max_model_len=(job.payload.get("models") or {}).get(model, {}).get(
-                                       "max_model_len", job.payload.get("max_model_len")))
+                                       "max_model_len", job.payload.get("max_model_len")), nodes=node_of)
         # Aliases the previous deployment had but this one does not use: reopen them (so they do
         # not stay "switching" forever) and forget idle ones, so clients get a clean 404.
         stale = [a for a in self.drained if a not in self.plan.routes]
         for a in stale:
             self.gateway.cancel_drain(a)
             st = self.gateway.routes.get(a)
-            if st is not None and not st.backends and st.inflight == 0:
-                self.gateway.routes.pop(a, None)
+            if st is not None and not st.backends and st.busy == 0:
+                self.gateway.remove_route(a)
         self.drained = []
         return "routing " + ", ".join(self.plan.routes)
 
     async def _healthy(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
+        if self.scope:
+            served = ", ".join(f"'{a}'" for a in self.plan.routes)
+            return (f"{rev.profile_name} {rev.label}: node {', '.join(self.scope['nodes'])}'s half serving as "
+                    f"{served}; node {', '.join(self.scope['kept'])}'s half kept serving throughout")
         return f"{rev.profile_name} {rev.label} serving as '{rev.draft.simple.api_alias}'"

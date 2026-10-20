@@ -43,7 +43,7 @@ function page({ hash = "", responses = {} } = {}) {
     window: { addEventListener() {} },
     document: { addEventListener() {}, querySelector: element, title: "" },
   });
-  for (const file of ["app.js", "start.js", "remote.js", "client.js"]) {
+  for (const file of ["app.js", "start.js", "remote.js", "bench.js", "keys.js", "playground.js", "client.js"]) {
     vm.runInContext(fs.readFileSync(path.join(JS, file), "utf8"), context, { filename: file });
   }
   return { context, element, storage, requests, loc, run: code => vm.runInContext(code, context) };
@@ -215,4 +215,26 @@ test("HTML loads the client module last and the GUI has its styles", () => {
   assert.equal(scripts[scripts.length - 1], "js/client.js");
   assert.match(html, /id="client-states"/);
   assert.match(fs.readFileSync(path.join(source, "css/style.css"), "utf8"), /\.client-states/);
+});
+
+test("a switch with running requests asks first; the answer becomes the drain policy", async () => {
+  const busy = { routes: [{ alias: "default", inflight: 2, oldest_inflight_s: 95 }], drain: { timeout_s: 30 } };
+  const p = page({ responses: { "/api/v1/status": { body: busy } } });
+  const asked = [];
+  p.context.modalAnswer = "wait";
+  p.run("modal = async (o) => { asked.push(o); return { value: modalAnswer }; }");
+  p.context.asked = asked;
+  const choice = async (pg) => JSON.parse(await pg.run("drainChoice().then(JSON.stringify)"));
+  assert.deepEqual(await choice(p), { drain_policy: "wait" });
+  assert.match(asked[0].title, /2 requests are still running/);
+  assert.match(asked[0].body, /longest for 95 s/);
+  p.context.modalAnswer = "force";
+  assert.deepEqual(await choice(p), { drain_policy: "force", drain_timeout_s: 0 });
+  p.context.modalAnswer = "abort";
+  assert.deepEqual(await choice(p), {});
+  p.context.modalAnswer = null;
+  assert.equal(await choice(p), null);                              // cancelled: no switch
+  const idle = page({ responses: { "/api/v1/status": { body: { routes: [{ alias: "default", inflight: 0 }] } } } });
+  assert.deepEqual(await choice(idle), {});                         // nothing running: no question
+  assert.equal(p.run("activationBody({drain_policy:'wait'}).drain_policy"), "wait");
 });

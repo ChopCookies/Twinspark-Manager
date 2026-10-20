@@ -59,5 +59,32 @@
       "reasoning parser deepseek_r1 is what the measured recipe uses; the upstream vLLM recipe uses glm47 — switch if your image ships it.",
       "KV/token ≈ 7 KB (fp8, no drafter) per tonyd2wild's measurement; used by the planner."
     ]
+  },
+  "default_mode": "latency",
+  "modes": {
+    "latency": {
+      "title": "Latency — MTP k=3",
+      "description": "Native multi-token prediction with 3 speculative tokens: the fastest single stream. The recipe author's measurements.",
+      "patch": {},
+      "measured": {
+        "single_stream_tok_s": 26.5,
+        "aggregate_c4_tok_s": 57.7,
+        "aggregate_c8_tok_s": 76.2,
+        "kv_pool": "7.48 GiB ≈ 1.15M tokens at 262K",
+        "boot": "~13-15 min (checkpoint load dominates)"
+      }
+    },
+    "throughput": {
+      "title": "Throughput — no speculation, 8 sequences",
+      "description": "Without the MTP drafter the scheduler can run more requests at once: higher aggregate tokens/s at a lower single-stream speed. Not measured on two Sparks yet: tsm bench run max-throughput, then share the result.",
+      "patch": {
+        "advanced": {
+          "speculative_config": null,
+          "max_num_seqs": 8,
+          "max_num_batched_tokens": 8192
+        }
+      },
+      "measured": {}
+    }
   }
 }
