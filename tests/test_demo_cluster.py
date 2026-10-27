@@ -37,6 +37,32 @@ def test_demo_provision_accepts_non_linux_host_username(tmp_path, monkeypatch):
     assert d.key
 
 
+def test_agent_ports_are_free_on_both_loopback_addresses(monkeypatch):
+    """Agent A listens on 127.0.0.1 and B on 127.0.0.2 with the same port. A port the kernel calls free
+    on 127.0.0.2 may be held on 127.0.0.1 by any local service; the demo then failed to start."""
+    import socket
+
+    from twinspark import demo as demo_mod
+
+    taken = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    taken.bind(("127.0.0.1", 0))
+    taken.listen()
+    busy = taken.getsockname()[1]
+    real, offered = demo_mod._any_port, []
+
+    def first_the_busy_one(host):
+        offered.append(host)
+        return busy if len(offered) == 1 else real(host)
+
+    monkeypatch.setattr(demo_mod, "_any_port", first_the_busy_one)
+    try:
+        port = demo_mod.free_port("127.0.0.2", "127.0.0.1")
+    finally:
+        taken.close()
+    assert port != busy and len(offered) >= 2
+    assert demo_mod._bindable("127.0.0.1", port) and demo_mod._bindable("127.0.0.2", port)
+
+
 @pytest.mark.skipif(sys.platform == "linux", reason="Linux supports the demo terminal")
 def test_demo_terminal_on_unsupported_host_has_clear_error():
     with pytest.raises(ValueError, match="requires Linux PTYs"):

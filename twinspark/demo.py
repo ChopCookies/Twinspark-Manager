@@ -35,7 +35,7 @@ class DemoError(RuntimeError):
     """The demo cannot start on this machine (reported as one line, not a traceback)."""
 
 
-def free_port(host: str = "127.0.0.1") -> int:
+def _any_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, 0))
@@ -46,6 +46,30 @@ def free_port(host: str = "127.0.0.1") -> int:
             raise DemoError(f"the demo's node B needs the loopback address {host}, which this machine does "
                             f"not have ({e.strerror}). On macOS: sudo ifconfig lo0 alias {host} up") from None
         return s.getsockname()[1]
+
+
+def _bindable(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError:
+            return False
+        return True
+
+
+def free_port(*hosts: str) -> int:
+    """A TCP port free on every one of ``hosts`` (default: 127.0.0.1).
+
+    Agents A and B (and their terminals) share one port number but listen on 127.0.0.1 and 127.0.0.2.
+    A port the kernel hands out as free on 127.0.0.2 can be taken on 127.0.0.1 by any local service,
+    so the demo asks for one that is free on both.
+    """
+    hosts = hosts or ("127.0.0.1",)
+    for _ in range(64):
+        port = _any_port(hosts[0])
+        if all(_bindable(h, port) for h in hosts[1:]):
+            return port
+    raise DemoError(f"no TCP port is free on all of {', '.join(hosts)}")
 
 
 def seed_recipes(controller) -> int:
@@ -75,8 +99,9 @@ class DemoCluster:
         self.seed = seed
         self.mgmt_port = mgmt_port or free_port()
         self.gateway_port = gateway_port or free_port()
-        self.agent_port = free_port("127.0.0.2")
-        self.terminal_port = free_port("127.0.0.2")
+        # agent A listens on 127.0.0.1, agent B on 127.0.0.2 — the same port must be free on both
+        self.agent_port = free_port("127.0.0.2", "127.0.0.1")
+        self.terminal_port = free_port("127.0.0.2", "127.0.0.1")
         # remote-management switches to turn on in both nodes' policy ({} = everything off, the default)
         self.remote = dict(remote or {})
         self.extra = extra or {}

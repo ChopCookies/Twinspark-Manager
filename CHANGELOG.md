@@ -23,6 +23,9 @@
   Windows code page instead of UTF-8 (a recipe with an umlaut failed). These read and write UTF-8 with LF
   now, `tsm mods install` converts a CRLF `run.sh` to LF, and a test keeps workstation-side modules from
   relying on the platform encoding.
+- **`tsm demo` could fail to start** ("demo server failed to start … address already in use"): the agent
+  and terminal ports were only checked on 127.0.0.2, but agent A listens on 127.0.0.1, where any local
+  service may already hold that port. The demo now picks ports free on both addresses.
 - Background tasks of the terminal (the shell-exit watcher) and of the client (closing a replaced HTTP
   client) are kept referenced until they finish.
 
