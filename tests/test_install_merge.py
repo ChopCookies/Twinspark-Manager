@@ -87,8 +87,10 @@ du() { printf '12G\t%s\n' "$2"; }
 TSM_BIN_DIR=/tmp/twinspark-installer-bin
 '''
     # Run the actual function, replacing systemctl and every deletion with trace-only functions.
+    units = re.search(r'(?m)^UNITS="[^"]*"$', source)
+    assert units, "could not locate the installer's unit list"
     return (mocks + f'TSM_HOME="{_shell_path(home)}"\nMARKER="$TSM_HOME/.twinspark-install"\n'
-            f"PURGE={int(purge)}\n" + function.group() + "\nuninstall\n")
+            f"PURGE={int(purge)}\n" + units.group() + "\n" + function.group() + "\nuninstall\n")
 
 
 @pytest.mark.parametrize("purge", [False, True])
@@ -98,11 +100,12 @@ def test_uninstall_stops_and_removes_terminal_before_other_services(purge, tmp_p
     result = subprocess.run([_bash(), "-c", script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
-    services = ["twinspark-terminal", "twinspark-controller", "twinspark-agent", "twinspark-privd"]
-    stops = [f"SERVICE disable --now {service}" for service in services]
+    units = ["twinspark-terminal.socket", "twinspark-terminal.service", "twinspark-controller.service",
+             "twinspark-gateway.service", "twinspark-agent.service", "twinspark-privd.service"]
+    stops = [f"SERVICE disable --now {unit}" for unit in units]
     assert [line for line in lines if line.startswith("SERVICE disable")] == stops
-    for service in services:
-        assert f"REMOVE -f /etc/systemd/system/{service}.service" in lines
+    for unit in units:
+        assert f"REMOVE -f /etc/systemd/system/{unit}" in lines
     assert "SERVICE daemon-reload" in lines
     assert f"REMOVE -rf {_shell_path(home)}" in lines
     purge_trace = "REMOVE -rf /etc/twinspark /var/lib/twinspark /var/cache/twinspark"
@@ -151,3 +154,11 @@ def test_purge_says_that_downloaded_models_go_too(tmp_path):
     script = _uninstall_script(True, tmp_path / "h", marked=True).replace("warn() { :; }", 'warn() { echo "WARN $*"; }')
     out = subprocess.run([_bash(), "-c", script], capture_output=True, text=True, timeout=10).stdout
     assert "model files" in out and "12G" in out
+
+
+def test_uninstall_knows_every_unit_setup_can_write():
+    """0.7 added twinspark-gateway.service: an uninstall that misses a unit leaves it restarting a deleted
+    program forever."""
+    from twinspark.provision import UNIT_NAMES
+    units = re.search(r'(?m)^UNITS="([^"]*)"$', INSTALL.read_text(encoding="utf-8"))
+    assert units and set(units.group(1).split()) == set(UNIT_NAMES)

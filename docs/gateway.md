@@ -112,4 +112,6 @@ longer drops the connections of running streams: an agent in the middle of a lon
 `gateway_mode: in-process` runs the gateway inside the controller as before. An installation set up with 0.6
 keeps that (its controller.yaml has no `gateway_mode`). To change it: add `gateway_mode: standalone` to
 `/etc/twinspark/controller.yaml`, then `sudo tsm setup` (it writes and starts `twinspark-gateway.service`
-for that mode, and restarts the controller).
+for that mode, and restarts the controller). Back to `in-process`: change the line and run `sudo tsm setup`
+again — it stops, disables and removes `twinspark-gateway.service` (keeping a `.bak` copy) before the
+controller restarts, so the two never compete for the gateway port.

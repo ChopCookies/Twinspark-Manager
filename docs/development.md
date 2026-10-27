@@ -44,8 +44,10 @@ python3.12 -m venv /tmp/rel && /tmp/rel/bin/pip install ".[hf]"
 ```
 
 Raise a bound in `constraints/minimum.txt` only together with `pyproject.toml`. Tests must pass on both
-sets: where a library changed behaviour between them (Starlette before 0.39 wraps stream errors in an
-`ExceptionGroup`), the test accepts both forms rather than narrowing the range.
+sets: where a library changed behaviour between them, the test accepts both forms rather than narrowing the
+range. A bound is raised when a published advisory covers the old floor (`pip-audit -r
+constraints/minimum.txt --no-deps`; 0.7.1 moved Starlette, anyio and cryptography for that reason), and
+`constraints/release.txt` is regenerated when `pip-audit -r constraints/release.txt` finds one.
 
 HF-cache symlink tests skip when Windows denies link creation. Linux PTYs, Unix sockets,
 root ownership, executable bits and atomic directory exchange have separate platform checks;

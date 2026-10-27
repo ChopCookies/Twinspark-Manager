@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twinspark-manager"
-version = "0.7.0"
+version = "0.7.1"
 description = "Model manager for two NVIDIA DGX Sparks: vLLM recipes, one OpenAI-compatible endpoint, web GUI and CLI"
 readme = "README.md"
 license = "MIT"
@@ -27,22 +27,26 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 requires-python = ">=3.12"
+# Lower bounds without a published advisory against them (pip-audit): Starlette before 1.3.1 (Host/path
+# handling of request.url, form limits), anyio before 4.14.2, cryptography before 50.0 (bundled OpenSSL,
+# certificate verification). FastAPI 0.133 is the first that accepts Starlette 1.x.
 dependencies = [
-    "fastapi>=0.115",
+    "fastapi>=0.133",
+    "starlette>=1.3.1",
     "uvicorn[standard]>=0.30",
     "websockets>=15.0",
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "httpx>=0.27",
-    "anyio>=4",
-    "cryptography>=42.0",
+    "anyio>=4.14.2",
+    "cryptography>=50.0",
 ]
 
 [project.optional-dependencies]
 hf = ["huggingface_hub>=0.24"]
 # the workstation client: keys in the system keychain (macOS Keychain, Windows Credential Manager, Secret Service)
 client = ["keyring>=24"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff"]
+dev = ["pytest>=9.0.3", "pytest-asyncio>=1.3", "ruff"]
 
 [project.urls]
 Homepage = "https://github.com/ChopCookies/Twinspark-Manager"

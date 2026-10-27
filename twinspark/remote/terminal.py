@@ -176,6 +176,7 @@ class TerminalManager:
         self.node_id = node_id
         self.sessions: dict[str, Session] = {}
         self._reaper: Optional[asyncio.Task] = None
+        self._watchers: set[asyncio.Task] = set()        # asyncio keeps only weak references to tasks
 
     # ---- lifecycle ------------------------------------------------------------------------
     def start(self) -> None:
@@ -239,7 +240,9 @@ class TerminalManager:
         self.sessions[sid] = sess
         loop = asyncio.get_running_loop()
         loop.add_reader(master, self._readable, sess)
-        loop.create_task(self._watch_exit(sess))
+        watcher = loop.create_task(self._watch_exit(sess))
+        self._watchers.add(watcher)
+        watcher.add_done_callback(self._watchers.discard)
         self.start()
         return sess
 

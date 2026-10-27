@@ -521,3 +521,30 @@ def test_a_new_install_runs_the_gateway_on_its_own_and_a_kept_06_config_does_not
     lay2.controller_yaml.write_text(text)
     Provisioner(answers_a(tmp_path), lay2, systemd=False).apply()
     assert not (lay2.systemd / "twinspark-gateway.service").exists()
+
+
+def test_going_back_to_in_process_retires_the_gateway_unit_before_the_controller_restarts(tmp_path):
+    """A standalone install switched back to `gateway_mode: in-process`: the gateway's own unit would keep the
+    gateway port and the controller's in-process gateway could not bind it."""
+    lay = Layout(tmp_path / "root")
+    Provisioner(answers_a(tmp_path), lay, systemd=False).apply()
+    unit = lay.systemd / "twinspark-gateway.service"
+    assert unit.exists()
+    lay.controller_yaml.write_text(lay.controller_yaml.read_text().replace("gateway_mode: standalone",
+                                                                            "gateway_mode: in-process"))
+    calls = []
+
+    def run(argv, *a, **kw):
+        calls.append(" ".join(argv))
+        return 0, ""
+    p = Provisioner(answers_a(tmp_path), lay, run=run, systemd=False)
+    p.systemd = True                                      # as on a real node: systemctl is called
+    p.apply()
+    assert not unit.exists() and list(lay.systemd.glob("twinspark-gateway.service.bak-*"))
+    retire = calls.index("systemctl disable --now twinspark-gateway.service")
+    assert retire < calls.index("systemctl enable --now twinspark-controller.service")
+    assert not any("enable --now twinspark-gateway" in c for c in calls)
+    # a second run has nothing left to retire, and node B never touches a gateway unit
+    calls.clear()
+    Provisioner(answers_a(tmp_path), lay, run=run, systemd=False).apply()
+    assert not any("twinspark-gateway" in c for c in calls)

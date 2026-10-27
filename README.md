@@ -7,7 +7,7 @@ One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA
 (GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
 and keep the machines headless.
 
-> **Status: alpha (0.7.0).** The control path is covered by automated tests (about 1,450). Real Docker
+> **Status: alpha (0.7.1).** The control path is covered by automated tests (about 1,450). Real Docker
 > activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
 > and two-node PP2) on 2026-09-28, at the code of that day — see the
 > [validation note](docs/notes/small-model-validation-2026-09-28.md). Large models, other topologies
