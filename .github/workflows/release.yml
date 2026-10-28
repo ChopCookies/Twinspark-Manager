@@ -1,0 +1,98 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (matching pyproject.toml) publishes that version as a GitHub release:
+# the wheel, the sdist, constraints-release.txt and SHA256SUMS. `tsm update` installs from these files.
+#   git tag v0.8.0 && git push origin v0.8.0
+# PyPI is optional: set the repository variable PUBLISH_PYPI to "true" after adding this repository as a
+# trusted publisher on pypi.org (project twinspark-manager, workflow release.yml, environment pypi).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      prerelease: ${{ steps.prepare.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Tag matches pyproject.toml
+        run: python scripts/release_assets.py check-tag --tag "$GITHUB_REF_NAME"
+      - name: Tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c constraints/release.txt -e ".[dev,hf,client]"
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider
+      - name: Build wheel and sdist
+        run: |
+          pip install build
+          rm -rf dist && python -m build
+      - name: Install the wheel with the release constraints, in a clean venv
+        run: |
+          python -m venv /tmp/tsm
+          /tmp/tsm/bin/pip install -c constraints/release.txt "$(ls dist/twinspark_manager-*.whl)[hf]"
+          test "$(/tmp/tsm/bin/tsm --version)" = "tsm ${GITHUB_REF_NAME#v}"
+      - name: Checksums and release notes
+        id: prepare
+        run: python scripts/release_assets.py prepare --tag "$GITHUB_REF_NAME" --dist dist --notes release-notes.md | tee prepare.log && grep '^prerelease=' prepare.log >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: |
+            dist/
+            release-notes.md
+          if-no-files-found: error
+
+  github:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+      - name: Create the release (or replace its files when re-run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          flags=()
+          [ "$PRE" = true ] && flags+=(--prerelease)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "TwinSpark Manager ${TAG#v}" --notes-file release-notes.md "${flags[@]}"
+          fi
+
+  pypi:
+    name: PyPI (optional)
+    needs: build
+    if: vars.PUBLISH_PYPI == 'true'
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+      - name: Only the packages
+        run: mkdir pypi && mv dist/twinspark_manager-*.whl dist/twinspark_manager-*.tar.gz pypi/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pypi/

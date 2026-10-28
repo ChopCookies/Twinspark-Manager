@@ -106,8 +106,9 @@ def load_policy(path: str | Path = POLICY_PATH, require_root: bool = True) -> Re
         return RemotePolicy(error=f"{path} is not valid JSON ({exc})", present=True)
     if not isinstance(data, dict):
         return RemotePolicy(error=f"{path} must contain a JSON object", present=True)
+    flags: dict[str, Any] = {f: data.get(f) is True for f in FEATURES}
     return RemotePolicy(
-        **{f: data.get(f) is True for f in FEATURES},
+        **flags,
         record_terminal=data.get("record_terminal") is not False,
         terminal_idle_s=_clamp(data, "terminal_idle_s"),
         terminal_max_s=_clamp(data, "terminal_max_s"),

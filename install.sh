@@ -87,6 +87,16 @@ uninstall() {
 }
 if [ "$UNINSTALL" -eq 1 ]; then uninstall; exit 0; fi
 
+# `tsm update` installs TwinSpark releases from GitHub on this node unless this root-owned switch says
+# otherwise. Written once; an operator's later change (`sudo tsm update policy off`) is kept.
+write_update_policy() {
+  local dir="${TSM_CONFIG_DIR:-/etc/twinspark}"
+  [ -e "$dir/update-policy.json" ] && return 0
+  [ -d "$dir" ] || mkdir -p -m 0755 "$dir"
+  printf '{"enabled": true, "allow_prerelease": false}\n' > "$dir/update-policy.json"
+  chmod 0644 "$dir/update-policy.json"
+}
+
 # ---- 1. prerequisites -------------------------------------------------------------------
 pick_python() {
   local c
@@ -159,6 +169,7 @@ fi
 # code that runs as root (privd) must not be writable by anyone else
 chown -R root:root "$TSM_HOME"
 chmod -R go-w "$TSM_HOME"
+write_update_policy
 mkdir -p "$TSM_BIN_DIR"
 ln -sf "$TSM_HOME/venv/bin/tsm" "$TSM_BIN_DIR/tsm"
 VERSION="$("$TSM_HOME/venv/bin/tsm" --version 2>/dev/null || true)"

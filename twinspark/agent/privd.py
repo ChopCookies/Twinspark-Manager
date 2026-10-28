@@ -11,6 +11,8 @@ Operations
 * ``boot_target``     — ``systemctl set-default multi-user.target|graphical.target``
 * ``display_manager`` — ``systemctl stop|start display-manager`` (headless *now*)
 * ``swappiness``      — ``vm.swappiness`` 0..100 (GB10 recipes use 0)
+* ``update_*``        — install a TwinSpark release into this node's environment (``tsm update``; see
+  :mod:`twinspark.agent.selfupdate`, switched by the root-owned update policy)
 * ``remote_*``        — journal/kernel log reads, UEFI BootNext, scheduled reboot/poweroff, Wake-on-LAN
   setting (see :mod:`twinspark.remote.privops`; changing ops need the root-owned remote policy)
 
@@ -32,7 +34,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..remote.privops import REMOTE_PRIV_OPS
-from . import maintenance
+from . import maintenance, selfupdate
 
 log = logging.getLogger("twinspark.privd")
 
@@ -110,6 +112,9 @@ PRIV_OPS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "maintenance_status": maintenance.status,
     "maintenance_reboot": maintenance.reboot,
     "maintenance_verify": maintenance.verify,
+    "update_probe": selfupdate.probe,
+    "update_start": selfupdate.start,
+    "update_status": selfupdate.status,
     "status": op_status,
     "drop_caches": op_drop_caches,
     "boot_target": op_boot_target,

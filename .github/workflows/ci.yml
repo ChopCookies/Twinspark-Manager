@@ -41,9 +41,25 @@ jobs:
         # no hardware: dry-run agents, loopback servers, fake host tools; browser tests skip without Chromium
         run: |
           set -o pipefail
+          # newest dependencies: under coverage (the report is the job summary and an artifact)
+          run=(python -m pytest)
+          if [ "${{ matrix.deps }}" = newest ]; then pip install "coverage[toml]"; run=(python -m coverage run -m pytest); fi
           # -v and unbuffered: if the run ends abruptly, the end of the log names the test that was running
-          PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -v -p no:cacheprovider -rs \
+          PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 "${run[@]}" -v -p no:cacheprovider -rs \
             --junitxml=pytest.xml 2>&1 | tee pytest.log
+      - name: Coverage
+        if: matrix.deps == 'newest'
+        run: |
+          python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY" || true
+          python -m coverage html -d htmlcov
+          python -m coverage report --format=total | xargs -I{} echo "total coverage {} %"
+          python -m coverage report > /dev/null          # fails below fail_under (pyproject.toml)
+      - uses: actions/upload-artifact@v7
+        if: matrix.deps == 'newest' && always()
+        with:
+          name: coverage-html
+          path: htmlcov/
+          if-no-files-found: ignore
       - name: Failures as annotations
         if: failure()
         run: |
@@ -77,6 +93,52 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff
       - run: ruff check .
+
+  alerts:
+    name: alert rules (promtool)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: check and unit-test deploy/observability/alerts.yml
+        run: |
+          img=prom/prometheus:v3.5.0           # the version docker-compose.yml runs
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/observability:/o:ro" -w /o "$img" check rules alerts.yml
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/observability:/o:ro" -w /o "$img" test rules alerts-test.yml
+
+  types:
+    name: type check (mypy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[hf,client]" mypy types-PyYAML
+      # the modules listed under [tool.mypy.overrides] in pyproject.toml are not checked yet
+      - run: mypy
+
+  windows:
+    name: workstation tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev,client]"
+      # what runs on a Windows workstation: tsm, the client app, its update; the Spark-side tests need Linux
+      - name: pytest
+        env:
+          PYTHONUTF8: "0"                # the ANSI code page, as on a default Windows install
+          TSM_CLIENT_KEYRING: "off"
+        run: >-
+          python -m pytest -v -p no:cacheprovider -rs
+          tests/test_workstation_portability.py tests/test_update_cli.py tests/test_selfupdate.py
+          tests/test_release_assets.py tests/test_host_key_pinning.py tests/test_cli_init.py tests/test_catalog.py
+          tests/test_client_app.py tests/test_client_conn.py tests/test_client_conn_discovery.py
+          tests/test_client_routes_local.py tests/test_client_validate.py tests/test_client_hermes.py
+          tests/test_client_hermes_hosts.py tests/test_client_ssh.py tests/test_client_ssh_fake.py
 
   audit:
     name: dependency advisories

@@ -161,34 +161,98 @@ async def run_verify(reg: "TaskRegistry", tid: str, rt: "RuntimeSettings", repo:
     return {"verified": True, "files": len(verified)}
 
 
-def ssh_command(rt: "RuntimeSettings") -> list[str]:
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+SSH_HOST_KEY_DIR = Path("/etc/ssh")
+_HOST_KEY_RE = re.compile(r"^(ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa) "
+                          r"([A-Za-z0-9+/]{40,}={0,3})(?: .*)?\Z")
+_PIN_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}\Z")
+
+
+def own_host_keys(folder: Optional[Path] = None) -> list[str]:
+    """This machine's SSH host public keys ("type base64", comments dropped) — for the other node to pin."""
+    out = []
+    for name in ("ssh_host_ed25519_key.pub", "ssh_host_ecdsa_key.pub", "ssh_host_rsa_key.pub"):
+        try:
+            text = ((folder or SSH_HOST_KEY_DIR) / name).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        m = _HOST_KEY_RE.match(text)
+        if m:
+            out.append(f"{m[1]} {m[2]}")
+    return out
+
+
+def known_hosts_path(rt: "RuntimeSettings") -> Optional[Path]:
+    if rt.ssh_known_hosts:
+        return Path(rt.ssh_known_hosts)
+    return Path(rt.ssh_key).parent / "known_hosts" if rt.ssh_key else None
+
+
+def pin_host_keys(rt: "RuntimeSettings", host: str, keys: list[str]) -> Path:
+    """Make ``keys`` the only accepted host keys of ``host`` in the sync's own known_hosts file.
+
+    The keys come from the other node's agent, over the agent connection the controller authenticates with
+    that node's token. SSH then runs with StrictHostKeyChecking=yes, so not even the first connection is
+    taken on trust."""
+    if not _PIN_HOST_RE.match(host):
+        raise ValueError("not a host name")
+    lines = []
+    for k in keys:
+        m = _HOST_KEY_RE.match(str(k).strip())
+        if not m:
+            raise ValueError("host_keys must be SSH public keys (ssh-ed25519 / ecdsa-sha2-* / ssh-rsa)")
+        lines.append(f"{host} {m[1]} {m[2]}")
+    if not lines:
+        raise ValueError("no host keys to pin")
+    path = known_hosts_path(rt)
+    if path is None:
+        raise ValueError("runtime.ssh_known_hosts (or ssh_key) is not configured on this node")
+    try:
+        kept = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and ln.split(None, 1)[0] not in (host, f"[{host}]:22")]
+    except FileNotFoundError:
+        kept = []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(kept + lines) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
+def ssh_command(rt: "RuntimeSettings", pinned: bool = False) -> list[str]:
+    """``pinned``: the peer's host keys were written by :func:`pin_host_keys` — accept nothing else."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", f"StrictHostKeyChecking={'yes' if pinned else 'accept-new'}",
            "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
            "-o", "ServerAliveCountMax=6", "-o", "Compression=no", "-T"]
     if rt.ssh_cipher:
         cmd += ["-c", rt.ssh_cipher]
     if rt.ssh_key:
         cmd += ["-i", rt.ssh_key, "-o", "IdentitiesOnly=yes"]
-    if rt.ssh_known_hosts:
-        cmd += ["-o", f"UserKnownHostsFile={rt.ssh_known_hosts}"]
+    kh = known_hosts_path(rt) if pinned else (Path(rt.ssh_known_hosts) if rt.ssh_known_hosts else None)
+    if kh:
+        cmd += ["-o", f"UserKnownHostsFile={kh}"]
     return cmd
 
 
-def rsync_argv(rt: "RuntimeSettings", src_hub: Path, user: str, host: str, dst_hub: str) -> list[str]:
+def rsync_argv(rt: "RuntimeSettings", src_hub: Path, user: str, host: str, dst_hub: str,
+               pinned: bool = False) -> list[str]:
     return ["rsync", "-a", "--partial", "--append-verify", "--mkpath", "--from0",
             "--files-from=-", "--info=progress2", "--timeout=600",
-            "-e", shlex.join(ssh_command(rt)),
+            "-e", shlex.join(ssh_command(rt, pinned)),
             f"{src_hub}/", f"{user}@{host}:{dst_hub.rstrip('/')}/"]
 
 
 async def run_sync(reg: "TaskRegistry", tid: str, rt: "RuntimeSettings", repo: str, rev: str,
                    include: list[str], host: str, user: str, dst_hf_home: str,
-                   streams: int, dry_run: bool) -> dict[str, Any]:
+                   streams: int, dry_run: bool, host_keys: Optional[list[str]] = None) -> dict[str, Any]:
     src_hub = Path(rt.hf_cache_dir) / "hub"
     dst_hub = f"{dst_hf_home.rstrip('/')}/hub"
     repo_dir = hf_repo_dir(rt.hf_cache_dir, repo)
+    pinned = bool(host_keys)
+    if pinned and not dry_run:
+        pin_host_keys(rt, host, host_keys or [])
     if dry_run:
-        argv = rsync_argv(rt, src_hub, user, host, dst_hub)
+        argv = rsync_argv(rt, src_hub, user, host, dst_hub, pinned)
         reg.update(tid, detail="[dry-run] " + shlex.join(argv))
         return {"dry_run": True, "argv": argv}
     rels = await asyncio.to_thread(sync_files, repo_dir, rev, include)
@@ -200,7 +264,7 @@ async def run_sync(reg: "TaskRegistry", tid: str, rt: "RuntimeSettings", repo: s
     tails: list[bytearray] = [bytearray() for _ in groups]
 
     async def one(i: int, names: list[str]) -> int:
-        argv = rsync_argv(rt, src_hub, user, host, dst_hub)
+        argv = rsync_argv(rt, src_hub, user, host, dst_hub, pinned)
         proc = await asyncio.create_subprocess_exec(
             *argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         reg.register_proc(tid, proc)

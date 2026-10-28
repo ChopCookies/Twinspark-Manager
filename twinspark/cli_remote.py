@@ -858,7 +858,7 @@ def add_parsers(sub, cmd) -> None:
     p.add_argument("--remove", action="store_true")
     p.add_argument("--port", type=int, help="management port (default: listener.port in controller.yaml)")
     p.add_argument("--root", default="/", help=argparse.SUPPRESS)
-    cmd_remote.local = False
+    cmd_remote.local = False  # type: ignore[attr-defined]
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--root", default="/", help=argparse.SUPPRESS)
@@ -889,14 +889,14 @@ def add_parsers(sub, cmd) -> None:
     p = ns.add_parser("wol", help="Wake-on-LAN status, or on/off for a port", parents=[common])
     p.add_argument("mode", nargs="?", choices=["status", "on", "off"])
     p.add_argument("iface", nargs="?")
-    cmd_node.local = True
+    cmd_node.local = True  # type: ignore[attr-defined]
 
     s = cmd("wake", cmd_wake, "send a Wake-on-LAN magic packet from this machine")
     s.add_argument("mac")
     s.add_argument("--iface", help="send from this interface (for the QSFP link)")
     s.add_argument("--broadcast", default="255.255.255.255", help="e.g. 192.168.100.255 for the QSFP subnet")
     s.add_argument("--port", type=int, default=9)
-    cmd_wake.local = True
+    cmd_wake.local = True  # type: ignore[attr-defined]
 
     s = cmd("netboot", cmd_netboot, "plan or run a short PXE helper to boot a node over the network (rescue)")
     s.add_argument("what", choices=["plan", "serve"])
@@ -907,4 +907,4 @@ def add_parsers(sub, cmd) -> None:
     s.add_argument("--subnet", help="override the network (default: the port's own)")
     s.add_argument("--minutes", type=int, default=netboot.DEFAULT_MINUTES)
     s.add_argument("--out", help="plan: also write the dnsmasq config into this directory")
-    cmd_netboot.local = True
+    cmd_netboot.local = True  # type: ignore[attr-defined]

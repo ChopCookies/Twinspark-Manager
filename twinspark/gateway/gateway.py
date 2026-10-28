@@ -29,7 +29,7 @@ import secrets as _secrets
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -205,7 +205,7 @@ class Gateway:
         self._usage_lock = threading.Lock()
         self.last_used: dict[str, float] = {}
         # standalone gateway (state.GatewayLink): every change is published; the process reports back
-        self.on_change = None
+        self.on_change: Optional[Callable[[], None]] = None
         self.remote = False
         self.remote_ok = False
         self.published_version = 0
@@ -285,8 +285,7 @@ class Gateway:
     def inflight(self, aliases: list[str]) -> tuple[int, Optional[float]]:
         """(requests in flight, seconds the oldest of them has been running) over ``aliases``."""
         sts = [self.routes[a] for a in aliases if a in self.routes]
-        oldest = [s.oldest_inflight_s() for s in sts]
-        oldest = [o for o in oldest if o is not None]
+        oldest = [o for o in (s.oldest_inflight_s() for s in sts) if o is not None]
         busy = sum(s.busy for s in sts)
         if self._unacknowledged():
             busy = max(busy, 1)

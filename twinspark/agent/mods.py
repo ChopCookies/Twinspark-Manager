@@ -62,7 +62,7 @@ def tree_hash(root: Path) -> str:
 
 def list_mods(mods_dir: str | Path) -> list[dict[str, Any]]:
     root = Path(mods_dir)
-    out = []
+    out: list[dict[str, Any]] = []
     if not root.is_dir():
         return out
     for d in sorted(root.iterdir()):
@@ -107,6 +107,7 @@ def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, 
                                            and not d.name.startswith(".")) >= MAX_MODS:
         raise ModError(f"at most {MAX_MODS} mods can be installed; remove one first")
     tmp = Path(tempfile.mkdtemp(prefix=f".tmp-{name}-", dir=root))
+    published = False                       # tmp became the mod itself: nothing to clean up
     try:
         _extract(raw, tmp)
         if not (tmp / "run.sh").is_file():
@@ -140,11 +141,11 @@ def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, 
                     tmp = backup
             else:
                 tmp.rename(final)
-                tmp = None
+                published = True
         return {"name": name, "hash": tree_hash(final),
                 "files": sum(1 for p in final.rglob("*") if p.is_file())}
     finally:
-        if tmp is not None and tmp.exists():
+        if not published and tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -236,11 +237,11 @@ def _extract(raw: bytes, dest: Path) -> None:
             if total > MAX_EXTRACTED:
                 raise ModError("mod archive expands beyond the size limit")
             target.parent.mkdir(parents=True, exist_ok=True)
-            src = tf.extractfile(m)
-            if src is None:
+            member = tf.extractfile(m)
+            if member is None:
                 continue
-            with src, open(target, "wb") as out:
-                shutil.copyfileobj(src, out)
+            with member, open(target, "wb") as out:
+                shutil.copyfileobj(member, out)
             if m.mode & 0o111:
                 target.chmod(0o755)
 

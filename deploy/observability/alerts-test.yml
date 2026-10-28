@@ -1,0 +1,57 @@
+# promtool test rules alerts-test.yml — CI runs it with the prom/prometheus image.
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'twinspark_node_up{node="B"}'
+        values: '1 1 0 0 0 0 0'
+      - series: 'twinspark_node_up{node="A"}'
+        values: '1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TwinSparkNodeDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: TwinSparkNodeDown
+        exp_alerts:
+          - exp_labels: {severity: critical, node: B}
+            exp_annotations:
+              summary: "Node B's agent does not answer"
+              description: "`tsm remote reach B` says which case it is (docs/remote-management.md)."
+
+  - interval: 1m
+    input_series:
+      - series: 'twinspark_gateway_route_up{alias="default",model="m",revision="r1"}'
+        values: '0x15'
+      - series: 'twinspark_switch_in_progress'
+        values: '1x7 0x8'
+      - series: 'twinspark_update_in_progress'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 6m            # the alias is down because a switch is running: no alert
+        alertname: TwinSparkRouteDown
+        exp_alerts: []
+      - eval_time: 14m           # switch over, still down for more than 5 minutes
+        alertname: TwinSparkRouteDown
+        exp_alerts:
+          - exp_labels: {severity: critical, alias: default, model: m, revision: r1}
+            exp_annotations:
+              summary: "Alias default has no serving backend"
+              description: "Not during a switch or an update. `tsm status` and the job of the last switch show why."
+
+  - interval: 1m
+    input_series:
+      - series: 'twinspark_node_memory_available_bytes{node="A"}'
+        values: '4e9x15'
+      - series: 'twinspark_node_memory_total_bytes{node="A"}'
+        values: '128e9x15'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: TwinSparkMemoryLow
+        exp_alerts:
+          - exp_labels: {severity: warning, node: A}
+            exp_annotations:
+              summary: "Node A has less than 5 % of its memory available"
+              description: "CPU and GPU share this memory on a Spark: the next long prompt can fail to allocate. The memory forecast of the active revision (tsm fit) shows where it went."

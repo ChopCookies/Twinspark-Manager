@@ -87,7 +87,7 @@ async def endpoint_for(session: ClientSession, host: str, alias: Optional[str], 
         raise HTTPException(503, str(exc), headers={"X-TwinSpark-Client": "transport"}) from None
     except Exception as exc:  # noqa: BLE001 - the gateway answered something unusable
         raise HTTPException(502, f"node A's gateway did not list its models ({type(exc).__name__})") from None
-    served = {m.get("id"): m for m in models}
+    served = {m["id"]: m for m in models if isinstance(m.get("id"), str)}      # an entry without id is no alias
     if not served:
         raise HTTPException(409, "node A serves no model right now — switch to a recipe first")
     if alias is None:

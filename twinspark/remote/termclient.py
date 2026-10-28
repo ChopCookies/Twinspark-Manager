@@ -68,7 +68,10 @@ def _start_reader(loop: asyncio.AbstractEventLoop, fd: int,
 
     try:
         loop.add_reader(fd, on_ready)
-        return lambda: loop.remove_reader(fd)
+
+        def remove() -> None:
+            loop.remove_reader(fd)
+        return remove
     except (OSError, ValueError, PermissionError, NotImplementedError):
         stop = threading.Event()               # a regular file on stdin cannot be polled: read it in a thread
 
@@ -184,8 +187,10 @@ async def run_session(url: str, *, stdin_fd: int, stdout_fd: int, size: Callable
             # stdin ended without a tty: give the remote shell a moment to finish what it was given
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(tasks[1]), 15)
-        if tasks[1].done() and not tasks[1].cancelled() and tasks[1].exception():
-            raise tasks[1].exception()                  # an error frame from the node
+        if tasks[1].done() and not tasks[1].cancelled():
+            failure = tasks[1].exception()
+            if failure is not None:
+                raise failure                           # an error frame from the node
     finally:
         for t in tasks:
             t.cancel()

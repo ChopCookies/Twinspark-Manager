@@ -11,11 +11,12 @@ import httpx
 ALLOWED_AGENT_ACTIONS = {
     "system_telemetry", "maintenance_probe", "maintenance_quiet", "maintenance_start",
     "maintenance_status", "maintenance_reboot", "maintenance_verify",
+    "update_probe", "update_start", "update_status",          # `tsm update` (agent → privd → update worker)
     "hardware_facts", "memory_telemetry", "preflight", "image_ensure", "image_inspect", "image_probe",
     "container_start", "containers_stop_owned", "container_state", "container_logs", "container_evidence",
     "containers_list", "health_probe", "foreign_list", "foreign_stop",
     "weights_present", "weights_inventory", "weights_delete", "download", "verify", "sync",
-    "ssh_check", "task_status", "task_cancel", "tasks_list",
+    "ssh_check", "ssh_host_keys", "task_status", "task_cancel", "tasks_list",
     "link_test", "rdma_facts", "reclaim_memory", "headless_status", "headless_apply",
     "mods_list", "mods_status", "mods_install", "mods_remove",
     "remote_status", "remote_logs", "remote_bundle", "remote_power", "remote_power_cancel",

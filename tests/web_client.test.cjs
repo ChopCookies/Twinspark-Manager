@@ -695,3 +695,52 @@ test("the playground is in the navigation before Integrations", () => {
   const nav = JSON.parse(c.run("JSON.stringify(NAV.map(n => n[0]))"));
   assert.equal(nav.indexOf("playground") + 1, nav.indexOf("integrations"));
 });
+
+test("the playground exports the conversation as Markdown and as JSON", () => {
+  const c = client();
+  c.run(`var pgState = {system: "Be brief.\\nNo lists.", temperature: "0.2", max_tokens: "", columns: []};
+         var pgCols = [{alias: "coder", turns: [{role: "user", content: "Hi <b>"}, {role: "assistant", content: "Hello.", reasoning: "greet", stats: {ttft_ms: 250, tok_s: 50, completion_tokens: 3, estimated: false, total_ms: 1250}}]},
+                       {alias: "helper", turns: [{role: "user", content: "Hi <b>"}, {role: "assistant", content: "", error: "stopped"}]}];
+         var when = new Date("2026-11-02T09:30:00Z");`);
+  const md = c.run("playgroundMarkdown(pgState, pgCols, when)");
+  assert.match(md, /^# TwinSpark playground · 2026-11-02 09:30 UTC/);
+  assert.match(md, /Settings: temperature 0\.2\n/);
+  assert.match(md, /> Be brief\.\n> No lists\./);
+  assert.match(md, /## coder\n\n\*\*You\*\*\n\nHi <b>\n\n\*\*coder\*\*/);
+  assert.match(md, /<details><summary>Reasoning<\/summary>\n\ngreet/);
+  assert.match(md, /_TTFT 250 ms · 50 tok\/s · 3 tokens · 1\.3 s_/);
+  assert.match(md, /## helper[\s\S]*> error: stopped/);
+  assert.doesNotMatch(md, /\n{3}/);
+  const doc = JSON.parse(c.run("playgroundJson(pgState, pgCols, when)"));
+  assert.equal(doc.format, "twinspark-playground/1");
+  assert.deepEqual(doc.params, { temperature: 0.2 });
+  assert.equal(doc.columns[0].messages[1].reasoning, "greet");
+  assert.equal(doc.columns[0].messages[1].stats.tok_s, 50);
+  assert.equal(doc.columns[1].messages[1].error, "stopped");
+  const one = c.run("playgroundMarkdown(pgState, [pgCols[0]], when)");
+  assert.doesNotMatch(one, /## coder/);                                  // one model: no per-model heading
+});
+
+test("the Updates page shows TwinSpark versions, problems and progress, escaped", () => {
+  const c = client();
+  const info = `{versions: {controller: "0.8.0", A: "0.8.0", B: "0.7.1"}, behind: ["A", "B"], available: true, ready: true,
+    release: {latest: "0.8.1", published_at: "2026-11-01T10:00:00Z", html_url: "https://github.com/ChopCookies/Twinspark-Manager/releases/tag/v0.8.1", notes: "<script>x</script>"},
+    problems: [], order: ["B", "A"], note: "Updates node B first, then node A.", dry_run: false}`;
+  const html = c.run(`tsmUpdateHtml(${info}, {state: "idle"})`);
+  assert.match(html, /Node B<\/b><span>0\.7\.1 → 0\.8\.1/);
+  assert.match(html, /Update both Sparks to 0\.8\.1/);
+  assert.match(html, /href="https:\/\/github\.com\/ChopCookies\/Twinspark-Manager\/releases\/tag\/v0\.8\.1"/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /data-act="tsm-start" disabled/);
+  const blocked = c.run(`tsmUpdateHtml({...${info}, ready: false, problems: ["node B: <old>"], release: {latest: "0.8.1", html_url: "javascript:alert(1)"}}, null)`);
+  assert.match(blocked, /node B: &lt;old&gt;/);
+  assert.match(blocked, /data-act="tsm-start" disabled/);
+  assert.doesNotMatch(blocked, /javascript:/);                          // only a GitHub release page is linked
+  const failed = c.run(`tsmUpdateProgress({state: "failed", order: ["B", "A"], index: 0, nodes: {B: {state: "rolled_back"}}, target: {version: "0.8.1"}, error: "node B: <x>"})`);
+  assert.match(failed, /rolled_back/);
+  assert.match(failed, /node B: &lt;x&gt;/);
+  assert.match(failed, /Nothing is held/);
+  const done = c.run(`tsmUpdateProgress({state: "completed", order: ["B", "A"], index: 2, target: {version: "0.8.1"}})`);
+  assert.match(done, /Both Sparks run TwinSpark 0\.8\.1/);
+  assert.match(done, /data-act="tsm-reload"/);
+});

@@ -1,0 +1,108 @@
+# Alert rules for the metrics node A exports (docs/metrics.md). Prometheus loads them (prometheus.yml:
+# rule_files) and shows firing alerts on http://127.0.0.1:9090/alerts; add an Alertmanager to be notified.
+# Thresholds are starting points for two GB10 Sparks; change them to what your recipes need.
+groups:
+  - name: twinspark
+    rules:
+      - alert: TwinSparkControllerUnreachable
+        expr: up{job="twinspark"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: Prometheus cannot scrape node A's controller
+          description: >-
+            Node A's management API did not answer for 2 minutes: the controller is down, node A is off, or the
+            forward from this computer (tsm client) is not running. The model may still be serving.
+
+      - alert: TwinSparkNodeDown
+        expr: twinspark_node_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Node {{ $labels.node }}'s agent does not answer"
+          description: "`tsm remote reach {{ $labels.node }}` says which case it is (docs/remote-management.md)."
+
+      - alert: TwinSparkRouteDown
+        expr: >-
+          twinspark_gateway_route_up == 0
+          unless on() (twinspark_switch_in_progress == 1 or twinspark_update_in_progress == 1)
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Alias {{ $labels.alias }} has no serving backend"
+          description: "Not during a switch or an update. `tsm status` and the job of the last switch show why."
+
+      - alert: TwinSparkHalfDown
+        expr: >-
+          twinspark_half_serving == 0
+          unless on() (twinspark_switch_in_progress == 1 or twinspark_update_in_progress == 1)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The half {{ $labels.name }} on node {{ $labels.node }} is not serving"
+
+      - alert: TwinSparkGatewayErrors
+        expr: >-
+          sum by (alias) (rate(twinspark_gateway_errors_total[5m]))
+            / sum by (alias) (rate(twinspark_gateway_requests_total[5m])) > 0.05
+          and sum by (alias) (rate(twinspark_gateway_requests_total[5m])) > 0.01
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5 % of the requests to {{ $labels.alias }} fail"
+          description: "Backend errors and timeouts through node A's gateway; the engine log (tsm logs) has the cause."
+
+      - alert: TwinSparkRequestStuck
+        expr: twinspark_gateway_oldest_inflight_seconds > 900
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "A request to {{ $labels.alias }} has been running for more than 15 minutes"
+
+      - alert: TwinSparkEngineMetricsStale
+        expr: twinspark_scrape_age_seconds > 120
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The engine on node {{ $labels.node }} ({{ $labels.alias }}) stopped reporting metrics"
+
+      - alert: TwinSparkMemoryLow
+        expr: twinspark_node_memory_available_bytes / twinspark_node_memory_total_bytes < 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }} has less than 5 % of its memory available"
+          description: >-
+            CPU and GPU share this memory on a Spark: the next long prompt can fail to allocate. The memory
+            forecast of the active revision (tsm fit) shows where it went.
+
+      - alert: TwinSparkMemoryPressure
+        expr: twinspark_node_memory_pressure_avg10_percent{kind="full"} > 10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }} stalls on memory (PSI full above 10 %)"
+
+      - alert: TwinSparkSwapInUse
+        expr: twinspark_node_swap_used_bytes > 1073741824
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }} uses more than 1 GiB of swap"
+          description: "GB10 recipes run with vm.swappiness 0; swap in use slows the model down."
+
+      - alert: TwinSparkGpuHot
+        expr: twinspark_node_gpu_temperature_celsius > 85
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }}'s GPU has been above 85 °C for 10 minutes"
+          description: "Check the airflow around the Spark; throttling lowers the decode rate."
+
+      - alert: TwinSparkVersionsDiffer
+        expr: count(count by (version) (twinspark_node_info)) > 1 unless on() (twinspark_update_in_progress == 1)
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: The nodes run different TwinSpark versions
+          description: "`tsm update` shows the versions; `tsm update sparks` brings both to the same release."

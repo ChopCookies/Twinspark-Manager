@@ -42,7 +42,7 @@ async def run_link_test(ctrl: "Controller", mode: str = "tcp", duration_s: float
                          f"simulated side opens no socket, so the test cannot measure the link. Run "
                          f"`sudo tsm go-live` on node {', '.join(dry)} (or keep both in dry-run to see a simulation)")
     simulated = all(m == "dry-run" for m in modes.values())
-    common = dict(mode=mode, port=port, duration_s=duration_s, streams=streams)
+    common: dict[str, Any] = dict(mode=mode, port=port, duration_s=duration_s, streams=streams)
     resp = await b.call("link_test", role="responder", bind=peer_ip if mode == "tcp" else None,
                         hcas=ep_b.rdma_hcas, gid_index=ep_b.ib_gid_index, **common)
 
@@ -235,10 +235,14 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
                            "weights cannot be copied to this node over QSFP")
                 continue
             try:
+                from .staging import peer_host_keys
+                keys = await peer_host_keys(ctrl.agents[dst]) if dst in ctrl.agents else []
                 r = await ctrl.agents[src].call("ssh_check", target_host=ep.sync_host,
-                                                ssh_user=ep.ssh_user, timeout=40)
+                                                ssh_user=ep.ssh_user, timeout=40,
+                                                **({"host_keys": keys} if keys else {}))
+                pin = " (host key pinned from node " + dst + "'s agent)" if r.get("pinned") else ""
                 _check(res, "ssh", f"{src}→{dst}", "pass" if r.get("ok") else "fail",
-                       f"{ep.ssh_user}@{ep.sync_host}" + ("" if r.get("ok") else f": {r.get('error')}"),
+                       f"{ep.ssh_user}@{ep.sync_host}" + (pin if r.get("ok") else f": {r.get('error')}"),
                        "" if r.get("ok") else f"copy the agent user's SSH key from node {src} to "
                        f"{ep.ssh_user}@{ep.sync_host} (ssh-copy-id)")
             except AgentActionError as exc:

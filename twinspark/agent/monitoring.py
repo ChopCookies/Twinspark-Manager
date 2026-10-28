@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from .sysinfo import memory_snapshot, read_psi
 
@@ -112,7 +113,7 @@ class HostSampler:
                     "state": read(root / "operstate") or "unknown",
                 }
             gpu = gpu_sample()
-            memory = memory_snapshot()
+            memory: dict[str, Any] = memory_snapshot()
             if not memory["mem_total_gib"]:
                 memory = dict.fromkeys(memory)
             load = read(self.proc / "loadavg").split()

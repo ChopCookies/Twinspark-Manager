@@ -33,7 +33,8 @@ DEFAULTS = {"state_path": "/var/lib/twinspark/gateway-state.json",
 def read_config(path: str) -> dict[str, Any]:
     """The few settings of controller.yaml this process needs (no pydantic here: it stays small)."""
     doc = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    gl = doc.get("gateway_listener") if isinstance(doc.get("gateway_listener"), dict) else {}
+    raw = doc.get("gateway_listener")
+    gl: dict[str, Any] = raw if isinstance(raw, dict) else {}
     return {"bind": str(gl.get("bind") or "0.0.0.0"), "port": int(gl.get("port") or 8000),
             "tls_cert": gl.get("tls_cert"), "tls_key": gl.get("tls_key"),
             "secrets_dir": str(doc.get("secrets_dir") or "/etc/twinspark/secrets"),

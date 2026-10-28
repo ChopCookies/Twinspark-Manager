@@ -41,8 +41,9 @@ available except while node A (the controller) reboots. The browser reconnects;
 the controller resumes its saved checkpoint before normal model autostart.
 
 This updates packages supplied by the machine's repositories, including drivers
-when packaged there. It does **not** self-upgrade TwinSpark's Python environment,
-replace pinned recipe images, update model weights, or provide OS/firmware rollback.
+when packaged there. It does not replace pinned recipe images, update model weights,
+or provide OS/firmware rollback. TwinSpark itself is updated separately, on the same
+page, without stopping the model: see [updating.md](updating.md).
 
 ## Enable on real nodes
 

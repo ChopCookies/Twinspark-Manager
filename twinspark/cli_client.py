@@ -249,4 +249,4 @@ def add_parsers(sub, cmd) -> None:
     pp.add_argument("name")
     pp.add_argument("--api", metavar="PORT|auto", help="local port of node A's management API")
     pp.add_argument("--gateway", metavar="PORT|auto", help="local port of the model gateway (what apps use)")
-    cmd_client.local = True
+    cmd_client.local = True  # type: ignore[attr-defined]

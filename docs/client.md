@@ -136,10 +136,10 @@ Everything else in the GUI is node A's API, passed through with the stored manag
 
 ## Keeping the Sparks up to date
 
-The client and the Sparks are separate installs. Update the Sparks as before (`git pull && sudo
-./install.sh --no-setup` on each node, then restart the services) and the client with
-`pipx upgrade twinspark-manager` (or `pipx install --force …` for a git install). **Agents
-compatible** says when they drifted apart.
+The client and the Sparks are separate installs. `tsm update sparks` (or **Updates → TwinSpark**) updates
+both Sparks; `tsm update here` updates the client on this computer, and the **Connection** page says when a
+newer one is published. **Agents compatible** says when they drifted apart. Details:
+[updating.md](updating.md).
 
 ## Existing setups
 

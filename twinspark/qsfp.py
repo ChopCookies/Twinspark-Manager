@@ -1162,8 +1162,10 @@ def identify(ip: str, user: str, host: Optional[Host] = None) -> Optional[str]:
         ip = str(ipaddress.IPv4Address(ip))
     except ValueError as exc:
         raise QsfpError(f"not an IPv4 address: {ip!r}") from exc
+    # only a host whose key you already confirmed (ssh user@ip once, comparing the fingerprint): a scan
+    # never adds the keys of whatever answers on the link subnet to your known_hosts
     rc, out, _ = host.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o",
-                           "StrictHostKeyChecking=accept-new", f"{user}@{ip}",
+                           "StrictHostKeyChecking=yes", f"{user}@{ip}",
                            "nvidia-smi --query-gpu=name --format=csv,noheader"], 10)
     return out.strip().splitlines()[0] if rc == 0 and out.strip() else None
 

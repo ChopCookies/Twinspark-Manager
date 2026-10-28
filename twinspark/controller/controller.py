@@ -99,7 +99,7 @@ class Controller:
         self.current_job: Optional[str] = None
         self.busy_profile: Optional[str] = None      # profile named by the running activation/prepare
         self.current_scope: Optional[dict] = None    # the halves the running switch touches (None = all)
-        self.gateway_link = None                     # gateway.state.GatewayLink with gateway_mode: standalone
+        self.gateway_link: Any = None                # gateway.state.GatewayLink with gateway_mode: standalone
         self.sampler = MetricsSampler()
         self.half_samplers: dict[str, MetricsSampler] = {}   # split deployments: one per half (node)
         self.history = MetricsHistory(self.store)             # minute averages, 24 h, kept across restarts
@@ -109,7 +109,9 @@ class Controller:
         self.telemetry_history: dict[str, list] = {}
         from .maintenance import Maintenance
         from .remote import RemoteService
+        from .selfupdate import SelfUpdate
         self.maintenance = Maintenance(self)
+        self.selfupdate = SelfUpdate(self)        # `tsm update`: a TwinSpark release on every node
         self.remote = RemoteService(self)
         self.watch_state: dict[str, Any] = {"unhealthy_streak": 0, "recoveries": [], "last": None}
         self._apply_gateway_settings()
@@ -544,6 +546,8 @@ class Controller:
             "nodes": {n: self.store.kv_get(f"hardware:{n}") for n in self.config.nodes},
             "telemetry": self.telemetry,
             "maintenance": self.maintenance.state(),
+            "update": {k: v for k, v in self.selfupdate.state().items() if k in (
+                "state", "phase", "waiting", "error", "target", "order", "index", "started_at", "dry_run")},
             "routes": [st.to_payload() for st in self.gateway.routes.values()],
             "halves": self.halves_status(),
             "gateway": {k: self.gateway.settings.get(k) for k in ("balance", "affinity", "weights", "fallbacks")},
@@ -609,6 +613,8 @@ class Controller:
             raise ValueError(f"revision not found: {profile_name}@{ref}")
         if self._lock.locked() or (self.maintenance.blocking() and not _maintenance):
             raise BusyError("another activation or stop is in progress")
+        if self.selfupdate.blocking():
+            raise BusyError("TwinSpark is being updated; switch models when the update has finished")
         missing = [n for n in rev.required_nodes() if n not in self.agents]
         if missing:
             raise RuntimeError(f"{rev.draft.simple.topology.value} needs node(s) {missing}, "
@@ -923,6 +929,8 @@ class Controller:
     async def stop(self, *, _maintenance: bool = False) -> Job:
         if self._lock.locked() or (self.maintenance.blocking() and not _maintenance):
             raise BusyError("an activation is in progress")
+        if self.selfupdate.blocking():
+            raise BusyError("TwinSpark is being updated; stop the model when the update has finished")
         async with self._lock:
             job = Job(job_id=f"stop-{secrets.token_hex(5)}", kind="stop")
             step = job.begin_step("stopping")
@@ -973,6 +981,8 @@ class Controller:
         if self.maintenance.blocking():
             self.maintenance.ensure_running()
             return None
+        # node A's update restarted this controller: finish that run; the model is re-attached below
+        self.selfupdate.ensure_running()
         if journal:
             return await self._recover_interrupted(journal, interrupted)
         return await self._resume_active()
@@ -1141,6 +1151,7 @@ class Controller:
             self._background.append(asyncio.create_task(self._watchdog_loop()))
         self._background.append(asyncio.create_task(self._metrics_loop()))
         self.maintenance.ensure_running()
+        self.selfupdate.ensure_running()
 
     async def _watchdog_loop(self) -> None:
         while True:
@@ -1152,7 +1163,7 @@ class Controller:
 
     async def watchdog_tick(self) -> Optional[str]:
         """One health check of the active deployment. Returns the incident, if any."""
-        if self.busy():
+        if self.busy() or self.selfupdate.blocking():      # agents restart during an update: not an incident
             return None
         rev = self.active_revision()
         if rev is None:

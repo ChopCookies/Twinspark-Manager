@@ -560,6 +560,7 @@ function dashboardHtml(st, series, profs, job) {
 
   if (job) html += jobBanner(job);
   if (!act && !job) html += `<div class="callout info"><div><b>New here?</b> The <a href="#/start">Get started</a> checklist shows what is set up and what is next.</div></div>`;
+  if (st.update?.state === "running") html += `<div class="callout info"><div><b>TwinSpark is being updated</b> to ${esc(st.update.target?.version || "")} · ${esc(st.update.waiting || st.update.phase || "")} · the model keeps serving <a href="#/updates">Follow the update</a></div></div>`;
   if (["running", "failed"].includes(st.maintenance?.state)) html += `<div class="callout warn"><div><b>Cluster reserved for maintenance</b> · ${esc(st.maintenance.phase)}${st.maintenance.error ? ` · ${esc(st.maintenance.error)}` : ""} <a href="#/updates">Open update progress</a></div></div>`;
   const gp = st.gateway_process || {};
   if (gp.mode === "standalone" && gp.reachable === false && gp.error) html += `<div class="callout bad"><div><b>The gateway does not answer:</b> apps cannot reach the model. ${esc(gp.error || "")} — on node A: <span class="mono">sudo systemctl status twinspark-gateway</span></div></div>`;
@@ -745,17 +746,58 @@ function maintenanceProgress(s) {
     ${s.error ? `<div class="callout bad">${esc(s.error)}</div>` : ""}
     ${s.state === "failed" ? `<p class="small">The cluster stays reserved. Repair the reported issue on the node, then recheck. Recheck polls the existing update; it does not repeat a failed installation. Release only succeeds when workers have stopped and the nodes pass checks.</p><div class="row"><button class="btn" data-act="resume">Recheck progress</button><button class="btn" data-act="release">Release after repair</button></div>` : ""}`;
 }
+/* ---- TwinSpark itself (tsm update): releases from GitHub, node B then node A, the model keeps serving ---- */
+function githubLink(url) { return /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/releases\/tag\/[\w.-]+$/.test(String(url || "")) ? url : ""; }
+function tsmUpdateProgress(s) {
+  const nodes = s.order || [], t = s.target || {};
+  const nodeState = (n, i) => s.nodes?.[n]?.state || (i < s.index ? "done" : i === s.index && s.state === "running" ? "starting" : "waiting");
+  return `<div class="card-head" style="margin-top:12px"><h3>${s.dry_run ? "Simulated update" : "Update"} to ${esc(t.version || "?")}</h3>${tag(s.state, s.state === "completed" ? "good" : s.state === "failed" ? "bad" : "info")}</div>
+    <div class="maintenance-steps">${nodes.map((n, i) => `<div class="maintenance-step ${i === s.index && s.state === "running" ? "current" : ""}"><b>Node ${esc(n)}</b><span>${esc(nodeState(n, i))}</span></div>`).join("")}</div>
+    <p>${esc(s.waiting || s.phase || "")}${s.started_at ? ` · started ${esc(when(s.started_at))}` : ""}</p>
+    ${s.error ? `<div class="callout bad"><div>${esc(s.error)}</div></div><p class="small">Nothing is held: the model kept serving. A node that rolled back runs its previous version again. Fix the reported cause, then check and update again. An older version can be installed with <span class="mono">tsm update sparks --version X.Y.Z</span>.</p>` : ""}
+    ${s.state === "completed" ? `<div class="callout good"><div>Both Sparks run TwinSpark ${esc(t.version)}${s.dry_run ? " (simulated)" : ""}. <button class="btn sm" data-act="tsm-reload">Reload the page</button> to load its GUI.</div></div>` : ""}`;
+}
+function tsmUpdateHtml(info, st) {
+  let html = "";
+  if (info) {
+    const rel = info.release || {}, latest = rel.latest, behind = info.behind || [];
+    const names = Object.keys(info.versions || {}).filter(n => n !== "controller").sort();
+    const link = githubLink(rel.html_url);
+    html += `<div class="kv">${names.map(n => `<b>Node ${esc(n)}</b><span>${esc(info.versions[n] || "?")}${latest ? (behind.includes(n) ? ` → ${esc(latest)}` : " · up to date") : ""}</span>`).join("")}
+      <b>Newest release</b><span>${latest ? `${esc(latest)}${rel.prerelease ? " (pre-release)" : ""}${rel.published_at ? " · " + esc(String(rel.published_at).slice(0, 10)) : ""}${link ? ` · <a href="${esc(link)}" target="_blank" rel="noopener noreferrer">release page</a>` : ""}` : esc(info.release_error || "—")}</span></div>`;
+    if (rel.notes) html += `<details><summary>Release notes</summary>${codeBlock(rel.notes)}</details>`;
+    if ((info.problems || []).length) html += `<div class="callout warn"><div>${info.problems.map(esc).join("<br>")}</div></div>`;
+    const can = info.ready && info.available && st?.state !== "running";
+    html += `<p class="small muted">${esc(info.note)}${info.dry_run ? " Dry-run nodes: the update is simulated, nothing is installed." : ""}</p>
+      <div class="row"><button class="btn primary" data-act="tsm-start" ${can ? "" : "disabled"}>${latest && info.available ? `Update both Sparks to ${esc(latest)}` : "Both Sparks are up to date"}</button></div>`;
+  }
+  if (st && st.state && st.state !== "idle") html += tsmUpdateProgress(st);
+  return html || `<p class="small muted">Compare the versions on both Sparks with the newest release on GitHub. The model keeps serving during a TwinSpark update; each node rolls back on its own if its new version does not start.</p>`;
+}
 async function viewUpdates() {
-  const g = S.gen; let plan = null, state = {};
-  render(g, `<div class="view"><div class="view-head"><div><h1>Updates & reboots</h1><p>One coordinated maintenance run for both Sparks.</p></div><button class="btn" data-act="check">Check nodes</button></div>
+  const g = S.gen; let plan = null, state = {}, tsmInfo = null, tsmState = null, tsmAway = false;
+  render(g, `<div class="view"><div class="view-head"><div><h1>Updates & reboots</h1><p>TwinSpark itself, and one coordinated OS maintenance run for both Sparks.</p></div></div>
+    <section class="card" id="tsm-update"><div class="card-head"><h2>TwinSpark</h2><button class="btn" data-act="tsm-check">Check for a new version</button></div><div id="tsm-update-body"></div></section>
+    <div class="card-head" style="margin-top:18px"><h2>OS, drivers and firmware</h2><button class="btn" data-act="check">Check nodes</button></div>
     <ol class="recipe-steps" aria-label="Maintenance workflow"><li><span>1</span><div><b>Drain & stop</b><small>Finish requests, then stop the model.</small></div></li><li><span>2</span><div><b>Update B, then A</b><small>Install, reboot, and verify each node.</small></div></li><li><span>3</span><div><b>Restore</b><small>Start the exact revision that was serving.</small></div></li></ol>
-    <div class="callout info"><div>Automatic installation and reboots are opt-in for each run. The model is unavailable during maintenance. OS and driver updates use configured package repositories; optional firmware uses the node's configured fwupd remotes. TwinSpark itself and recipe container images are not upgraded by this workflow.</div></div>
+    <div class="callout info"><div>Automatic installation and reboots are opt-in for each run. The model is unavailable during maintenance. OS and driver updates use configured package repositories; optional firmware uses the node's configured fwupd remotes. TwinSpark itself is updated above; recipe container images are not upgraded by either.</div></div>
     <div id="maintenance-plan"></div><div class="card" id="maintenance-progress"></div></div>`);
+  const drawTsm = () => { if (current(g)) $("#tsm-update-body").innerHTML = tsmUpdateHtml(tsmInfo, tsmState) + (tsmAway ? `<div class="callout info"><div>Node A's controller is restarting with the new version · reconnecting…</div></div>` : ""); };
   const draw = async () => {
     try { const next = await GET("/api/v1/system/maintenance"); if (!current(g)) return; state = next; $("#maintenance-progress").innerHTML = maintenanceProgress(state); }
     catch (e) { if (current(g)) $("#maintenance-progress").innerHTML = `<div class="callout warn">${esc(e.message)} · Reconnecting. Maintenance resumes from its saved checkpoint.</div>`; }
+    try { const next = await GET("/api/v1/system/update"); if (!current(g)) return; tsmAway = false; const changed = JSON.stringify(next) !== JSON.stringify(tsmState); tsmState = next; if (changed) drawTsm(); }
+    catch (e) { if (current(g) && tsmState?.state === "running") { tsmAway = true; drawTsm(); } }
   };
   onAct({
+    "tsm-check": async el => { tsmInfo = await busy(el, () => POST("/api/v1/system/update/check?refresh=true")); tsmState = tsmInfo.state; drawTsm(); },
+    "tsm-start": async () => {
+      const latest = tsmInfo?.release?.latest; if (!latest) return;
+      await modal({ title: `Update both Sparks to TwinSpark ${latest}?`, body: `<p>Node ${esc((tsmInfo.order || []).join(", then node "))}: each downloads the release from GitHub, checks its SHA-256 against the release's checksums, installs it next to a backup and restarts the TwinSpark services. A node whose new version does not start goes back to its previous one.</p><p>The model keeps serving. Node A's gateway restarts once, after requests in flight have finished (up to the drain timeout). Model switches wait until the update is done.</p>`, actions: [{ label: "Cancel" }, { label: "Update", cls: "primary", validate: async () => {
+        tsmState = await POST("/api/v1/system/update/start", { confirm: "UPDATE TWINSPARK" }); drawTsm(); return true;
+      } }] });
+    },
+    "tsm-reload": () => location.reload(),
     check: async el => {
       const next = await busy(el, () => POST("/api/v1/system/maintenance/plan")); if (!current(g)) return; plan = next;
       $("#maintenance-plan").innerHTML = `<div class="grid cols-2">${Object.entries(plan.nodes).map(([n, p]) => `<div class="card"><div class="card-head"><h2>Node ${esc(n)}</h2>${tag(p.dry_run ? "simulation" : p.enabled ? "opted in" : "disabled", p.enabled ? "good" : "warn")}</div>${p.error ? `<p>${esc(p.error)}</p>` : `<p class="small">Firmware ${p.allow_firmware ? "permitted" : "disabled"} · ${p.reboot_required ? "reboot pending" : "no reboot flagged"}</p><details><summary>Package preview (cached repository metadata)</summary>${codeBlock(p.package_preview || "No preview available")}</details>`}</div>`).join("")}</div>
@@ -773,7 +815,7 @@ async function viewUpdates() {
     resume: async () => { await POST("/api/v1/system/maintenance/resume"); await draw(); },
     release: async () => { if (await confirmBox("Release the maintenance hold?", "Use this after repairing the nodes. TwinSpark will check both nodes and leave model activation to you.", { label: "Check & release" })) { await POST("/api/v1/system/maintenance/release"); await draw(); } },
   });
-  await draw(); every(draw, 3000);
+  drawTsm(); await draw(); every(draw, 3000);
 }
 function jobBanner(job) {
   const step = (job.steps || []).slice(-1)[0] || {};

@@ -525,7 +525,7 @@ def cmd_activate(args, api: Api):
     import secrets as _secrets
     # an id per invocation: if the connection drops while the request is in flight, sending it again
     # (e.g. by the client's retry) returns the same job instead of starting a second switch
-    body = {"request_id": f"cli-{_secrets.token_hex(8)}"}
+    body: dict[str, Any] = {"request_id": f"cli-{_secrets.token_hex(8)}"}
     if args.drain:
         body["drain_policy"] = args.drain
     if args.drain_timeout is not None:
@@ -1377,7 +1377,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--image")
     cmd("hardware", cmd_hardware, "hardware facts of both nodes")
 
-    from . import cli_bench, cli_client, cli_gateway, cli_keys, cli_metrics, cli_qsfp, cli_remote, cli_setup
+    from . import (
+        cli_bench,
+        cli_client,
+        cli_gateway,
+        cli_keys,
+        cli_metrics,
+        cli_qsfp,
+        cli_remote,
+        cli_setup,
+        cli_update,
+    )
     cli_bench.add_parsers(sub, cmd)
     cli_gateway.add_parsers(sub, cmd)
     cli_keys.add_parsers(sub, cmd)
@@ -1386,6 +1396,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_setup.add_parsers(sub, cmd)
     cli_remote.add_parsers(sub, cmd)
     cli_qsfp.add_parsers(sub, cmd)
+    cli_update.add_parsers(sub, cmd)
     from . import demo
     demo.add_parsers(sub, cmd)
     sub.add_parser("first-night").set_defaults(fn=cmd_first_night)      # no help=: not in `tsm --help`
@@ -1402,7 +1413,7 @@ def cmd_first_night(args, api) -> None:
     print(FIRST_NIGHT)
 
 
-cmd_first_night.local = True
+cmd_first_night.local = True  # type: ignore[attr-defined]
 
 
 def main(argv=None) -> int:

@@ -67,6 +67,7 @@ nav:
       - Agent clients and harnesses: agent-integrations.md
       - The gateway (keys, routing, fallbacks): gateway.md
   - Operations:
+      - Updating TwinSpark (tsm update): updating.md
       - Monitoring and maintenance: maintenance.md
       - Remote management: remote-management.md
   - Development: development.md

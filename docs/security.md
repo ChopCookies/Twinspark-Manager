@@ -104,6 +104,23 @@ Limits: any program running as you on your computer can read the client's folder
 the OS, your keychain) — the same as for `~/.ssh`. A direct connection crosses the network; it is only
 offered for an HTTPS listener whose certificate verifies.
 
+### Updates (`tsm update`)
+
+- What an update installs is a release of this repository on GitHub, fetched over HTTPS. A node installs only
+  files listed in that release's `SHA256SUMS` with a matching hash. Where GitHub reports an asset digest, it
+  must agree as well. There is no signature: whoever can publish a release in this repository can ship
+  code.
+- A request through the API carries only a tag and two hashes. The node builds every URL itself from the
+  fixed repository name, so a management-key holder cannot point an update at another server or another
+  package. The same key can still install an older published version: that is the way back.
+- Each node's root-owned `/etc/twinspark/update-policy.json` decides whether updates through the API are
+  allowed there at all (`sudo tsm update policy off`). Nothing the services can reach changes it.
+- The worker runs as root in its own systemd unit, with the system interpreter (`-I -S`) and a stdlib-only
+  copy of itself, outside the environment it replaces.
+- Weight copies from node A to node B pin B's SSH host keys, which the controller reads from B's agent over
+  the authenticated agent connection (`StrictHostKeyChecking=yes`). Without them (an agent older than 0.8)
+  the copy falls back to `accept-new`.
+
 ## Known limits (deliberately not fixed yet)
 
 - **The service user is effectively root.** It is in the `docker` group (the agent starts containers),

@@ -12,7 +12,7 @@ for your apps, with memory planning for unified memory, safe model switching and
   one key per app ([gateway](gateway.md)).
 - **Measure:** [benchmarks](benchmarks.md) per revision, [validation records](validation.md),
   [Prometheus metrics](metrics.md).
-- **Operate:** [maintenance](maintenance.md), [remote management](remote-management.md) for headless nodes,
+- **Operate:** [updating TwinSpark](updating.md), [maintenance](maintenance.md), [remote management](remote-management.md) for headless nodes,
   the [QSFP link](qsfp-link.md).
 
 TwinSpark is MIT-licensed and alpha software; [the security model](security.md) says what it protects and

@@ -7,12 +7,12 @@ One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA
 (GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
 and keep the machines headless.
 
-> **Status: alpha (0.7.1).** The control path is covered by automated tests (about 1,450). Real Docker
+> **Status: alpha (0.8.0).** The control path is covered by automated tests (about 1,600). Real Docker
 > activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
 > and two-node PP2) on 2026-09-28, at the code of that day — see the
 > [validation note](docs/notes/small-model-validation-2026-09-28.md). Large models, other topologies
-> and the newer features (remote management, `tsm qsfp`, everything new in 0.7) still need on-site
-> validation, which is why a new install starts in **dry-run** (nothing is run on your machines) until you
+> and the newer features (remote management, `tsm qsfp`, everything new in 0.7, `tsm update`) still need
+> on-site validation, which is why a new install starts in **dry-run** (nothing is run on your machines) until you
 > say otherwise.
 
 ---
@@ -314,17 +314,20 @@ switch it on, on that node.
 ## Updating and removing
 
 ```bash
-cd Twinspark-Manager && git pull && sudo ./install.sh --no-setup && sudo systemctl restart twinspark-agent twinspark-controller
-sudo systemctl restart twinspark-gateway   # node A, where the gateway runs as its own service (new in 0.7)
+tsm update                               # what runs where, and the newest release on GitHub
+tsm update sparks                        # both Sparks: node B, then node A — the model keeps serving
+tsm update here                          # this computer (the workstation client)
 sudo ./install.sh --uninstall            # stop services, remove the program; config, models and state stay
 sudo ./install.sh --uninstall --purge    # …and delete /etc/twinspark and /var/lib/twinspark
 ```
 
-Update both nodes (the Get started page and the client's **Agents compatible** state warn when versions
-differ). Coming from 0.5 with the terminal switched on, run `sudo tsm remote enable terminal` once on
-each node afterwards: it moves the terminal to its on-demand socket (until then it keeps running as
-before). Update the client with `pipx upgrade twinspark-manager` (a git install:
-`pipx install --force git+https://github.com/ChopCookies/Twinspark-Manager`).
+`tsm update` (and **Updates → TwinSpark** in the GUI) installs a release on each node next to a backup, and
+goes back to the previous version on its own if the new one does not start. It is described in
+[docs/updating.md](docs/updating.md). Coming from 0.7 or older, update once by hand on each node:
+`git pull && sudo ./install.sh --no-setup`, then restart the services
+(`sudo systemctl restart twinspark-privd twinspark-agent twinspark-controller`, and `twinspark-gateway` on
+node A in standalone mode). Coming from 0.5 with the terminal switched on, also run
+`sudo tsm remote enable terminal` once on each node.
 
 ## TwinSpark vs. general cluster managers
 

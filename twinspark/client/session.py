@@ -54,10 +54,10 @@ def compatibility(client_version: str, node_version: Optional[str], capabilities
         return {"state": "older-node",
                 "note": (f"node A runs TwinSpark {node_version}, this client {client_version}. The GUI works; the "
                          f"lean services, the activation journal and the startup timeline need {c[0]}.{c[1]} on "
-                         f"both Sparks — update them (docs/client.md, 'Updating the Sparks').")}
+                         f"both Sparks — update them: tsm update sparks (or Updates in the GUI).")}
     return {"state": "newer-node",
             "note": (f"node A runs TwinSpark {node_version}, newer than this client ({client_version}). "
-                     f"Update the client: pipx upgrade twinspark-manager")}
+                     f"Update the client: tsm update here")}
 
 
 class ClientSession:

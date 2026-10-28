@@ -369,7 +369,7 @@ def scan_host_keys(host: str, port: int = 22, *, timeout: float = 10.0) -> list[
     check_host(host)
     check_port(port)
     argv = [find_keyscan(), "-T", str(max(1, int(timeout))), "-p", str(port), "--", host]
-    kw: dict[str, Any] = {"creationflags": subprocess.CREATE_NO_WINDOW} if _WIN else {}
+    kw: dict[str, Any] = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if _WIN else {}
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout + 5, stdin=subprocess.DEVNULL,
                            **kw)
@@ -452,7 +452,7 @@ class RemoteResult:
 
 def _spawn_kwargs(new_session: bool = False) -> dict[str, Any]:
     if _WIN:
-        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
     return {"start_new_session": True} if new_session else {}
 
 
