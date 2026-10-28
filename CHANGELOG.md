@@ -63,7 +63,9 @@ for Windows, types and coverage.
 
 ### CI and code health
 
-- Windows job for the workstation side (client, `tsm update`, portability), run in the ANSI code page.
+- Windows job for the workstation side (client, `tsm update`, portability), run in the ANSI code page. On its
+  first run it found that `tsm demo` (and `tsm setup`) wrote their configuration files in the Windows code
+  page. They write UTF-8 now; files written by an older version still load.
 - mypy job: every module is checked except a recorded list of older ones, which is shortened module by module.
   This release fixes the findings in the others, including a client integration route that answered 500
   instead of 404 when a served model had no id.

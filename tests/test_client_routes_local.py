@@ -13,7 +13,7 @@ import httpx
 import pytest
 import yaml
 
-from tests.test_client_hermes import MGMT_KEY, kill_fake_gateways, make_install
+from tests.test_client_hermes import MGMT_KEY, kill_fake_gateways, make_install, needs_posix
 from tests.test_client_validate import BASE, KEY, FakeGateway
 from twinspark.client import integrations_local
 from twinspark.client.adapters import Endpoint, HermesAdapter
@@ -67,6 +67,7 @@ def hermes(tmp_path, monkeypatch):
     kill_fake_gateways(tmp_path)
 
 
+@needs_posix
 async def test_hermes_on_this_computer_detect_preview_apply_validate_restore(hermes):
     inst, session = hermes
     original = (inst.hermes / "config.yaml").read_bytes()

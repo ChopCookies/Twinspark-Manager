@@ -34,6 +34,11 @@ from twinspark.client.adapters.hermes import (
     service_candidates,
 )
 
+POSIX = os.name != "nt"
+# The fake Hermes launchers and wrappers are #! scripts in a Linux/macOS layout (~/.local/bin, .venv/bin).
+needs_posix = pytest.mark.skipif(not POSIX, reason="the fake Hermes launchers are #! scripts (POSIX only)")
+
+
 DEEPSEEK_KEY = "sk-deepseekSecretValue0123456789abcd"
 OPENROUTER_KEY = "sk-or-v1-routerSecretValue0123456789"
 MGMT_KEY = "management-key-Kp4sW9xL2mQ7"
@@ -269,7 +274,7 @@ def kill_fake_gateways(root: Path) -> None:
     """Never leave a fake gateway behind, whatever a test did."""
     for pidfile in root.rglob("gateway.pid"):
         try:
-            os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
+            os.kill(int(pidfile.read_text().strip()), getattr(signal, "SIGKILL", signal.SIGTERM))
         except (OSError, ValueError):
             pass
 
@@ -289,6 +294,7 @@ def assert_no_secrets(text: str) -> None:
 
 
 # ---- the incident, end to end ---------------------------------------------------------------------------------
+@needs_posix
 async def test_incident_resolved_end_to_end(install):
     gw = FakeGateway()
     adapter = install.adapter(gw, forbidden_keys=[MGMT_KEY])
@@ -339,7 +345,7 @@ async def test_incident_resolved_end_to_end(install):
     assert cfg["auxiliary"]["vision"]["provider"] == "openrouter"     # reported, never changed
     env_text = (install.hermes / ".env").read_text()
     assert env_text == DEEPSEEK_ENV + f"TWINSPARK_API_KEY={KEY}\n"
-    assert stat.S_IMODE((install.hermes / ".env").stat().st_mode) == 0o600
+    assert not POSIX or stat.S_IMODE((install.hermes / ".env").stat().st_mode) == 0o600
     assert KEY not in text
 
     checks = await adapter.validate(endpoint)
@@ -390,11 +396,11 @@ async def test_backups_are_byte_exact_and_private(install):
     preview = await adapter.preview(gw.endpoint())
     result = await adapter.apply(gw.endpoint(), preview.token)
     location = Path(result.backup.location)
-    assert stat.S_IMODE(location.stat().st_mode) == 0o700
+    assert not POSIX or stat.S_IMODE(location.stat().st_mode) == 0o700
     assert (location / "config.yaml").read_bytes() == DEEPSEEK_CONFIG.replace("\n", "\r\n").encode()
     assert (location / ".env").read_bytes() == DEEPSEEK_ENV.encode()
     for name in (".env", "config.yaml", "manifest.json"):
-        assert stat.S_IMODE((location / name).stat().st_mode) == 0o600
+        assert not POSIX or stat.S_IMODE((location / name).stat().st_mode) == 0o600
     manifest = (location / "manifest.json").read_text()
     assert_no_secrets(manifest)
     # CRLF files keep CRLF outside the rewritten block.
@@ -533,6 +539,7 @@ async def test_comment_loss_is_announced_when_the_block_cannot_be_edited_in_plac
     assert (inst.hermes / "config.yaml").read_text() == cfg
 
 
+@needs_posix
 async def test_fresh_install_without_files_gets_new_private_files(tmp_path):
     inst = make_install(tmp_path, config=None, env=None, stale_wrapper=False, wrapper_ok=True)
     adapter = inst.adapter(FakeGateway())
@@ -542,7 +549,7 @@ async def test_fresh_install_without_files_gets_new_private_files(tmp_path):
     preview = await adapter.preview(ep)
     assert all(f.before_hash is None for f in preview.files)
     await adapter.apply(ep, preview.token)
-    assert stat.S_IMODE((inst.hermes / ".env").stat().st_mode) == 0o600
+    assert not POSIX or stat.S_IMODE((inst.hermes / ".env").stat().st_mode) == 0o600
     assert (inst.hermes / ".env").read_text() == f"TWINSPARK_API_KEY={KEY}\n"
     restored = await adapter.restore()
     assert sorted(restored.removed) == sorted([str(inst.hermes / "config.yaml"), str(inst.hermes / ".env")])
@@ -632,6 +639,7 @@ async def test_not_installed(tmp_path):
         await adapter.launch("cli")
 
 
+@needs_posix
 async def test_launcher_on_path_works(tmp_path):
     inst = make_install(tmp_path, stale_wrapper=False, path_hermes=True)
     det = await inst.adapter().detect()
@@ -639,6 +647,7 @@ async def test_launcher_on_path_works(tmp_path):
     assert det.launcher == det.on_path and not det.broken_launchers
 
 
+@needs_posix
 async def test_broken_symlink_and_missing_interpreter(tmp_path):
     inst = make_install(tmp_path, stale_wrapper=False)
     os.symlink(tmp_path / "gone" / "hermes", inst.wrapper)
@@ -652,6 +661,7 @@ async def test_broken_symlink_and_missing_interpreter(tmp_path):
     assert any("Re-run the Hermes installer" in n for n in det.notes)
 
 
+@needs_posix
 async def test_launcher_that_fails_to_run_is_broken(tmp_path):
     inst = make_install(tmp_path, stale_wrapper=False)
     inst.wrapper.write_text("#!/bin/sh\necho 'ModuleNotFoundError: No module named hermes_cli' >&2\nexit 1\n")

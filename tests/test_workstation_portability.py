@@ -18,8 +18,9 @@ from twinspark import cli
 
 ROOT = Path(__file__).resolve().parents[1] / "twinspark"
 # Modules a workstation imports when it runs `tsm …` or the client app.
-WORKSTATION = [ROOT / "cli.py", ROOT / "cli_remote.py", ROOT / "schemas" / "config.py",
-               *sorted((ROOT / "client").rglob("*.py"))]
+WORKSTATION = [ROOT / "cli.py", ROOT / "cli_remote.py", ROOT / "cli_setup.py", ROOT / "cli_update.py",
+               ROOT / "schemas" / "config.py", ROOT / "provision.py", ROOT / "demo.py", ROOT / "security.py",
+               ROOT / "releases.py", ROOT / "local_update.py", *sorted((ROOT / "client").rglob("*.py"))]
 
 
 def _text_io_without_encoding(path: Path) -> list[str]:
@@ -35,6 +36,8 @@ def _text_io_without_encoding(path: Path) -> list[str]:
             continue  # os.open, z.open, … take no encoding
         if name in ("read_text", "write_text") and isinstance(f.value, ast.Attribute) and f.value.attr == "host":
             continue  # the Hermes host helpers decode UTF-8 themselves
+        if name == "read_text" and isinstance(f.value, ast.Name) and f.value.id == "dist":
+            continue  # importlib.metadata's Distribution.read_text(filename) decodes UTF-8 itself
         mode = next((a.value for a in node.args[1:2] if isinstance(a, ast.Constant)), None)
         mode = next((k.value.value for k in node.keywords if k.arg == "mode" and isinstance(k.value, ast.Constant)),
                     mode)
@@ -82,3 +85,25 @@ def test_config_with_non_ascii_text_loads(tmp_path):
     p = tmp_path / "workstation.yaml"
     p.write_bytes("db_path: /srv/küche/state.db\n".encode("utf-8"))
     assert load_config(p, Doc).db_path == "/srv/küche/state.db"
+
+
+def test_a_config_written_in_the_windows_code_page_before_0_8_still_loads(tmp_path):
+    from pydantic import BaseModel
+
+    from twinspark.schemas.config import load_config
+
+    class Doc(BaseModel):
+        note: str
+
+    p = tmp_path / "controller.yaml"
+    p.write_bytes("note: written by tsm demo \x97 on Windows\n".encode("latin-1"))      # 0x97: an em dash in cp1252
+    assert load_config(p, Doc).note.startswith("written by tsm demo")
+
+
+def test_setup_writes_its_files_as_utf8(tmp_path):
+    """`tsm demo` provisions with the same code as `tsm setup`: on Windows its files were cp1252 before 0.8."""
+    from twinspark.demo import DemoCluster
+    d = DemoCluster(base=tmp_path)
+    d.provision()
+    text = d.a_layout.controller_yaml.read_bytes().decode("utf-8")
+    assert any(ord(ch) > 127 for ch in text)            # the template has non-ASCII text (dashes)

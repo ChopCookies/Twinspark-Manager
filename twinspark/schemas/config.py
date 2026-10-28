@@ -388,5 +388,10 @@ T = TypeVar("T", bound=BaseModel)
 
 
 def load_config(path: str | Path, model: type[T]) -> T:
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # written before 0.8 by `tsm demo` / `tsm setup` on Windows, in the ANSI code page
+        text = Path(path).read_text(encoding="cp1252", errors="replace")
+    data = yaml.safe_load(text) or {}
     return model.model_validate(data)
