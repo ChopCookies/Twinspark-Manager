@@ -33,7 +33,7 @@ python -m venv .venv
 | GUI tests | `node --test tests/*.test.cjs`, and `web/dist` must equal a fresh `scripts/build_web.py` |
 | lint | `ruff check .` |
 | type check (mypy) | `mypy` with the settings in `pyproject.toml` (see below) |
-| workstation tests (Windows) | the client, `tsm update`, release and portability tests on `windows-latest`, in the ANSI code page |
+| workstation tests (Windows) | the client, `tsm update`, release and portability tests on `windows-latest`, in the ANSI code page (not the Hermes fakes: their launchers are `#!` scripts) |
 | alert rules (promtool) | `promtool check rules` and `promtool test rules` for `deploy/observability/` |
 | dependency advisories | `pip-audit` on `constraints/release.txt` and `constraints/minimum.txt` |
 | wheel + install smoke test | builds the wheel, installs it with `constraints/release.txt` in a clean venv and starts the demo cluster from it |
