@@ -129,16 +129,24 @@ jobs:
       - run: pip install -e ".[dev,client]"
       # what runs on a Windows workstation: tsm, the client app, its update; the Spark-side tests need Linux
       - name: pytest
+        shell: bash
         env:
           PYTHONUTF8: "0"                # the ANSI code page, as on a default Windows install
           TSM_CLIENT_KEYRING: "off"
-        run: >-
-          python -m pytest -v -p no:cacheprovider -rs
-          tests/test_workstation_portability.py tests/test_update_cli.py tests/test_selfupdate.py
-          tests/test_release_assets.py tests/test_host_key_pinning.py tests/test_cli_init.py tests/test_catalog.py
-          tests/test_client_app.py tests/test_client_conn.py tests/test_client_conn_discovery.py
-          tests/test_client_routes_local.py tests/test_client_validate.py tests/test_client_hermes.py
-          tests/test_client_hermes_hosts.py tests/test_client_ssh.py tests/test_client_ssh_fake.py
+        run: |
+          set -o pipefail
+          python -m pytest -v -p no:cacheprovider -rs --junitxml=pytest.xml \
+            tests/test_workstation_portability.py tests/test_update_cli.py tests/test_selfupdate.py \
+            tests/test_release_assets.py tests/test_host_key_pinning.py tests/test_cli_init.py tests/test_catalog.py \
+            tests/test_client_app.py tests/test_client_conn.py tests/test_client_conn_discovery.py \
+            tests/test_client_routes_local.py tests/test_client_validate.py tests/test_client_hermes.py \
+            tests/test_client_hermes_hosts.py tests/test_client_ssh.py tests/test_client_ssh_fake.py 2>&1 | tee pytest.log
+      - name: Failures as annotations
+        if: failure()
+        shell: bash
+        run: |
+          pip freeze > pip-freeze.txt
+          python scripts/ci_annotate.py pytest.xml pytest.log pip-freeze.txt
 
   audit:
     name: dependency advisories
