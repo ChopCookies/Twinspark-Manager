@@ -32,7 +32,24 @@ python -m venv .venv
 | tests (newest dependencies) | pytest against today's releases |
 | GUI tests | `node --test tests/*.test.cjs`, and `web/dist` must equal a fresh `scripts/build_web.py` |
 | lint | `ruff check .` |
+| type check (mypy) | `mypy` with the settings in `pyproject.toml` (see below) |
+| workstation tests (Windows) | the client, `tsm update`, release and portability tests on `windows-latest`, in the ANSI code page (not the Hermes fakes: their launchers are `#!` scripts) |
+| alert rules (promtool) | `promtool check rules` and `promtool test rules` for `deploy/observability/` |
+| dependency advisories | `pip-audit` on `constraints/release.txt` and `constraints/minimum.txt` |
 | wheel + install smoke test | builds the wheel, installs it with `constraints/release.txt` in a clean venv and starts the demo cluster from it |
+
+The newest-dependency test job runs under `coverage`. The report is the job's summary, the HTML is an artifact,
+and the job fails below `fail_under` in `pyproject.toml` (80 %). What stays uncovered is mostly code that
+only runs on hardware: Docker, RDMA, privd and systemd.
+
+**mypy** checks every module except the ones listed under `[[tool.mypy.overrides]]` in `pyproject.toml`.
+Those were written before mypy ran in CI. Their remaining findings are mostly an Optional value used without
+a check, or a loose dict type. Fix one module, then delete it from the list. New modules are always checked.
+
+CI also runs on a weekly schedule, so a new advisory or a new dependency release shows up without a push.
+`.github/dependabot.yml` proposes updates for the actions and for the pins in `constraints/release.txt`.
+Releases come from tags (`.github/workflows/release.yml`); the steps are in
+[updating.md](updating.md#releases-maintainers).
 
 `pyproject.toml` only sets lower bounds, so a library install takes the newest versions. A Spark install
 (`install.sh`) uses `constraints/release.txt`: the exact set this release was tested with
@@ -159,3 +176,11 @@ for real in a test.
 5. QSFP link (never run on real Sparks yet): on each node `tsm qsfp status`, `tsm qsfp plan --node A|B`, then
    `sudo tsm qsfp apply --temporary`, `tsm qsfp verify`, and only then the permanent `sudo tsm qsfp apply`.
    Run it from the management network, not over the QSFP link. [docs/qsfp-link.md](qsfp-link.md)
+6. `tsm update` (new in 0.8, not run on hardware yet). First the one manual update from 0.7 on each node
+   ([updating.md](updating.md#the-first-time-07-08-by-hand)). Then `tsm update`, which should list both nodes
+   at 0.8.0. With a model serving and a request loop running against the gateway, run
+   `tsm update sparks --version 0.8.0`, a reinstall of the same version. Watch node B, then node A, the
+   controller coming back by itself, and the model never stopping. Then try the refusals:
+   `sudo tsm update policy off` on node B, and a version that does not exist.
+7. Host-key pinning (new in 0.8): `tsm doctor` should report the A→B SSH check with "host key pinned from
+   node B's agent". Then a weight copy to node B.

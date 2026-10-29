@@ -149,7 +149,7 @@ class Session:
 
 def session_members(sid: int, proc: str = "/proc") -> list[int]:
     """PIDs whose session id is ``sid`` (the shell the PTY started is its session leader)."""
-    out = []
+    out: list[int] = []
     try:
         names = os.listdir(proc)
     except OSError:

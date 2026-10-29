@@ -1,0 +1,22 @@
+# Version updates as pull requests. Security advisories are also checked by CI's weekly `audit` job.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+  # constraints/release.txt: the exact versions install.sh and `tsm update` install. Floors in pyproject.toml are
+  # raised by hand (docs/development.md); Dependabot only proposes new pins here.
+  - package-ecosystem: pip
+    directory: /constraints
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      release-pins:
+        patterns: ["*"]

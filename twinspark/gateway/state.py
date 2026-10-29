@@ -203,9 +203,10 @@ class GatewayLink:
         self.gw.remote_ok, self.last_seen, self.last_error = True, time.time(), None
         self.gw.remote_version = int(doc.get("version") or 0)
         for alias, s in (doc.get("routes") or {}).items():
-            st = self.gw.routes.get(alias)
-            if st is None:
+            route = self.gw.routes.get(alias)
+            if route is None:
                 continue
+            st = route
             # the process's requests go to remote_inflight: the controller's own (the playground) stay counted
             st.remote_inflight, st.requests, st.errors = int(s.get("inflight") or 0), \
                 int(s.get("requests") or 0), int(s.get("errors") or 0)

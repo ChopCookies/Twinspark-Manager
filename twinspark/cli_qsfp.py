@@ -300,7 +300,8 @@ def cmd_scan(args, api=None) -> None:
         gpu = f"   {r['gpu']}" if r["gpu"] else ""
         print(f"{r['ip']:16} via {r['via']}{gpu}")
     if args.identify and not any(r["gpu"] for r in found):
-        print("(no GPU name came back: SSH key login to that machine is needed for --identify)")
+        print("(no GPU name came back: --identify needs SSH key login to that machine and its host key in your "
+              "known_hosts — connect once with `ssh <user>@<ip>` and compare the fingerprint with the Spark's)")
 
 
 # ---- parsers ---------------------------------------------------------------------------------------
@@ -345,4 +346,4 @@ def add_parsers(sub, cmd) -> None:
     p.add_argument("--user", default=os.environ.get("USER") or "twinspark", help="SSH user for --identify")
     p.set_defaults(fn=cmd_scan)
     for fn in (cmd_status, cmd_plan, cmd_apply, cmd_revert, cmd_verify, cmd_scan):
-        fn.local = True
+        fn.local = True  # type: ignore[attr-defined]

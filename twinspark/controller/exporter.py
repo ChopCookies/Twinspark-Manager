@@ -85,6 +85,10 @@ def _nodes(ctrl: "Controller", f: _Families) -> None:
         up = bool(t) and not t.get("stale") and not t.get("error")
         f.add("twinspark_node_up", "gauge", "The node's agent answered the last telemetry poll", int(up),
               {"node": node})
+        facts = ctrl.store.kv_get(f"hardware:{node}") or {}
+        if facts.get("agent_version"):
+            f.add("twinspark_node_info", "gauge", "The TwinSpark version the node's agent reported", 1,
+                  {"node": node, "version": facts["agent_version"]})
         if not up:
             continue
         lab = {"node": node}
@@ -111,6 +115,8 @@ def _nodes(ctrl: "Controller", f: _Families) -> None:
 def _deployment(ctrl: "Controller", f: _Families) -> None:
     act = ctrl.active()
     f.add("twinspark_switch_in_progress", "gauge", "A switch, stop or maintenance holds the cluster", int(ctrl.busy()))
+    f.add("twinspark_update_in_progress", "gauge", "`tsm update` is installing a TwinSpark release on the nodes",
+          int(ctrl.selfupdate.blocking()))
     if act:
         f.add("twinspark_active_info", "gauge", "The active deployment", 1,
               {"profile": act.get("profile"), "revision": act.get("revision_id"), "label": act.get("label")})

@@ -13,6 +13,8 @@ from ..security import tokens_equal
 
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
 _MAINTENANCE_OK = ("/api/v1/system/maintenance/", "/api/v1/remote/")
+# during a TwinSpark update the model keeps serving: the playground stays usable too
+_UPDATE_OK = ("/api/v1/system/update", "/api/v1/remote/", "/api/v1/playground/")
 _FAILED_PER_MIN = 120          # wrong-key requests tolerated per client per minute
 
 
@@ -108,3 +110,6 @@ def require_auth(request: Request, x_api_key: Optional[str] = Header(default=Non
     if (request.method in _MUTATING and ctrl.maintenance.blocking()
             and not request.url.path.startswith(_MAINTENANCE_OK)):
         raise HTTPException(409, "cluster is reserved for maintenance; open Updates to review progress")
+    if (request.method in _MUTATING and ctrl.selfupdate.blocking()
+            and not request.url.path.startswith(_UPDATE_OK)):
+        raise HTTPException(409, "TwinSpark is being updated; open Updates to follow it (the model keeps serving)")

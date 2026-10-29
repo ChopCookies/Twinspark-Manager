@@ -325,7 +325,7 @@ remote_mgmt:
 
 
 def _rw_paths(a: Answers, lay: Layout, controller: bool) -> str:
-    paths = [lay.state, lay.secrets]
+    paths: list[Path | str] = [lay.state, lay.secrets]
     if not controller:
         paths += [lay.cache, a.hf_cache_dir or lay.state / "hf-cache"]
     return " ".join(str(p) for p in dict.fromkeys(paths))
@@ -497,7 +497,7 @@ def installed_terminal_unit(lay: Layout) -> str:
     from types import SimpleNamespace
     agent_unit = lay.systemd / "twinspark-agent.service"
     try:
-        m = re.search(r"(?m)^User=(\S+)\s*$", agent_unit.read_text())
+        m = re.search(r"(?m)^User=(\S+)\s*$", agent_unit.read_text(encoding="utf-8"))
     except OSError:
         m = None
     if not m:
@@ -517,19 +517,19 @@ def set_runtime_mode(path: Path, mode: str) -> bool:
     """Flip ``runtime_mode`` keeping comments. Returns True if the file changed."""
     if mode not in ("dry-run", "docker"):
         raise SetupError("mode must be dry-run or docker")
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     new, n = re.subn(r"(?m)^runtime_mode:\s*[\w-]+", f"runtime_mode: {mode}", text)
     if n == 0:
         new = text.rstrip("\n") + f"\nruntime_mode: {mode}\n"
     if new == text:
         return False
-    path.write_text(new)
+    path.write_text(new, encoding="utf-8")
     return True
 
 
 def set_node_fields(path: Path, node: str, hcas: list[str], gid: Optional[int]) -> bool:
     """Rewrite ``nodes.<node>.rdma_hcas`` / ``ib_gid_index`` in a wizard-generated controller.yaml."""
-    lines = path.read_text().splitlines(keepends=True)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     start = next((i for i, ln in enumerate(lines) if re.fullmatch(rf"  {node}:\s*", ln.rstrip("\n"))), None)
     if start is None:
         raise SetupError(f"node {node} not found in {path} — edit rdma_hcas / ib_gid_index by hand")
@@ -548,7 +548,7 @@ def set_node_fields(path: Path, node: str, hcas: list[str], gid: Optional[int]) 
             lines[idx] = new.rstrip("\n") + comment + "\n"
             changed = True
     if changed:
-        path.write_text("".join(lines))
+        path.write_text("".join(lines), encoding="utf-8")
     return changed
 
 
@@ -591,7 +591,7 @@ class Provisioner:
     def _write(self, path: Path, text: str, mode: int = 0o644, label: str = "") -> None:
         label = label or path.name
         if path.exists():
-            if path.read_text() == text:
+            if path.read_text(encoding="utf-8") == text:
                 self._step(label, "kept", "unchanged")
                 return
             if not self.force and path.suffix in (".yaml",):
@@ -603,7 +603,7 @@ class Provisioner:
             self._step(label, "planned", str(path))
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         os.chmod(path, mode)
         self._step(label, "done", str(path))
 
@@ -729,7 +729,7 @@ class Provisioner:
                 self._chown(lay.ssh_dir, *own)
             self._step("ssh key", "done", f"generated {key}")
         pub = Path(str(key) + ".pub")
-        return pub.read_text().strip() if pub.exists() else None
+        return pub.read_text(encoding="utf-8").strip() if pub.exists() else None
 
     def _authorize(self, pubkey: str, from_ip: Optional[str]) -> None:
         """Append a restricted authorized_keys entry for the service user (idempotent)."""
@@ -745,12 +745,13 @@ class Provisioner:
         opts = "no-agent-forwarding,no-port-forwarding,no-X11-forwarding"
         line = f'from="{from_ip}",{opts} {pubkey}' if from_ip else f"{opts} {pubkey}"
         ak.parent.mkdir(parents=True, exist_ok=True)
-        existing = ak.read_text() if ak.exists() else ""
+        existing = ak.read_text(encoding="utf-8") if ak.exists() else ""
         blob = pubkey.split()[1]
         if any(blob == tok for ln in existing.splitlines() for tok in ln.split()):
             self._step("authorize key", "kept", f"the other node's key is already authorised for {self.a.service_user}")
             return
-        ak.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n")
+        ak.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n") + line + "\n",
+                      encoding="utf-8")
         os.chmod(ak, 0o600)
         os.chmod(ak.parent, 0o700)
         own = self._owner()
@@ -900,7 +901,7 @@ def generate_ssh_key(path: Path, comment: str) -> None:
         os.write(fd, pem)
     finally:
         os.close(fd)
-    Path(str(path) + ".pub").write_text(pub.decode() + f" {comment}\n")
+    Path(str(path) + ".pub").write_text(pub.decode() + f" {comment}\n", encoding="utf-8")
     os.chmod(str(path) + ".pub", 0o644)
 
 

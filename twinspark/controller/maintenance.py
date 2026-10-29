@@ -47,6 +47,8 @@ class Maintenance:
         plan = await self.plan()
         if self.ctrl.busy() or self.ctrl._staging:
             raise ValueError("cluster is busy or held for maintenance")
+        if self.ctrl.selfupdate.blocking():
+            raise ValueError("TwinSpark is being updated; start maintenance when that has finished")
         if not plan["ready"]:
             raise ValueError("every configured node must be reachable and opted in through its root policy")
         if firmware and not all(n.get("allow_firmware") for n in plan["nodes"].values()):

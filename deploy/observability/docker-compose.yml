@@ -18,6 +18,7 @@ services:
       - --web.listen-address=127.0.0.1:9090
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
       - ./twinspark.key:/etc/prometheus/twinspark.key:ro
       - prometheus-data:/prometheus
     restart: unless-stopped

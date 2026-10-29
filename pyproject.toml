@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twinspark-manager"
-version = "0.7.1"
+version = "0.8.0"
 description = "Model manager for two NVIDIA DGX Sparks: vLLM recipes, one OpenAI-compatible endpoint, web GUI and CLI"
 readme = "README.md"
 license = "MIT"
@@ -75,6 +75,59 @@ ignore = ["B008"]                    # FastAPI's Depends() in argument defaults
 [tool.ruff.lint.per-file-ignores]
 "twinspark/api/*" = ["B904"]         # HTTPException re-raised from the handler is intended
 "scripts/*" = ["E402", "B905"]       # dev scripts put the repo on sys.path before importing it
+
+[tool.mypy]
+python_version = "3.12"
+files = ["twinspark"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+
+# The modules below were written before mypy ran in CI. Their remaining findings (mostly Optional values
+# used without a check, and loose dict types) are being fixed one module at a time: delete a name from this list
+# once `mypy` is clean for it. Every other module, and every new one, is checked in CI.
+[[tool.mypy.overrides]]
+module = [
+    "twinspark.agent.sysinfo",
+    "twinspark.agent.timeline",
+    "twinspark.api.routes_benchmarks",
+    "twinspark.api.routes_cookbook",
+    "twinspark.api.routes_diagnostics",
+    "twinspark.client.adapters.hermes",
+    "twinspark.client.adapters.validate",
+    "twinspark.client.app",
+    "twinspark.client.bench",
+    "twinspark.client.bench_local",
+    "twinspark.client.discovery",
+    "twinspark.client.session",
+    "twinspark.controller.controller",
+    "twinspark.controller.evidence",
+    "twinspark.controller.files",
+    "twinspark.controller.halves",
+    "twinspark.controller.integration",
+    "twinspark.controller.integrations",
+    "twinspark.controller.jobs",
+    "twinspark.controller.launch",
+    "twinspark.controller.measurements",
+    "twinspark.controller.pinning",
+    "twinspark.controller.planner",
+    "twinspark.controller.playground",
+    "twinspark.controller.timeline",
+    "twinspark.cookbook.community",
+    "twinspark.cookbook.eugr",
+    "twinspark.demo",
+    "twinspark.gateway.app",
+    "twinspark.metrics",
+    "twinspark.qsfp",
+]
+ignore_errors = true
+
+[tool.coverage.run]
+source = ["twinspark"]
+
+[tool.coverage.report]
+# CI fails below this; hardware-only paths (Docker, RDMA, privd, systemd) are what is left uncovered
+fail_under = 80
+skip_empty = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

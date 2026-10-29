@@ -84,8 +84,9 @@ class TaskRegistry:
         return False
 
     def running(self, kind: Optional[str] = None) -> list[dict[str, Any]]:
-        return [self.status(t) for t, v in self.tasks.items()
-                if v["state"] == "running" and (kind is None or v["kind"] == kind)]
+        out = [self.status(t) for t, v in self.tasks.items()
+               if v["state"] == "running" and (kind is None or v["kind"] == kind)]
+        return [s for s in out if s is not None]
 
     def _trim(self) -> None:
         done = [t for t, v in self.tasks.items() if v["state"] != "running"]

@@ -162,6 +162,7 @@ def _do_boot_next(target: str) -> dict[str, Any]:
     status = op_boot_status({})
     if not status.get("available"):
         raise RuntimeError(status["reason"])
+    entry: Optional[dict[str, Any]]
     if target == "network":
         entry = _pick_network_entry(status)
     elif _BOOTNUM_RE.match(target):
@@ -302,7 +303,7 @@ def op_wol_status(params: dict[str, Any]) -> dict[str, Any]:
         if rc == 127:
             return {"available": False, "reason": "ethtool is not installed (sudo apt install ethtool)",
                     "interfaces": {}}
-        info = parse_ethtool_wol(text) if rc == 0 else {"supports": None, "mode": None}
+        info: dict[str, Any] = parse_ethtool_wol(text) if rc == 0 else {"supports": None, "mode": None}
         try:
             info["mac"] = (SYS_NET / name / "address").read_text().strip()
         except OSError:

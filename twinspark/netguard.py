@@ -35,7 +35,7 @@ def check_public_url(url: str, resolve: bool = True) -> str:
         except (socket.gaierror, UnicodeError) as exc:
             raise UnsafeURL(f"cannot resolve {parts.hostname}") from exc
         for info in infos:
-            addr = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+            addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
             if not addr.is_global:
                 raise UnsafeURL(f"{parts.hostname} resolves to a non-public address; refusing to connect")
     return url

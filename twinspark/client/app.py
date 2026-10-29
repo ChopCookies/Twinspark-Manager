@@ -242,6 +242,32 @@ def create_client_app(session: ClientSession, local_key: str, *, web_dir: Option
     async def status():
         return await session.status()
 
+    update_cache: dict[str, tuple] = {}
+
+    @app.get("/api/v1/client/update")
+    async def client_update(refresh: bool = False):
+        """This computer's TwinSpark and the newest release (cached 10 min); `tsm update here` installs it."""
+        import time
+
+        import httpx
+
+        from .. import local_update, releases
+        kind = local_update.install_kind()
+        hit = update_cache.get("release")
+        if refresh or hit is None or time.time() - hit[0] > 600:
+            try:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+                    hit = (time.time(), await releases.latest_async(c), None)
+            except releases.ReleaseError as exc:
+                hit = (time.time(), None, str(exc))
+            except httpx.HTTPError as exc:
+                hit = (time.time(), None, f"GitHub is not reachable from this computer ({type(exc).__name__})")
+            update_cache["release"] = hit
+        _, rel, err = hit
+        return {"version": __version__, "install": {k: kind.get(k) for k in ("kind", "ok", "why")},
+                "release": releases.summary(__version__, rel), "error": err,
+                "command": "tsm update here" if kind["ok"] else None}
+
     @app.get("/api/v1/client/connections")
     def list_connections():
         return {"connections": [c.to_dict() for c in session.connections.list()]}

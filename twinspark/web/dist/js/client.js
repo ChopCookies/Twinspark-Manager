@@ -162,6 +162,8 @@ function connectionHtml(info, st, probe) {
     if (probe.error) html += `<div class="callout bad" data-key="probe-err"><div>${esc(probe.error)}</div></div>`;
     html += `<div data-key="probe">${setupChecksHtml(probe.checks)}</div>`;
   }
+  const upd = S.clientUpdate, rel = (upd && upd.release) || {};
+  if (rel.available) html += `<div class="callout info" data-key="client-update"><div><b>TwinSpark ${esc(rel.latest)} is available for this computer</b> (it runs ${esc(upd.version)}). ${upd.command ? `In a terminal: <span class="mono">${esc(upd.command)}</span>, then start <span class="mono">tsm client</span> again.` : esc((upd.install || {}).why || "")} The Sparks are updated separately, on <a href="#/updates">Updates</a>.</div></div>`;
   html += `<p class="small muted" data-key="foot">Client ${esc(info.version)} · keys stored in ${esc(info.credential_backend === "keyring" ? "your system keychain" : "a private file")} under <span class="mono">${esc(info.home)}</span>${ssh.path ? ` · ssh: <span class="mono">${esc(ssh.path)}</span>` : ""}</p></div>`;
   return html;
 }
@@ -294,6 +296,7 @@ async function viewConnection() {
   const g = S.gen;
   if (!S.client) { render(g, `<div class="view">${empty("Not available here", "The Connection page belongs to the workstation client (tsm client). This page is served by node A itself.")}</div>`); return; }
   let probe = null;
+  if (!S.clientUpdate) GET("/api/v1/client/update").then(u => { S.clientUpdate = u; if (current(g)) draw(); }).catch(() => {});
   const draw = async () => {
     const [info, st] = await Promise.all([GET("/api/v1/client/info"), GET("/api/v1/client/status")]);
     S.client = info; S.clientStatus = st;

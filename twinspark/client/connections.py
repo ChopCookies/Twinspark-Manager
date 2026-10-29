@@ -179,10 +179,10 @@ class Connection:
         for what, port in (("SSH port", self.ssh_port), ("management port on node A", self.manager_port),
                            ("gateway port on node A", self.gateway_port)):
             check_port(port, what)
-        for what, port in (("local API port", self.local_api_port),
-                           ("local gateway port", self.local_gateway_port)):
-            if port is not None:
-                check_port(port, what)
+        for what, lport in (("local API port", self.local_api_port),
+                            ("local gateway port", self.local_gateway_port)):
+            if lport is not None:
+                check_port(lport, what)
         if self.local_api_port is not None and self.local_api_port == self.local_gateway_port:
             raise ValueError("The local API port and the local gateway port must be different.")
         if self.identity_file is not None:
@@ -319,7 +319,7 @@ def _tailscale_binary() -> Optional[str]:
     found = shutil.which("tailscale")
     if found:
         return found
-    candidates = []
+    candidates: list[str] = []
     if sys.platform == "darwin":
         candidates.append("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
     elif sys.platform.startswith("win"):

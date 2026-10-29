@@ -258,7 +258,7 @@ def gather_controller(args, con: Console, rep: hostprobe.HostReport, a: Answers)
     a.runtime_mode = mode
     gather_remote(args, con, a)
     if args.hf_token_file:
-        a.hf_token = Path(args.hf_token_file).read_text().strip()
+        a.hf_token = Path(args.hf_token_file).read_text(encoding="utf-8").strip()
     elif not con.yes:
         a.hf_token = con.secret("Hugging Face token for gated models") or None
 
@@ -357,7 +357,7 @@ def gather_agent(args, con: Console, rep: hostprobe.HostReport, a: Answers, info
         a.runtime_mode = args.runtime_mode
     gather_remote(args, con, a)
     if args.hf_token_file:
-        a.hf_token = Path(args.hf_token_file).read_text().strip()
+        a.hf_token = Path(args.hf_token_file).read_text(encoding="utf-8").strip()
     elif not con.yes:
         a.hf_token = con.secret("Hugging Face token (only needed here if node B downloads models)") or None
 
@@ -530,11 +530,11 @@ def cmd_join_code(args, api=None):
     pub = Path(str(cfg.runtime.ssh_key) + ".pub") if cfg.runtime.ssh_key else None
     ans.runtime_mode = "dry-run"
     try:
-        agent_cfg = yaml.safe_load(lay.agent_yaml.read_text()) if lay.agent_yaml.exists() else {}
+        agent_cfg = yaml.safe_load(lay.agent_yaml.read_text(encoding="utf-8")) if lay.agent_yaml.exists() else {}
         ans.runtime_mode = (agent_cfg or {}).get("runtime_mode", "dry-run")
     except (OSError, yaml.YAMLError):
         pass
-    pubkey = pub.read_text().strip() if pub and pub.exists() else None
+    pubkey = pub.read_text(encoding="utf-8").strip() if pub and pub.exists() else None
     print(f"sudo tsm setup --join {provision.make_join(ans, vault, pubkey)}")
 
 

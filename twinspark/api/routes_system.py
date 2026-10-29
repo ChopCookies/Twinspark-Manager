@@ -65,6 +65,35 @@ async def maintenance_release(ctrl: Controller = Depends(controller_dep)):
         raise HTTPException(409, str(exc)) from exc
 
 
+@router.get("/update")
+def update_status(ctrl: Controller = Depends(controller_dep)):
+    """The TwinSpark update run (``tsm update``): progress, or the last result."""
+    return ctrl.selfupdate.state()
+
+
+@router.post("/update/check")
+async def update_check(refresh: bool = False, prerelease: bool = False, ctrl: Controller = Depends(controller_dep)):
+    """Versions on every node and the newest release on GitHub (cached for 10 minutes)."""
+    return await ctrl.selfupdate.check(refresh=refresh, allow_prerelease=prerelease)
+
+
+class UpdateRequest(BaseModel):
+    confirm: str
+    version: Optional[str] = Field(None, max_length=32, description="a published version; default: the newest")
+    prerelease: bool = False
+
+
+@router.post("/update/start")
+async def update_start(req: UpdateRequest, ctrl: Controller = Depends(controller_dep)):
+    from ..releases import ReleaseError
+    if req.confirm != "UPDATE TWINSPARK":
+        raise HTTPException(422, "explicit confirmation is required (confirm: UPDATE TWINSPARK)")
+    try:
+        return await ctrl.selfupdate.start(req.version, req.prerelease)
+    except (ValueError, ReleaseError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 class SpecSource(BaseModel):
     """Either a registered repo, or an inline HF config.json (+ safetensors total_size)."""
 

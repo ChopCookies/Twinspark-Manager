@@ -9,13 +9,25 @@ on the receiving node.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .agent_client import AgentActionError, AgentClient
 
 if TYPE_CHECKING:
     from ..schemas.config import ControllerConfig
     from ..schemas.job import Job, JobStep
+
+
+async def peer_host_keys(agent: AgentClient) -> list[str]:
+    """The target node's SSH host keys, asked from its agent over the authenticated agent connection.
+
+    The copying node pins exactly these (StrictHostKeyChecking=yes). An agent older than 0.8 cannot tell:
+    then [] and the copy falls back to the earlier accept-new behaviour."""
+    try:
+        r = await agent.call("ssh_host_keys", timeout=15)
+    except Exception:  # noqa: BLE001 - an older agent, or the node is away (the copy reports that itself)
+        return []
+    return [k for k in (r.get("keys") or []) if isinstance(k, str)][:8]
 
 
 class StageError(RuntimeError):
@@ -133,9 +145,11 @@ class WeightsStager:
             copy = phase(job, f"copy:{ref}:{src}>{target}", kind="copy", node=target, ref=ref,
                          label=f"copy {what} {repo}@{rev[:12]} node {src} → node {target} over QSFP")
             self.persist(job)
+            keys = await peer_host_keys(self.agent(target))
+            pin: dict[str, Any] = {"host_keys": keys} if keys else {}
             task = await self.agent(src).call(
                 "sync", repo=repo, revision=rev, include=include, target_host=ep.sync_host,
-                ssh_user=ep.ssh_user, target_hf_home=dst, streams=self.config.runtime.sync_streams)
+                ssh_user=ep.ssh_user, target_hf_home=dst, streams=self.config.runtime.sync_streams, **pin)
             try:
                 await self.agent(src).wait_task(task["task_id"], timeout=6 * 3600, poll=self.poll,
                                                 on_progress=self._progress(job, step, f"{src}→{target}: ", copy),

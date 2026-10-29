@@ -85,6 +85,49 @@ async function streamChat(body, onDelta, signal) {
   return { text, reasoning, stats };
 }
 
+/** One line of numbers for an export. */
+function playgroundStatsLine(st) {
+  if (!st) return "";
+  return [st.ttft_ms == null ? "" : `TTFT ${st.ttft_ms} ms`, st.tok_s == null ? "" : `${st.tok_s} tok/s`,
+    `${st.completion_tokens}${st.estimated ? " (counted)" : ""} tokens`, `${(st.total_ms / 1000).toFixed(1)} s`].filter(Boolean).join(" · ");
+}
+
+/** The conversation as Markdown: the question, each model's answer and its numbers — to keep or to paste. */
+function playgroundMarkdown(state, cols, when = new Date()) {
+  const out = [`# TwinSpark playground · ${when.toISOString().slice(0, 16).replace("T", " ")} UTC`, ""];
+  const settings = [state.temperature ? `temperature ${state.temperature}` : "", state.max_tokens ? `max_tokens ${state.max_tokens}` : ""].filter(Boolean);
+  if (settings.length) out.push(`Settings: ${settings.join(" · ")}`, "");
+  if (state.system) out.push("**System prompt**", "", ...String(state.system).split("\n").map(l => `> ${l}`), "");
+  for (const c of cols) {
+    if (cols.length > 1) out.push(`## ${c.alias}`, "");
+    for (const t of c.turns) {
+      if (t.role === "user") { out.push("**You**", "", t.content, ""); continue; }
+      out.push(`**${c.alias}**`, "");
+      if (t.reasoning) out.push("<details><summary>Reasoning</summary>", "", t.reasoning, "", "</details>", "");
+      if (t.content) out.push(t.content, "");
+      if (t.error) out.push(`> error: ${t.error}`, "");
+      if (t.stats) out.push(`_${playgroundStatsLine(t.stats)}_`, "");
+    }
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+}
+
+/** The same as JSON (format twinspark-playground/1): messages in the shape the chat API takes, plus the numbers. */
+function playgroundJson(state, cols, when = new Date()) {
+  const params = {};
+  for (const k of ["temperature", "max_tokens"]) if (state[k] !== "" && Number.isFinite(+state[k])) params[k] = +state[k];
+  return JSON.stringify({
+    format: "twinspark-playground/1", exported_at: when.toISOString(), system: state.system || null, params,
+    columns: cols.map(c => ({ alias: c.alias, messages: c.turns.map(t => {
+      const m = { role: t.role, content: t.content };
+      if (t.reasoning) m.reasoning = t.reasoning;
+      if (t.error) m.error = t.error;
+      if (t.stats) m.stats = t.stats;
+      return m;
+    }) })),
+  }, null, 2) + "\n";
+}
+
 function playgroundStatsHtml(st) {
   if (!st) return "";
   const parts = [["Time to first token", st.ttft_ms == null ? "—" : `${num(st.ttft_ms)} ms`], ["Decode", st.tok_s == null ? "—" : `${st.tok_s} tok/s`],
@@ -123,7 +166,8 @@ async function viewPlayground() {
     <details style="margin-top:8px" ${state.system ? "open" : ""}><summary>System prompt</summary><textarea id="pg-system" rows="3" spellcheck="false">${esc(state.system)}</textarea></details></div>
     <div class="grid ${state.compare ? "cols-2" : ""} pg-cols">${cols.map((c, i) => `<div class="card pg-col"><div class="card-head"><h2 class="mono">${esc(c.alias)}</h2><div class="row"><button class="btn sm ghost" data-act="pg-curl" data-col="${i}">Copy as curl</button><button class="btn sm ghost" data-act="pg-clear" data-col="${i}">Clear</button></div></div><div class="pg-log" id="pg-log-${i}">${playgroundTurns(c)}</div></div>`).join("")}</div>
     <div class="card pg-input"><textarea id="pg-msg" rows="3" placeholder="Message — Ctrl+Enter sends"></textarea>
-      <div class="row end"><button class="btn" data-act="pg-stop" disabled>Stop</button><button class="btn primary" data-act="pg-send">Send</button></div></div>
+      <div class="row between"><div class="row"><button class="btn sm ghost" data-act="pg-export" data-format="md" ${cols.some(c => c.turns.length) ? "" : "disabled"}>Export Markdown</button><button class="btn sm ghost" data-act="pg-export" data-format="json" ${cols.some(c => c.turns.length) ? "" : "disabled"}>JSON</button></div>
+        <div class="row"><button class="btn" data-act="pg-stop" disabled>Stop</button><button class="btn primary" data-act="pg-send">Send</button></div></div></div>
   </div>`)) return;
 
   const remember = () => {
@@ -162,9 +206,16 @@ async function viewPlayground() {
         log();
       }));
       running = null;
-      if (current(g)) { $('[data-act="pg-stop"]').disabled = true; $('[data-act="pg-send"]').disabled = false; $("#pg-msg").focus(); }
+      if (current(g)) { $('[data-act="pg-stop"]').disabled = true; $('[data-act="pg-send"]').disabled = false; $$('[data-act="pg-export"]').forEach(b => { b.disabled = false; }); $("#pg-msg").focus(); }
     },
     "pg-stop": () => { if (running) running.abort(); },
+    "pg-export": (el) => {
+      remember();
+      const when = new Date(), stamp = when.toISOString().slice(0, 16).replace(/[-:T]/g, "");
+      const md = el.dataset.format === "md";
+      downloadIntegrationFile({ name: `twinspark-playground-${stamp}.${md ? "md" : "json"}`,
+        content: md ? playgroundMarkdown(state, cols, when) : playgroundJson(state, cols, when) });
+    },
     "pg-clear": (el) => { state.columns[+el.dataset.col].turns = []; viewPlayground(); },
     "pg-curl": async (el) => {
       const c = cols[+el.dataset.col];

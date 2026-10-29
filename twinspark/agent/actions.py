@@ -80,8 +80,10 @@ class AgentActions:
         self.tasks = TaskRegistry()
         from .monitoring import HostSampler
         from .node_maintenance import NodeMaintenance
+        from .node_update import NodeUpdate
         self.host_sampler = HostSampler()
         self.maintenance = NodeMaintenance(self)
+        self.update = NodeUpdate(self)
         self.downloader: Optional[Callable[[dict], None]] = None   # test hook
         self.registry: dict[str, Callable[[dict], Any]] = {
             "system_telemetry": lambda params: self.host_sampler.sample(),
@@ -91,6 +93,9 @@ class AgentActions:
             "maintenance_status": self.maintenance.status,
             "maintenance_reboot": self.maintenance.reboot,
             "maintenance_verify": self.maintenance.verify,
+            "update_probe": self.update.probe,
+            "update_start": self.update.start,
+            "update_status": self.update.status,
             "hardware_facts": self.hardware_facts,
             "memory_telemetry": self.memory_telemetry,
             "preflight": self.preflight,
@@ -113,6 +118,7 @@ class AgentActions:
             "verify": self.verify,
             "sync": self.sync,
             "ssh_check": self.ssh_check,
+            "ssh_host_keys": self.ssh_host_keys,
             "task_status": self.task_status,
             "task_cancel": self.task_cancel,
             "tasks_list": self.tasks_list,
@@ -387,9 +393,9 @@ class AgentActions:
         for k, v in spec.env.items():
             if "${secret" in v.lower().replace(" ", "") and not _SECRET_REF.fullmatch(v):
                 raise ActionError(f"malformed secret reference in {k}")
-            m = _SECRET_REF.fullmatch(v)
-            if m:
-                slot = m.group(1)
+            ref = _SECRET_REF.fullmatch(v)
+            if ref:
+                slot = ref.group(1)
                 # Only the documented slot -> variable pairs. Anything else would let a profile,
                 # recipe or mod read the node's vault (management key, agent token, ...).
                 if k not in _SECRET_ENV.get(slot, ()):
@@ -608,24 +614,45 @@ class AgentActions:
         include = self._globs(params.get("include"))
         streams = int(params.get("streams") or self.rt.sync_streams)
         streams = max(1, min(streams, 16))
+        keys = self._host_keys(params)
 
         async def run(tid):
             return await transfers.run_sync(self.tasks, tid, self.rt, repo, rev, include,
-                                            host, user, dst, streams, self.dry_run)
+                                            host, user, dst, streams, self.dry_run, host_keys=keys)
         return self.tasks.spawn("sync", run, repo=repo, revision=rev, target=host)
 
     def ssh_check(self, params: dict) -> dict:
         host, user = str(params.get("target_host", "")), str(params.get("ssh_user", ""))
         if not _HOST_RE.match(host) or not _USER_RE.match(user):
             raise ActionError("ssh_check needs a valid target_host and ssh_user")
-        argv = transfers.ssh_command(self.rt) + [f"{user}@{host}", "true"]
+        keys = self._host_keys(params)
+        argv = transfers.ssh_command(self.rt, pinned=bool(keys)) + [f"{user}@{host}", "true"]
         if self.dry_run:
-            return {"ok": True, "dry_run": True, "argv": argv}
+            return {"ok": True, "dry_run": True, "argv": argv, "pinned": bool(keys)}
+        if keys:
+            try:
+                transfers.pin_host_keys(self.rt, host, keys)
+            except ValueError as exc:
+                raise ActionError(str(exc)) from exc
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=25)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": p.returncode == 0, "error": p.stderr.strip()[-400:] if p.returncode else None}
+        return {"ok": p.returncode == 0, "error": p.stderr.strip()[-400:] if p.returncode else None,
+                "pinned": bool(keys)}
+
+    @staticmethod
+    def _host_keys(params: dict) -> list[str]:
+        keys = params.get("host_keys") or []
+        if not isinstance(keys, list) or len(keys) > 8 or not all(isinstance(k, str) and len(k) < 4096 for k in keys):
+            raise ActionError("host_keys must be a short list of SSH public keys")
+        return keys
+
+    def ssh_host_keys(self, params: dict) -> dict:
+        """This node's SSH host public keys, for the other node to pin before it copies weights here."""
+        if self.dry_run:
+            return {"keys": [], "dry_run": True}
+        return {"keys": transfers.own_host_keys()}
 
     def task_status(self, params: dict) -> dict:
         t = self.tasks.status(str(params.get("task_id")))

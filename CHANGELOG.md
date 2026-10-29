@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.8.0 — 2026-10-28 — `tsm update`
+
+Updating TwinSpark used to mean `git pull` and `install.sh` on each node, then restarting the right services
+in the right order. From this version on, `tsm update` installs releases from GitHub on both Sparks and on
+the workstation, and goes back on its own if a new version does not start. The rest of this release is what
+the review of 0.7 suggested: SSH host-key pinning between the nodes, alert rules, a playground export, and CI
+for Windows, types and coverage.
+
+### `tsm update`
+
+- **Releases.** Pushing a tag `vX.Y.Z` builds and publishes a GitHub release (`.github/workflows/release.yml`)
+  with the wheel, the sdist, `constraints-release.txt` and `SHA256SUMS`. The release notes come from
+  `CHANGELOG.md`. Publishing to PyPI is optional, through a trusted publisher and the repository variable
+  `PUBLISH_PYPI`.
+- **`tsm update sparks`** (and **Updates → TwinSpark** in the GUI) updates node B, then node A, without
+  stopping the model. Each node downloads the release, checks every file against `SHA256SUMS` and GitHub's
+  digest, installs it next to a backup of `/opt/twinspark/venv`, verifies it and restarts the TwinSpark
+  services. If the new version does not install, import or stay up, the node rolls back on its own. The work
+  runs as root in its own systemd unit, with the system Python and a stdlib-only worker, so it survives the
+  restarts. Node A's controller restarts in the middle of the run and finishes it from its database. Before
+  node A's gateway restarts, the run waits for requests in flight. `--version X` installs a published
+  version, also an older one.
+- **`tsm update here`** updates the workstation client (pipx or venv; a checkout or a Spark install is
+  refused with the reason). On Windows it continues outside `tsm.exe` so the launcher can be replaced. The
+  client's Connection page says when a newer client is published.
+- **`/etc/twinspark/update-policy.json`** (written once by install.sh) switches updates on or off per node:
+  `sudo tsm update policy off|on|show`. Nothing reachable over the API can change it.
+- `tsm update` / `tsm update status`: versions on every node and on this computer, the newest release, the
+  progress of a run. A metric `twinspark_update_in_progress`, and a dashboard notice while a run is going.
+- Coming from 0.7: update once by hand (`git pull && sudo ./install.sh --no-setup`, then restart privd, the
+  agent and the controller). See [docs/updating.md](docs/updating.md).
+
+### Security
+
+- **Node B's SSH host key is pinned for weight copies.** Node A's agent copied over SSH with
+  `StrictHostKeyChecking=accept-new`, so it took the first key it saw on trust. Now the controller asks node B's
+  agent for its host keys, over the agent connection it authenticates with B's token. Node A pins exactly
+  those keys in the sync's own `known_hosts` and connects with `StrictHostKeyChecking=yes`. `tsm doctor`'s SSH
+  check does the same and says so. A node B older than 0.8 falls back to the previous behaviour.
+- `tsm qsfp scan --identify` no longer adds the keys of whatever answers on the link subnet to your
+  `known_hosts`. It only identifies hosts whose key you have already confirmed.
+
+### Monitoring
+
+- **Alert rules** in `deploy/observability/alerts.yml`, loaded by the compose setup. They cover:
+  - an unreachable controller or a node that is down
+  - an alias or a split half that is down (not during a switch or an update)
+  - gateway errors and stuck requests
+  - stale engine metrics
+  - low memory, memory pressure and swap use
+  - a hot GPU
+  - nodes on different versions
+
+  CI checks them with `promtool check rules` and unit-tests them with `promtool test rules`.
+- New metrics: `twinspark_node_info{version}` and `twinspark_update_in_progress`.
+
+### Playground
+
+- **Export** the conversation as Markdown (questions, answers, reasoning, the numbers of each answer) or as
+  JSON (`twinspark-playground/1`, messages in the shape the chat API takes).
+
+### CI and code health
+
+- Windows job for the workstation side (client, `tsm update`, portability), run in the ANSI code page. On its
+  first run it found that `tsm demo` (and `tsm setup`) wrote their configuration files in the Windows code
+  page. They write UTF-8 now; files written by an older version still load.
+- mypy job: every module is checked except a recorded list of older ones, which is shortened module by module.
+  This release fixes the findings in the others, including a client integration route that answered 500
+  instead of 404 when a served model had no id.
+- Coverage on the newest-dependency job, with a report in the job summary and a floor of 80 %.
+- `.github/dependabot.yml` for the GitHub actions and the release pins.
+
 ## 0.7.1 — 2026-10-27 — fixes from a full review of 0.7.0
 
 ### Fixes

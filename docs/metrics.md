@@ -33,6 +33,27 @@ An existing Prometheus needs one scrape job:
 tsm prometheus config --target 127.0.0.1:8443 --key-file /etc/prometheus/twinspark.key
 ```
 
+## Alerts
+
+`deploy/observability/alerts.yml` holds alert rules for these metrics. The compose setup loads them, and
+firing alerts show on `http://127.0.0.1:9090/alerts`. For notifications, add an Alertmanager. An existing
+Prometheus takes the file with `rule_files:`.
+
+| Alert | When |
+|---|---|
+| TwinSparkControllerUnreachable | node A's management API cannot be scraped for 2 min |
+| TwinSparkNodeDown | a node's agent did not answer the telemetry poll for 2 min |
+| TwinSparkRouteDown / TwinSparkHalfDown | an alias (or a split half) does not serve for 5 min, not during a switch or an update |
+| TwinSparkGatewayErrors | more than 5 % of an alias's requests fail for 10 min |
+| TwinSparkRequestStuck | a request has been in flight for more than 15 min |
+| TwinSparkEngineMetricsStale | the engine stopped reporting metrics for 5 min |
+| TwinSparkMemoryLow / TwinSparkMemoryPressure / TwinSparkSwapInUse | less than 5 % memory available, PSI full above 10 %, or more than 1 GiB swap |
+| TwinSparkGpuHot | GPU above 85 °C for 10 min |
+| TwinSparkVersionsDiffer | the nodes run different TwinSpark versions for an hour (`tsm update`) |
+
+The thresholds are starting points; change them to suit your recipes. CI checks the file with `promtool check
+rules` and runs the unit tests in `alerts-test.yml` (`promtool test rules`).
+
 ## The key
 
 The metrics key opens `GET /metrics` and nothing else; the management key also works but should not be

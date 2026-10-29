@@ -59,7 +59,7 @@ def build_controller(cfg: "ControllerConfig", vault: "SecretsVault") -> tuple["C
 
 
 def build_servers(config_path: str, seed=None,
-                  log_level: str = "info") -> tuple["Controller", "uvicorn.Server", "uvicorn.Server"]:
+                  log_level: str = "info") -> tuple["Controller", "uvicorn.Server", Optional["uvicorn.Server"]]:
     """Controller + the two uvicorn servers (management API, gateway), not yet running."""
     from .controller.app import create_app
     from .gateway.app import build_gateway_app
