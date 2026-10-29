@@ -3,6 +3,7 @@ before the old model is stopped. No Docker: plans are inspected, probes come fro
 
 from __future__ import annotations
 
+import json
 import shlex
 from types import SimpleNamespace
 
@@ -206,3 +207,33 @@ async def test_the_agent_runs_only_its_own_probe_script(cluster):
         await a.call("image_probe", image_ref=f"x/y@{DIGEST}", engine="bash")
     cluster.runtimes["A"].probe_result = None
     assert await a.call("image_probe", image_ref=f"x/y@{DIGEST}", engine="vllm") == {"simulated": True}
+
+
+def test_the_image_probe_never_pulls_and_leaves_no_container_behind(monkeypatch):
+    """Review of 0.7: `docker run` without --pull never could fetch an image inside the check, and a probe
+    that timed out kept running (killing the CLI does not stop the container) — and showed up as a foreign
+    inference container."""
+    import subprocess
+
+    from twinspark.agent import runtime
+    calls = []
+
+    def fake_run(argv, *a, **kw):
+        calls.append(argv)
+        if argv[1] == "run":
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        if argv[1] == "ps":
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
+                {"Names": calls[0][calls[0].index("--name") + 1], "Image": "vllm/vllm-openai@sha256:" + "a" * 64,
+                 "Command": "python3 -c …", "Labels": "twinspark.probe=true", "Status": "Up 3 minutes"}) + "\n",
+                stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    rt = runtime.DockerRuntime()
+    with pytest.raises(runtime.RuntimeError_, match="did not finish"):
+        rt.probe("vllm/vllm-openai@sha256:" + "a" * 64, "print(1)", timeout=1)
+    run = calls[0]
+    assert run[run.index("--pull") + 1] == "never" and "--network" in run and "ALL" in run
+    name = run[run.index("--name") + 1]
+    assert name.startswith("tsm-probe-") and calls[1] == ["docker", "rm", "-f", name]
+    assert rt.list_foreign() == []                                     # a lingering probe is not "foreign"

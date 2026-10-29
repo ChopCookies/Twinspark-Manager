@@ -56,12 +56,16 @@ if [ "$(id -u)" -ne 0 ] && [ -z "${TSM_NO_SUDO:-}" ]; then
   exec sudo -E bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
+# every unit `tsm setup` can write (provision.UNIT_NAMES), in stopping order: the terminal's socket first so it
+# cannot start the terminal again, the gateway after the controller, privd last
+UNITS="twinspark-terminal.socket twinspark-terminal.service twinspark-controller.service twinspark-gateway.service twinspark-agent.service twinspark-privd.service"
+
 uninstall() {
   say "Stopping TwinSpark services"
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    for u in twinspark-terminal twinspark-controller twinspark-agent twinspark-privd; do
+    for u in $UNITS; do
       systemctl disable --now "$u" 2>/dev/null || true
-      rm -f "/etc/systemd/system/$u.service"
+      rm -f "/etc/systemd/system/$u"
     done
     systemctl daemon-reload || true
   fi

@@ -17,6 +17,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -44,6 +45,16 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex((host, port)) == 0
+
+
+PROBE_LABEL = "twinspark.probe"
+
+
+def probe_argv(docker: str, image_ref: str, script: str, name: str) -> list[str]:
+    return [docker, "run", "--rm", "--pull", "never", "--name", name, "--label", f"{PROBE_LABEL}=true",
+            "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--entrypoint", "python3", "--env", "HF_HUB_OFFLINE=1", "--memory", "6g", "--pids-limit", "512",
+            image_ref, "-c", script]
 
 
 def _looks_like_vllm(image: str, command: str) -> bool:
@@ -101,13 +112,15 @@ class DockerRuntime:
         self._run([self.docker, "pull", image_ref], timeout=3600)
 
     def probe(self, image_ref: str, script: str, timeout: int = 240) -> str:
-        """Run TwinSpark's fixed probe script in the image: no network, no GPU, no mounts, removed after."""
-        argv = [self.docker, "run", "--rm", "--network", "none", "--entrypoint", "python3",
-                "--env", "HF_HUB_OFFLINE=1", "--memory", "6g", "--pids-limit", "512",
-                image_ref, "-c", script]
+        """Run TwinSpark's fixed probe script in the image: no network, no GPU, no mounts, no capabilities,
+        never a pull (the switch pulled the image before), removed after — also when it does not finish."""
+        name = f"tsm-probe-{uuid.uuid4().hex[:12]}"
+        argv = probe_argv(self.docker, image_ref, script, name)
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
+            # killing the docker CLI leaves the container running (next to the model, up to 6 GiB)
+            self._run([self.docker, "rm", "-f", name], check=False, timeout=60)
             raise RuntimeError_(f"the image probe did not finish within {timeout} s") from exc
         except FileNotFoundError as exc:
             raise RuntimeError_(f"{argv[0]} not found — is Docker installed?") from exc
@@ -148,8 +161,9 @@ class DockerRuntime:
                 c = json.loads(line)
             except ValueError:
                 continue
-            if f"{OWNER_LABEL}=true" in (c.get("Labels") or ""):
-                continue
+            labels = c.get("Labels") or ""
+            if f"{OWNER_LABEL}=true" in labels or f"{PROBE_LABEL}=true" in labels:
+                continue                         # ours: a model container, or the image probe before a switch
             if _looks_like_vllm(c.get("Image", ""), c.get("Command", "")) or \
                     self._runs_vllm(c.get("Names", "")):
                 found.append({"name": c.get("Names"), "image": c.get("Image"),

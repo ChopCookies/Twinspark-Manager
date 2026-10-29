@@ -388,5 +388,5 @@ T = TypeVar("T", bound=BaseModel)
 
 
 def load_config(path: str | Path, model: type[T]) -> T:
-    data = yaml.safe_load(Path(path).read_text()) or {}
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     return model.model_validate(data)

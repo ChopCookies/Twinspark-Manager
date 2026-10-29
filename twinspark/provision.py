@@ -34,6 +34,7 @@ from .schemas.config import AgentConfig, ControllerConfig, load_config
 from .security import SecretsVault
 
 JOIN_PREFIX = "tsm1."
+GATEWAY_UNIT = "twinspark-gateway.service"
 UNIT_NAMES = ("twinspark-privd.service", "twinspark-agent.service", "twinspark-controller.service",
               "twinspark-gateway.service",
               "twinspark-terminal.service", "twinspark-terminal.socket")
@@ -580,6 +581,7 @@ class Provisioner:
         self.pubkey: Optional[str] = None
         self.systemd = systemd and not lay.sandbox
         self.steps: list[Step] = []
+        self.stale_units: list[str] = []
         self.vault = SecretsVault(lay.secrets)
 
     def _step(self, name: str, status: str, detail: str = "") -> None:
@@ -822,9 +824,28 @@ class Provisioner:
         for name, text in render_units(self.a, self.lay, gateway_mode=mode).items():
             self._write(self.lay.systemd / name, text, label=name)
             written.append(name)
+        # back from standalone to in-process: the gateway's own unit would keep the gateway port, and the
+        # controller's in-process gateway could not start
+        self.stale_units = [u for u in (GATEWAY_UNIT,)
+                            if self.a.role in ("controller", "single") and u not in written
+                            and (self.lay.systemd / u).exists()]
         return written
 
+    def _retire(self, units: list[str]) -> None:
+        """Stop, disable and remove units this configuration no longer has (before the others start)."""
+        for u in units:
+            if self.dry:
+                self._step(u, "planned", "systemctl disable --now " + u + "; remove the unit file")
+                continue
+            if self.systemd:
+                self.run(["systemctl", "disable", "--now", u])
+            path = self.lay.systemd / u
+            shutil.copy2(path, path.with_name(path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}"))
+            path.unlink()
+            self._step(u, "done", "removed: controller.yaml no longer runs the gateway as its own service")
+
     def start(self, unit_names: list[str]) -> None:
+        self._retire(self.stale_units)
         if not self.systemd:
             self._step("services", "skipped", "sandbox install or systemd not available — start them manually")
             return

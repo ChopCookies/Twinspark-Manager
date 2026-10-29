@@ -18,6 +18,7 @@ This module imports nothing heavier than the gateway itself.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -38,9 +39,12 @@ _ROUTE_FIELDS = ("backends", "served_model", "revision_id", "max_model_len", "dr
 
 
 def export_state(gw: Gateway, version: int) -> dict[str, Any]:
+    # publish() also runs in API worker threads while the event loop changes routes: take copies first
+    # (one C-level step each), never iterate the live dicts
+    routes, keys = list(gw.routes.items()), list(gw.keys.values())
     return {"format": FORMAT, "version": version, "written_at": time.time(),
-            "routes": {a: {f: getattr(st, f) for f in _ROUTE_FIELDS} for a, st in gw.routes.items()},
-            "settings": gw.settings, "keys": list(gw.keys.values()), "keys_managed": gw.keys_managed}
+            "routes": {a: {f: copy.copy(getattr(st, f)) for f in _ROUTE_FIELDS} for a, st in routes},
+            "settings": copy.deepcopy(gw.settings), "keys": keys, "keys_managed": gw.keys_managed}
 
 
 def apply_state(gw: Gateway, doc: dict[str, Any]) -> None:

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.7.1 — 2026-10-27 — fixes from a full review of 0.7.0
+
+### Fixes
+
+- **Uninstall stopped only four units.** `install.sh --uninstall` left `twinspark-gateway.service` (new in 0.7)
+  and `twinspark-terminal.socket` enabled: the gateway kept restarting a deleted program. It now stops and
+  removes every unit `tsm setup` can write, and a test keeps the two lists equal.
+- **Going back to `gateway_mode: in-process`** left `twinspark-gateway.service` running on the gateway port,
+  so the controller's in-process gateway could not start. `sudo tsm setup` now stops, disables and removes
+  the unit (keeping a `.bak` copy) before the controller restarts.
+- **The image check before a switch** could pull an image inside the check (`docker run` without
+  `--pull never`), left its container running when it timed out (killing the Docker CLI does not stop the
+  container: up to 6 GiB next to the serving model), and that container was then listed as a hand-started
+  inference container. The probe now never pulls, runs without capabilities, is named and labelled, is
+  removed after a timeout, and is never counted as foreign.
+- **Token usage could be lost or counted twice** when `GET /api/v1/usage` (a worker thread) flushed the
+  counters while requests ended on the event loop. The hand-over is one locked swap now. Publishing the
+  gateway state from a worker thread copies the routing first instead of iterating it while it changes.
+- **`tsm` on Windows:** `tsm mods file-patch` wrote its `run.sh` with CRLF line endings, which bash on the
+  Spark cannot run, and `tsm cookbook import FILE`, `tsm edit` and config loading read files in the
+  Windows code page instead of UTF-8 (a recipe with an umlaut failed). These read and write UTF-8 with LF
+  now, `tsm mods install` converts a CRLF `run.sh` to LF, and a test keeps workstation-side modules from
+  relying on the platform encoding.
+- **`tsm demo` could fail to start** ("demo server failed to start … address already in use"): the agent
+  and terminal ports were only checked on 127.0.0.2, but agent A listens on 127.0.0.1, where any local
+  service may already hold that port. The demo now picks ports free on both addresses.
+- Background tasks of the terminal (the shell-exit watcher) and of the client (closing a replaced HTTP
+  client) are kept referenced until they finish.
+
+### Dependencies
+
+- Lower bounds raised past published advisories: FastAPI ≥ 0.133 with **Starlette ≥ 1.3.1**, **anyio ≥ 4.14.2**,
+  **cryptography ≥ 50.0** (pytest ≥ 9.0.3, pytest-asyncio ≥ 1.3 for development). `constraints/release.txt`
+  regenerated (it pinned a certifi with an advisory).
+- CI: a dependency-advisory job (`pip-audit` on the release and the minimum set), a weekly scheduled run,
+  and the GitHub actions moved to their Node 24 versions.
+
+### Cleanup
+
+- Removed `twinspark/artifacts.py` and `twinspark/schemas/artifact.py`, which nothing used.
+
 ## 0.7.0 — 2026-10-19 — measured, not guessed
 
 0.6 moved the work off the Sparks. 0.7 makes what TwinSpark says about a deployment checkable: memory

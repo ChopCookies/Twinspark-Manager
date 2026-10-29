@@ -233,3 +233,28 @@ def test_a_revocation_is_not_lost_to_a_usage_flush(tmp_path):
     ks.records = original
     (r,) = ks.records()
     assert r["revoked_at"] and r["last_used_at"]
+
+
+def test_usage_handed_over_from_another_thread_is_never_lost():
+    """GET /usage flushes from a worker thread while requests end on the event loop: every request counts
+    exactly once."""
+    import threading
+    gw = Gateway(None)
+    n, taken, done = 20000, [], threading.Event()
+
+    def requests():
+        for _ in range(n):
+            gw.record_usage("key-1", "default", 3, 5, False)
+        done.set()
+
+    def flusher():
+        while not done.is_set():
+            taken.extend(gw.take_usage()["rows"])
+        taken.extend(gw.take_usage()["rows"])
+    threads = [threading.Thread(target=requests), threading.Thread(target=flusher)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert sum(r["requests"] for r in taken) == n
+    assert sum(r["completion_tokens"] for r in taken) == 5 * n

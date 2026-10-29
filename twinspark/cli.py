@@ -365,14 +365,14 @@ def cmd_edit(args, api: Api):
     if draft is None:
         sys.exit("profile has no draft")
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
-    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False, encoding="utf-8") as f:
         json.dump(draft, f, indent=2)
         path = f.name
     try:
         while True:
             subprocess.run([*editor.split(), path], check=False)
             try:
-                new = json.loads(Path(path).read_text())
+                new = json.loads(Path(path).read_text(encoding="utf-8"))
             except ValueError as exc:
                 if input(f"invalid JSON ({exc}) — edit again? [Y/n] ").lower().startswith("n"):
                     return
@@ -728,7 +728,7 @@ def cmd_cookbook(args, api: Api):
         if args.name.startswith(("http://", "https://")):
             body["url"] = args.name
         else:
-            body["text"] = Path(args.name).expanduser().read_text()
+            body["text"] = Path(args.name).expanduser().read_text(encoding="utf-8")
         res = api("POST", "/api/v1/cookbook/import-recipe", json=body)
         if _out(api, res):
             return
@@ -831,7 +831,12 @@ def _pack_dir(path: Path) -> str:
             info = zipfile.ZipInfo(rel.as_posix())
             info.external_attr = (f.stat().st_mode & 0o777) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
-            z.writestr(info, f.read_bytes())
+            data = f.read_bytes()
+            if rel.as_posix() == "run.sh" and b"\r\n" in data:
+                # An editor or git checkout on Windows leaves CRLF; bash on the Spark cannot run that.
+                print("note: run.sh has Windows line endings — sending it with LF", file=sys.stderr)
+                data = data.replace(b"\r\n", b"\n")
+            z.writestr(info, data)
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -885,8 +890,10 @@ def file_patch_mod(name: str, source: Path, target: str, out: Path) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     (d / source.name).write_bytes(data)
     run = d / "run.sh"
+    # newline="\n": written on a Windows workstation, a CRLF run.sh fails on the Spark ("bash\r").
     run.write_text(_FILE_PATCH_RUN.format(name=name, target=target, digest=digest, short=digest[:12],
-                                          q_target=shlex.quote(target), q_file=shlex.quote(source.name)))
+                                          q_target=shlex.quote(target), q_file=shlex.quote(source.name)),
+                   encoding="utf-8", newline="\n")
     run.chmod(0o755)
     return d
 

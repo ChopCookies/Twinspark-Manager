@@ -80,6 +80,7 @@ class ClientSession:
         self.message: Optional[str] = None
         self._http = http
         self._own_http = http is None
+        self._closing: set[asyncio.Task] = set()
         self._node: dict[str, Any] = {}
         self._node_at = 0.0
         self._node_lock = asyncio.Lock()
@@ -133,7 +134,9 @@ class ClientSession:
         if self._http is None or getattr(self._http, "_tsm_direct", None) != direct:
             if self._http is not None and self._own_http:
                 old = self._http
-                asyncio.get_running_loop().create_task(old.aclose())
+                closing = asyncio.get_running_loop().create_task(old.aclose())
+                self._closing.add(closing)                  # keep a reference until it is done
+                closing.add_done_callback(self._closing.discard)
             self._http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), trust_env=False,
                                            verify=direct)
             self._http._tsm_direct = direct      # type: ignore[attr-defined]

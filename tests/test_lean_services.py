@@ -44,7 +44,7 @@ def test_node_services_do_not_load_the_controller_or_fastapi(role):
         + ("import twinspark.remote.termd\n" if role == "termd" else "")
         + ("import twinspark.agent.privd\n" if role == "privd" else ""))
     for heavy in ("fastapi", "twinspark.controller.controller", "twinspark.cookbook", "twinspark.controller.app",
-                  "twinspark.schemas.profile", "twinspark.schemas.artifact"):
+                  "twinspark.schemas.profile", "twinspark.schemas.job"):
         assert heavy not in mods, f"{role} imports {heavy}"
 
 

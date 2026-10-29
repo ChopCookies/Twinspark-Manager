@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, "release/**"]
   pull_request:
+  schedule:
+    - cron: "17 5 * * 1"          # Mondays: new releases of the dependencies and new advisories show up here
 
 permissions:
   contents: read
@@ -21,8 +23,8 @@ jobs:
       matrix:
         deps: [minimum, newest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install (${{ matrix.deps }})
@@ -52,11 +54,11 @@ jobs:
     name: GUI tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: node --test tests/*.test.cjs
@@ -69,19 +71,32 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install ruff
       - run: ruff check .
 
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      # what install.sh installs on the Sparks, and the oldest versions pyproject.toml allows
+      - run: pip-audit -r constraints/release.txt --progress-spinner off
+      - run: pip-audit -r constraints/minimum.txt --no-deps --progress-spinner off
+
   catalog:
     name: recipe catalog
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -e .
@@ -94,8 +109,8 @@ jobs:
     name: wheel + install smoke test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build the wheel

@@ -1,7 +1,7 @@
 """Domain schema exports for TwinSpark.
 
 The names below resolve lazily (PEP 562): importing ``twinspark.schemas.config`` on a Spark's agent
-does not build the profile, job and artifact pydantic models as a side effect of this package being
+does not build the profile and job pydantic models as a side effect of this package being
 imported. Those models are the largest part of a TwinSpark process's memory after the framework.
 """
 
@@ -11,7 +11,6 @@ import importlib
 from typing import Any
 
 _EXPORTS = {
-    "artifact": ("ArtifactFile", "ModelArtifact", "SyncJob"),
     "config": ("AgentConfig", "ControllerConfig", "NodeEndpoint", "NodeIdentity", "RuntimeSettings"),
     "enums": ("ActivationStage", "DataClass", "DistributedBackend", "HeadlessMode", "JobState", "MemoryStrategy",
               "NodeRole", "Quantization", "RuntimeAdapter", "Topology", "VerificationStatus"),

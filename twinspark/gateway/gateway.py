@@ -26,6 +26,7 @@ import hashlib
 import itertools
 import math
 import secrets as _secrets
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -201,6 +202,7 @@ class Gateway:
         # TwinSpark's own checks through the in-process gateway (compatibility, smoke): never leaves the process
         self.internal_token = _secrets.token_urlsafe(32)
         self.usage: dict[tuple[str, str, str], dict[str, int]] = {}   # (day, key id, alias) -> counters
+        self._usage_lock = threading.Lock()
         self.last_used: dict[str, float] = {}
         # standalone gateway (state.GatewayLink): every change is published; the process reports back
         self.on_change = None
@@ -365,21 +367,24 @@ class Gateway:
         if key_id in ("internal",):
             return
         day = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
-        row = self.usage.setdefault((day, key_id, alias), {"requests": 0, "prompt_tokens": 0,
-                                                           "completion_tokens": 0, "estimated_requests": 0})
-        row["requests"] += 1
-        row["prompt_tokens"] += max(0, int(prompt))
-        row["completion_tokens"] += max(0, int(completion))
-        row["estimated_requests"] += int(bool(estimated))
-        self.last_used[key_id] = time.time()
+        with self._usage_lock:
+            row = self.usage.setdefault((day, key_id, alias), {"requests": 0, "prompt_tokens": 0,
+                                                               "completion_tokens": 0, "estimated_requests": 0})
+            row["requests"] += 1
+            row["prompt_tokens"] += max(0, int(prompt))
+            row["completion_tokens"] += max(0, int(completion))
+            row["estimated_requests"] += int(bool(estimated))
+            self.last_used[key_id] = time.time()
 
     def take_usage(self) -> dict[str, Any]:
         """Counters since the last call (the controller adds them to its daily totals), and when each key was
-        last used."""
-        rows = [{"day": d, "key_id": k, "alias": a, **v} for (d, k, a), v in self.usage.items()]
-        out = {"rows": rows, "last_used": dict(self.last_used)}
-        self.usage, self.last_used = {}, {}
-        return out
+        last used. Requests end on the event loop while ``GET /usage`` asks from a worker thread: the hand-over
+        is one locked swap, so no request is counted twice or lost."""
+        with self._usage_lock:
+            usage, last_used = self.usage, self.last_used
+            self.usage, self.last_used = {}, {}
+        rows = [{"day": d, "key_id": k, "alias": a, **v} for (d, k, a), v in usage.items()]
+        return {"rows": rows, "last_used": last_used}
 
     # ---- request handling ----------------------------------------------------
 

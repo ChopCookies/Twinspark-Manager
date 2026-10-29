@@ -115,9 +115,9 @@ def _terminal_unit(lay: Layout, enable: bool) -> list[str]:
     notes: list[str] = []
     if enable:
         for path, text in ((unit, installed_terminal_unit(lay)), (sock, installed_terminal_socket(lay))):
-            if not path.exists() or path.read_text() != text:
+            if not path.exists() or path.read_text(encoding="utf-8") != text:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(text)
+                path.write_text(text, encoding="utf-8", newline="\n")
                 path.chmod(0o644)
                 notes.append(f"installed {path}")
         old_link = lay.systemd / "multi-user.target.wants" / f"{UNIT}.service"
@@ -192,7 +192,7 @@ def cmd_remote_plug_token(args) -> None:
     from .security import SecretsVault
 
     if args.from_file:
-        token = Path(args.from_file).read_text().strip()
+        token = Path(args.from_file).read_text(encoding="utf-8").strip()
     elif not sys.stdin.isatty():
         token = sys.stdin.read().strip()
     else:
@@ -216,7 +216,7 @@ def cmd_remote_tailscale_serve(args) -> None:
     doc: Any = None
     if lay.controller_yaml.exists():
         try:
-            doc = yaml.safe_load(lay.controller_yaml.read_text())
+            doc = yaml.safe_load(lay.controller_yaml.read_text(encoding="utf-8"))
         except (OSError, ValueError, yaml.YAMLError) as exc:
             # the management_auth check below needs this file: never forward on a guess
             sys.exit(f"{lay.controller_yaml} is not readable ({type(exc).__name__}) — fix it, or run with sudo")
@@ -765,7 +765,7 @@ def cmd_netboot(args, api=None) -> None:
             print(f"  {i}. {s}")
         if args.out:
             Path(args.out).mkdir(parents=True, exist_ok=True)
-            (Path(args.out) / "dnsmasq-netboot.conf").write_text(plan.config)
+            (Path(args.out) / "dnsmasq-netboot.conf").write_text(plan.config, encoding="utf-8", newline="\n")
             print(f"\nwritten: {Path(args.out) / 'dnsmasq-netboot.conf'}")
         return
     if not hasattr(os, "geteuid"):
