@@ -117,6 +117,47 @@ jobs:
       # the modules listed under [tool.mypy.overrides] in pyproject.toml are not checked yet
       - run: mypy
 
+  systemd:
+    name: install and services on systemd (umask 077, dry-run)
+    # What unit tests cannot show: the real units with their sandboxes (ProtectSystem=strict), the service user,
+    # socket activation, and an install by an operator whose umask is 077. Every check found a real bug in 0.8.0.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: install.sh under umask 077, then unattended single-node setup
+        run: |
+          sudo bash -c 'umask 077 && ./install.sh --yes --single --runtime-mode dry-run --skip-checks \
+            --service-user tsmci --create-user --remote terminal'
+      - name: each unit is up on its own, and stays up
+        run: |
+          units="twinspark-privd twinspark-agent twinspark-controller twinspark-gateway"
+          for u in $units; do
+            for i in $(seq 1 30); do [ "$(systemctl is-active "$u")" = active ] && break; sleep 1; done
+            [ "$(systemctl is-active "$u")" = active ] || { echo "::error::$u is not active"; exit 1; }
+          done
+          [ "$(systemctl is-active twinspark-terminal.socket)" = active ]
+          sleep 15
+          for u in $units; do
+            [ "$(systemctl show -p NRestarts --value "$u")" = 0 ] || { echo "::error::$u restarted"; exit 1; }
+          done
+      - name: the service user can import the program
+        run: sudo -u tsmci /opt/twinspark/venv/bin/python -I -c "import twinspark.cli, twinspark.serve"
+      - name: the API and the gateway answer (the gateway read its keys from its read-only vault)
+        run: |
+          curl -fsS http://127.0.0.1:8443/api/v1/health
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/models)
+          [ "$code" = 401 ] || { echo "::error::the gateway answered $code without a key"; exit 1; }
+          key=$(sudo /opt/twinspark/venv/bin/python -I -c "from twinspark.security import SecretsVault as V; \
+            print(V('/etc/twinspark/secrets').get('inference_api_key'))")
+          curl -fsS -H "Authorization: Bearer $key" http://127.0.0.1:8000/v1/models > /dev/null
+          sudo tsm status
+          sudo tsm update policy
+      - name: the terminal socket listens on its address
+        run: systemctl show -p Listen twinspark-terminal.socket | tee /dev/stderr | grep -q '127.0.0.1:9444'
+      - name: journals
+        if: failure()
+        run: sudo journalctl -u 'twinspark-*' -n 200 --no-pager
+
   windows:
     name: workstation tests (Windows)
     runs-on: windows-latest

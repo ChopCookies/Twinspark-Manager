@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.8.1 — 2026-10-30 — fixes from the first upgrade of two real Sparks to 0.8.0
+
+The upgrade of a two-Spark cluster to 0.8.0 found the problems below. Each one was worked around on site, and
+this release fixes it in the code, with a test that fails without the fix. A new CI job installs and starts
+everything on a real systemd, which is where the first two showed up.
+
+### Fixes
+
+- **The standalone gateway could not start** (`OSError: [Errno 30] Read-only file system:
+  '/etc/twinspark/secrets'`). Every read of the vault created its directory and set its mode, and the gateway's
+  unit (`ProtectSystem=strict`) allows no writes there. Reading now opens an existing vault exactly as it is.
+  Only writes (`tsm init`, setup) create the vault or repair its mode. A vault whose secrets are there but whose
+  master key is missing now says so, instead of quietly making a new key that cannot decrypt them. Tested on a
+  real read-only bind mount. The gateway's sandbox is unchanged. If you added a `ReadWritePaths` drop-in to get
+  the gateway going, remove it ([docs/updating.md](docs/updating.md#coming-from-080)).
+- **Installed mods could not be used by the container.** The mod's directory stayed `0700`, as
+  `tempfile.mkdtemp` makes it. A container user with its capabilities dropped could not enter the read-only
+  mount: `bash ./run.sh: Permission denied`. Mod directories, nested ones included, are `0755` now. A test runs
+  the installed mod as another UID without capabilities.
+- **`tsm mods install` exited 0 when a node had failed**, also `file-patch` and `import-eugr`. Now any node
+  without the mod, or nodes with different content, mean exit status 1 and a message naming the nodes. The API
+  result carries `ok`, `failed` and `hash`. The nodes that succeeded keep the mod, so the same command again
+  finishes the install.
+- **An install under a restrictive umask left code only root could read.** Root's checks passed, then the agent
+  failed with `ModuleNotFoundError: twinspark.cli`.
+  - `install.sh` runs with `umask 022` and makes the program readable for everyone, writable only by root.
+  - The update worker does the same, runs in a unit with `UMask=0022`, and also imports the new version as
+    the services' user before it restarts anything.
+  - `tsm setup` checks, before it starts a service, that the service user can load the program, and names the
+    fix if not.
+- **`tsm setup` checked only that systemd accepted a start.** Now each service must be active and keep the same
+  process for a few seconds. One that restarts in a loop fails setup, with its first useful journal line.
+- **A missing QSFP address could become `ListenStream=None:9444`.** Socket addresses are validated when the
+  unit is rendered. A bad one stops setup with the reason.
+- **"No release published" looked like a connection problem.** `tsm update` and the GUI now tell the cases
+  apart: no release yet (GitHub answered), no release with the workflow's files, GitHub unreachable, and the
+  rate limit.
+
+### Required patches as pinned prerequisites
+
+A recipe's required mod used to be a name plus instructions in prose ("download that file, then …"). A GLM
+preparation pinned everything, then stopped at `mod(s) not installed`. Now:
+
+- **The recipe pins the patch** in `source.mod_artifacts`:
+  - the repository, a full commit, the file and its SHA-256
+  - the path it replaces in the image
+  - the license, and the image it was written for
+
+  The GLM-5.3-Flash DFlash2 recipe carries its SM121 sparse-attention patch this way. The commit and the
+  file's SHA-256 were checked against the upstream repository.
+- **Installing it is one action:** Mods → Install pinned patch, or `tsm mods required PROFILE --install`.
+  - Node A fetches exactly that file and refuses it if the hash differs.
+  - It builds the mod exactly as `tsm mods file-patch` does (the same bytes, so a mod made by hand from the same
+    file matches).
+  - It installs the mod on every node and checks them all. Then the failed preparation can be retried.
+- **A switch or a preparation names the fix** when a pinned patch is missing. It stops when a node has other
+  content under the patch's name. This check runs while the revision resolves, before anything is downloaded.
+- `tsm mods required PROFILE` shows each mod's state: missing on a node, different between the nodes,
+  installed, and the pinned patch or not. GPU behaviour still shows only in a real activation.
+
+### CI
+
+- **install and services on systemd:** `install.sh` under `umask 077`, unattended single-node setup, then the
+  real units. It checks each unit separately and that it stays up. It also checks the service user's imports,
+  the gateway answering from its read-only vault, and the terminal socket's address.
+
 ## 0.8.0 — 2026-10-28 — `tsm update`
 
 Updating TwinSpark used to mean `git pull` and `install.sh` on each node, then restarting the right services

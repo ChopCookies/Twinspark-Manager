@@ -81,7 +81,7 @@ class SelfUpdate:
             raise
         except Exception as exc:  # noqa: BLE001 - offline, DNS, TLS: one readable line
             err = releases.ReleaseError(f"GitHub is not reachable from node {self.own_node}: "
-                                        f"{type(exc).__name__}: {str(exc)[:200]}")
+                                        f"{type(exc).__name__}: {str(exc)[:200]}", "unreachable")
             self._cache[key] = (time.time(), err)
             raise err from exc
         self._cache[key] = (time.time(), out)
@@ -99,11 +99,11 @@ class SelfUpdate:
                 return name, {"enabled": False, "error": msg[:500]}
 
         nodes = dict(await asyncio.gather(*(node(n, a) for n, a in self.ctrl.agents.items())))
-        target, error = None, None
+        target, error, error_kind = None, None, None
         try:
             target = await self.release(allow_prerelease=allow_prerelease, refresh=refresh)
         except releases.ReleaseError as exc:
-            error = str(exc)
+            error, error_kind = str(exc), exc.kind
         problems = []
         for n, p in sorted(nodes.items()):
             if p.get("error"):
@@ -119,7 +119,8 @@ class SelfUpdate:
         latest = target["version"] if target else None
         behind = sorted(k for k, v in versions.items() if latest and (not v or releases.newer(latest, v)))
         return {"versions": versions, "nodes": nodes, "release": releases.summary(__version__, target),
-                "release_error": error, "behind": behind, "available": bool(behind),
+                "release_error": error, "release_state": error_kind or ("published" if target else None),
+                "behind": behind, "available": bool(behind),
                 "ready": not problems and target is not None and not self.blocking(),
                 "problems": problems, "order": self.order(),
                 "dry_run": bool(nodes) and all(p.get("dry_run") for p in nodes.values()),

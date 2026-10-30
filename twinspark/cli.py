@@ -840,40 +840,105 @@ def _pack_dir(path: Path) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _install_mod(api: Api, name: str, b64: str, nodes: Optional[str]) -> None:
-    res = api("POST", "/api/v1/mods", timeout=300,
+def _install_mod(api: Api, name: str, b64: str, nodes: Optional[str]) -> bool:
+    """Install on every node; False (and a message) unless every node has the same content now."""
+    res = api("POST", "/api/v1/mods", timeout=300, ok=(422,),
               json={"name": name, "archive_b64": b64, "nodes": nodes.split(",") if nodes else None})
-    for n, r in res["results"].items():
-        print(f"  {name:40} node {n}: " + (r.get("error") or f"ok {r['hash'][7:19]}"))
-    if not res["consistent"]:
-        print(f"  WARNING: {name} is not identical on every node")
+    if not isinstance(res, dict) or "results" not in res:       # 422: it failed on every node
+        res = {"name": name, "results": {}, "ok": False,
+               "detail": res.get("detail") if isinstance(res, dict) else res}
+    results = res.get("results") or {}
+    if api.as_json:
+        print(json.dumps(res, indent=2))
+    else:
+        for n, r in sorted(results.items()):
+            print(f"  {name:40} node {n}: " + (r.get("error") or f"ok {r['hash'][7:19]}"))
+    hashes = {r.get("hash") for r in results.values() if r.get("hash")}
+    failed = sorted(n for n, r in results.items() if not r.get("hash"))
+    if not results:
+        print(f"  {name}: not installed: {res.get('detail')}", file=sys.stderr)
+        return False
+    if failed:
+        print(f"  {name}: NOT installed on node {', '.join(failed)} — fix the cause and run the same command "
+              f"again (the nodes that have it keep it)", file=sys.stderr)
+        return False
+    if len(hashes) != 1:
+        print(f"  {name}: the nodes ended up with different content — install it again", file=sys.stderr)
+        return False
+    return True
 
 
-_FILE_PATCH_RUN = """#!/usr/bin/env bash
-# TwinSpark mod {name}: replaces one file inside the vLLM image before vLLM starts.
-# Made with `tsm mods file-patch`. target: {target}   sha256: {digest}
-set -euo pipefail
-target={q_target}
-if [ ! -f "$target" ]; then
-  echo "[mod {name}] $target does not exist in this image - is this the image the patch was made for?" >&2
-  exit 1
-fi
-install -m 0644 ./{q_file} "$target"
-if command -v sha256sum >/dev/null 2>&1; then
-  got="$(sha256sum "$target" | cut -d' ' -f1)"
-  if [ "$got" != "{digest}" ]; then
-    echo "[mod {name}] $target has sha256 $got after the copy, expected {digest}" >&2
-    exit 1
-  fi
-fi
-echo "[mod {name}] replaced $target (sha256 {short})"
-"""
+
+_MOD_STATE = {"missing": "MISSING", "inconsistent": "DIFFERS between nodes", "installed": "installed"}
+
+
+def _print_required(st: dict) -> None:
+    if not st["mods"]:
+        print(f"{st['profile']} needs no mods")
+    for m in st["mods"]:
+        nodes = " ".join(f"{n}:{'✓' if v['present'] else '-'}" for n, v in sorted(m["nodes"].items()))
+        pin = {True: "  = the recipe's pinned patch", False: "  ≠ NOT the recipe's pinned patch",
+               None: ""}[m["matches_recipe"]]
+        print(f"{m['name']:40} {nodes}  {_MOD_STATE.get(m['state'], m['state'])}{pin}")
+        a = m.get("artifact")
+        if a:
+            print(f"    pinned: {a['repo']}@{a['commit'][:12]} {a['path']}  sha256 {a['sha256'][:16]}…  "
+                  f"({a.get('license')})")
+            print(f"    review: {a['review_url']}")
+        elif m["state"] != "installed":
+            print("    the recipe does not pin this patch: install it by hand (tsm mods install / file-patch)")
+    for n, e in st.get("errors", {}).items():
+        print(f"  node {n}: {e}")
+    if st.get("artifact_error"):
+        print(f"  the recipe's mod_artifacts are invalid: {st['artifact_error']}")
+
+
+def cmd_mods_required(args, api: Api) -> None:
+    """`tsm mods required PROFILE [--install [MOD]]`: what the profile needs, and the recipe's pinned patches."""
+    if not args.path:
+        sys.exit("usage: tsm mods required PROFILE [--install [MOD]] [--yes]")
+    st = api("GET", f"/api/v1/profiles/{args.path}/prerequisites")
+    if _out(api, st) and not args.install:
+        return
+    if not api.as_json:
+        _print_required(st)
+    if not args.install:
+        if not st["ready"]:
+            sys.exit(1)
+        return
+    todo = [m for m in st["mods"] if m.get("installable") and (
+        m["name"] == args.install if args.install != "*" else (m["state"] != "installed" or not m["matches_recipe"]))]
+    if args.install != "*" and not todo:
+        sys.exit(f"{args.install}: not a mod of {args.path} with a pinned patch")
+    if not todo:
+        print("nothing to install")
+        return
+    if not args.yes:
+        if not sys.stdin.isatty():
+            sys.exit("not confirmed (add --yes when running without a terminal)")
+        names = ", ".join(m["name"] for m in todo)
+        if not input(f"Fetch {names} from the pinned commit(s), check the SHA-256 and install on every node? [y/N] "
+                     ).strip().lower().startswith("y"):
+            sys.exit("cancelled")
+    failed = []
+    for m in todo:
+        res = api("POST", f"/api/v1/profiles/{args.path}/prerequisites/install", timeout=600,
+                  json={"mod": m["name"], "confirm": "INSTALL PINNED PATCH"})
+        ok = res["install"].get("ok") and res["mod"]["matches_recipe"] is not False
+        print(f"{m['name']:40} " + ("installed on " + ", ".join(sorted(res["install"]["results"])) if ok else
+                                    "NOT installed everywhere: " + "; ".join(
+                                        f"{n}: {r.get('error')}" for n, r in res["install"]["results"].items()
+                                        if r.get("error"))))
+        if not ok:
+            failed.append(m["name"])
+    if failed:
+        sys.exit(1)
+    print("done — retry the preparation or switch (tsm job <id> shows the failed one; the GUI has Retry)")
 
 
 def file_patch_mod(name: str, source: Path, target: str, out: Path) -> Path:
     """Write a mod directory that copies ``source`` over ``target`` inside the container."""
     import hashlib
-    import shlex
 
     from .agent.mods import MOD_RE
     if not MOD_RE.match(name):
@@ -891,9 +956,8 @@ def file_patch_mod(name: str, source: Path, target: str, out: Path) -> Path:
     (d / source.name).write_bytes(data)
     run = d / "run.sh"
     # newline="\n": written on a Windows workstation, a CRLF run.sh fails on the Spark ("bash\r").
-    run.write_text(_FILE_PATCH_RUN.format(name=name, target=target, digest=digest, short=digest[:12],
-                                          q_target=shlex.quote(target), q_file=shlex.quote(source.name)),
-                   encoding="utf-8", newline="\n")
+    from .mod_artifacts import file_patch_run_sh
+    run.write_text(file_patch_run_sh(name, target, digest, source.name), encoding="utf-8", newline="\n")
     run.chmod(0o755)
     return d
 
@@ -909,7 +973,8 @@ def cmd_mods(args, api: Api):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             d = file_patch_mod(args.path, Path(args.file).expanduser(), args.target, Path(tmp))
-            _install_mod(api, args.path, _pack_dir(d), args.nodes)
+            if not _install_mod(api, args.path, _pack_dir(d), args.nodes):
+                sys.exit(1)
         return
     if args.action == "ls":
         data = api("GET", "/api/v1/mods")
@@ -932,7 +997,8 @@ def cmd_mods(args, api: Api):
         else:
             b64 = base64.b64encode(src.read_bytes()).decode()
             name = args.name or src.name.split(".")[0]
-        _install_mod(api, name, b64, args.nodes)
+        if not _install_mod(api, name, b64, args.nodes):
+            sys.exit(1)
     elif args.action == "import-eugr":
         root = Path(args.path).expanduser()
         if (root / "mods").is_dir():
@@ -942,8 +1008,11 @@ def cmd_mods(args, api: Api):
                 and (only is None or d.name in only)]
         if not dirs:
             sys.exit(f"no mod directories with a run.sh under {root}")
-        for d in dirs:
-            _install_mod(api, d.name, _pack_dir(d), args.nodes)
+        bad = [d.name for d in dirs if not _install_mod(api, d.name, _pack_dir(d), args.nodes)]
+        if bad:
+            sys.exit(f"not installed everywhere: {', '.join(bad)}")
+    elif args.action == "required":
+        cmd_mods_required(args, api)
     elif args.action == "rm":
         res = api("DELETE", f"/api/v1/mods/{args.path}")
         print(f"removed {args.path}" + (f" (still referenced by {', '.join(res['used_by'])})"
@@ -1340,8 +1409,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-wait", action="store_true")
 
     s = cmd("mods", cmd_mods, "vLLM patch mods (eugr format: a directory with run.sh)")
-    s.add_argument("action", choices=["ls", "install", "import-eugr", "file-patch", "rm"])
-    s.add_argument("path", nargs="?", help="mod dir/zip/tar, spark-vllm-docker checkout, or mod name")
+    s.add_argument("action", choices=["ls", "install", "import-eugr", "file-patch", "rm", "required"])
+    s.add_argument("path", nargs="?", help="mod dir/zip/tar, spark-vllm-docker checkout, mod name, or (required) "
+                                           "a profile")
+    s.add_argument("--install", nargs="?", const="*", metavar="MOD",
+                   help="required: install the recipe's pinned patch(es) on every node (all missing ones, or MOD)")
+    s.add_argument("--yes", "-y", action="store_true", help="required --install: do not ask")
     s.add_argument("--name")
     s.add_argument("--only", help="import-eugr: comma-separated mod names")
     s.add_argument("--nodes")

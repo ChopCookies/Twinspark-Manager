@@ -37,6 +37,7 @@ python -m venv .venv
 | alert rules (promtool) | `promtool check rules` and `promtool test rules` for `deploy/observability/` |
 | dependency advisories | `pip-audit` on `constraints/release.txt` and `constraints/minimum.txt` |
 | wheel + install smoke test | builds the wheel, installs it with `constraints/release.txt` in a clean venv and starts the demo cluster from it |
+| install and services on systemd | `install.sh` under `umask 077`, unattended single-node setup in dry-run, then the real units with their sandboxes. Each unit must be active and stay up. The service user must import the program, the gateway must answer from its read-only vault, and the terminal socket must listen on its address |
 
 The newest-dependency test job runs under `coverage`. The report is the job's summary, the HTML is an artifact,
 and the job fails below `fail_under` in `pyproject.toml` (80 %). What stays uncovered is mostly code that

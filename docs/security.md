@@ -31,11 +31,16 @@ is not in `ALLOWED_AGENT_ACTIONS`, and the agent refuses anything it does not im
 - Recipe/cookbook downloads accept only public `https://` URLs (private, loopback, link-local and
   metadata addresses are refused, including after redirects).
 - Mods are untrusted archives: bounded, link-free, installed atomically. A mod's `run.sh` does run
-  inside the container, so install mods you have read.
+  inside the container, so install mods you have read. A recipe's pinned patch
+  (`source.mod_artifacts`) names one file at a full commit with its SHA-256. Node A fetches exactly that
+  file, refuses any other content, and installs it only after you confirm. Review the file at the commit
+  link it shows.
 - Every state-changing call is written to the audit log with the actor.
 - Secrets are encrypted at rest (Fernet), but the key (`.master.key`) lives in the same directory: what
   actually protects them is that the directory is 0700 and its files 0600, owned by the service user.
   Commands run with `sudo` write vault files owned by that user, so the services can still read them.
+  Reading the vault never writes. The standalone gateway reads it under `ProtectSystem=strict`, and a vault
+  whose master key is missing is an error, not a reason to make a new key.
 - With `management_auth: none` (allowed only on a loopback listener) the API answers only requests for
   `localhost` / `127.x` / `[::1]`, so a web page cannot reach it through DNS rebinding.
 - Gateway request bodies are capped at 32 MiB; management API bodies at 4 MiB (mod uploads 100 MiB).

@@ -30,8 +30,8 @@
       "files": [
         {
           "path": "twinspark/cookbook/recipes/glm-5.3-flash-nvfp4-dflash2-tp2.json",
-          "sha256": "2217c8f1e88a3a9ed6d19c98685b8c947aaf50cf3145f2d1981f55a112587e0c",
-          "size": 5714
+          "sha256": "24b871ae834010ea0588d25100efa8a338e77be1511ace6689f223ff6a944ae0",
+          "size": 6461
         }
       ],
       "min_twinspark": "0.7.0",
@@ -121,5 +121,5 @@
       "verification": "verified"
     }
   ],
-  "twinspark_version": "0.8.0"
+  "twinspark_version": "0.8.1"
 }

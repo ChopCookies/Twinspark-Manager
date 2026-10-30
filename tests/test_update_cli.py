@@ -243,7 +243,7 @@ def test_install_sh_writes_the_update_policy_once(tmp_path):
     f.write_text('{"enabled": false}\n')
     subprocess.run([bash, "-c", script], env=env, check=True)
     assert json.loads(f.read_text()) == {"enabled": False}           # the operator's choice stays
-    assert "write_update_policy\n" in source.split("chmod -R go-w \"$TSM_HOME\"", 1)[1][:40]
+    assert "write_update_policy\n" in source.split('chmod -R u+rwX,go+rX,go-w "$TSM_HOME"', 1)[1][:40]
 
 
 # ---- the client's own notice -----------------------------------------------------------------------------

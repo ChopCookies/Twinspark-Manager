@@ -744,3 +744,40 @@ test("the Updates page shows TwinSpark versions, problems and progress, escaped"
   assert.match(done, /Both Sparks run TwinSpark 0\.8\.1/);
   assert.match(done, /data-act="tsm-reload"/);
 });
+
+test("the Mods page offers a recipe's pinned patch and shows what it is before installing", () => {
+  const c = client();
+  const html = c.run(`missingModsHtml([{name: "glm53-sm121-sparse-attn", profiles: ["glm-a"], pinned_by: ["glm-a"]},
+                                        {name: "hand<made>", profiles: ["x"], pinned_by: []}])`);
+  assert.match(html, /data-act="pinned" data-name="glm53-sm121-sparse-attn" data-profile="glm-a"/);
+  assert.match(html, /Install pinned patch/);
+  assert.match(html, /import-eugr ~\/spark-vllm-docker --only hand&lt;made&gt;/);     // only the unpinned one
+  assert.doesNotMatch(html, /--only glm53/);
+  const commit = "e6dcb04852aa469ad7b17c7156cabeae0f46f497";
+  const view = c.run(`pinnedPatchHtml({name: "fix", state: "missing", matches_recipe: null,
+    nodes: {A: {present: true, hash: "sha256:abcdef0123456789", matches_recipe: false}, B: {present: false}},
+    artifact: {repo: "owner/repo", commit: "${commit}", path: "docker/x.py", sha256: "${"8".repeat(64)}",
+      target: "/usr/lib/x.py", license: "Apache-2.0", why: "<b>long</b> decodes",
+      review_url: "https://github.com/owner/repo/blob/${commit}/docker/x.py"}})`);
+  assert.match(view, /owner\/repo @ e6dcb04852aa/);
+  assert.match(view, /Apache-2\.0/);
+  assert.match(view, /&lt;b&gt;long&lt;\/b&gt;/);
+  assert.match(view, /href="https:\/\/github\.com\/owner\/repo\/blob\/e6dcb/);
+  assert.match(view, /missing on a node/);
+  assert.match(view, /Node A: abcdef01 — other content · Node B: missing/);
+  const unsafe = c.run(`pinnedPatchHtml({name: "f", state: "installed", nodes: {}, artifact: {review_url: "javascript:alert(1)"}})`);
+  assert.doesNotMatch(unsafe, /javascript:/);                          // only a pinned GitHub blob link is shown
+});
+
+test("no published release is information, not a connection error", () => {
+  const c = client();
+  const none = c.run(`tsmUpdateHtml({versions: {A: "0.8.0", B: "0.8.0"}, behind: [], release: {}, problems: [], order: ["B", "A"], note: "n",
+    release_state: "none-published", release_error: "no TwinSpark release is published on GitHub yet"}, null)`);
+  assert.match(none, /callout info/);
+  assert.match(none, /No release published yet/);
+  assert.doesNotMatch(none, /callout warn/);
+  const down = c.run(`tsmUpdateHtml({versions: {A: "0.8.0"}, behind: [], release: {}, problems: [], order: ["A"], note: "n",
+    release_state: "unreachable", release_error: "GitHub is not reachable from node A: <ConnectError>"}, null)`);
+  assert.match(down, /callout warn/);
+  assert.match(down, /&lt;ConnectError&gt;/);
+});
