@@ -13,6 +13,7 @@ Nothing here changes network configuration. It never runs ``netplan``, ``ip`` or
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -461,6 +462,20 @@ TasksMax=1024
 """
 
 
+def listen_stream(host: Any, port: Any) -> str:
+    """A ``ListenStream=`` value, or SetupError. A missing QSFP address must not become ``None:9444``."""
+    text = str(host or "").strip()
+    try:
+        ip = ipaddress.ip_address(text)
+        port = int(port)
+    except (ValueError, TypeError):
+        raise SetupError(f"the terminal socket has no valid address ({text or 'empty'}:{port}) — on node B this is "
+                         f"its QSFP address: set it (--qsfp-ip) or check agent.yaml's listener") from None
+    if not 0 < port < 65536:
+        raise SetupError(f"the terminal port {port} is out of range")
+    return f"[{ip}]:{port}" if ip.version == 6 else f"{ip}:{port}"
+
+
 def terminal_listen_address(lay: Layout) -> str:
     """``ListenStream=`` value: the agent's address (loopback on A, QSFP on B) and the terminal port."""
     host, port = "127.0.0.1", 9444
@@ -469,13 +484,12 @@ def terminal_listen_address(lay: Layout) -> str:
         host, port = cfg.listener.bind or host, cfg.remote_mgmt.terminal_port
     except Exception:  # noqa: BLE001 - a fresh install renders units before the config exists
         pass
-    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    return listen_stream(host, port)
 
 
 def render_terminal_socket(a: Answers, lay: Layout) -> str:
     if isinstance(a, Answers):
-        host = agent_bind(a)
-        listen = f"[{host}]:{a.terminal_port}" if ":" in host else f"{host}:{a.terminal_port}"
+        listen = listen_stream(agent_bind(a), a.terminal_port)
     else:                                   # an installed node: read the address from its agent.yaml
         listen = terminal_listen_address(lay)
     return f"""[Unit]
@@ -853,9 +867,14 @@ class Provisioner:
         if self.dry:
             self._step("services", "planned", "systemctl enable --now " + " ".join(unit_names))
             return
+        unreadable = self._program_unreadable()
+        if unreadable:
+            self._step("services", "failed", unreadable)
+            return
         self.run(["systemctl", "daemon-reload"])
         failed = []
         on_demand = {u[:-len(".socket")] + ".service" for u in unit_names if u.endswith(".socket")}
+        started = []
         for u in unit_names:
             if u in on_demand:
                 # socket-activated: its socket starts it. A 0.5.x install ran it always-on, so drop that
@@ -868,10 +887,61 @@ class Provisioner:
             rc, out = self.run(["systemctl", "enable", "--now", u])
             if rc == 0:
                 self.run(["systemctl", "restart", u])      # pick up changed config
+                started.append(u)
             else:
                 failed.append(f"{u}: {out[-200:]}")
+        # `enable --now` returning 0 only means systemd accepted the job: each unit must also stay up
+        for u in started:
+            problem = self._unit_problem(u)
+            if problem:
+                failed.append(problem)
         self._step("services", "failed" if failed else "done",
                    "; ".join(failed) if failed else "enabled and started: " + ", ".join(unit_names))
+
+    UNIT_SETTLE_S = 5.0
+    UNIT_TIMEOUT_S = 40.0
+
+    def _program_unreadable(self) -> Optional[str]:
+        """The services import the program as the service user: check that before starting them."""
+        python = Path(self.lay.tsm_bin).parent / "python"
+        user = self.a.service_user
+        if not python.exists() or user == "root" or not shutil.which("runuser"):
+            return None
+        rc, out = self.run(["runuser", "-u", user, "--", str(python), "-I", "-c",
+                            "import twinspark.cli, twinspark.serve"])
+        if rc == 0:
+            return None
+        home = python.parent.parent.parent
+        return (f"the service user {user} cannot load the program in {home} ({out.strip()[-200:]}). Usually an "
+                f"install under a restrictive umask: sudo chmod -R u+rwX,go+rX,go-w {home}, then run setup again")
+
+    def _unit_problem(self, unit: str) -> Optional[str]:
+        """None once ``unit`` is active and running with the same PID for UNIT_SETTLE_S; else why not, with the
+        unit's last journal lines. A unit that restarts in a loop never passes."""
+        deadline, since, pid, last = time.monotonic() + self.UNIT_TIMEOUT_S, None, None, {}
+        while time.monotonic() < deadline:
+            rc, out = self.run(["systemctl", "show", unit, "-p", "ActiveState", "-p", "SubState",
+                                "-p", "MainPID", "-p", "Type"])
+            last = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+            if "ActiveState" not in last:
+                return None                              # cannot tell (not systemd); never block setup on it
+            if last.get("Type") == "oneshot" and last["ActiveState"] in ("active", "inactive"):
+                return None
+            running = last["ActiveState"] == "active" and last.get("SubState") == "running"
+            if running and last.get("MainPID") == pid and since is not None:
+                if time.monotonic() - since >= self.UNIT_SETTLE_S:
+                    return None
+            elif running:
+                pid, since = last.get("MainPID"), time.monotonic()
+            else:
+                pid, since = None, None
+            time.sleep(1.0)
+        _rc, journal = self.run(["journalctl", "-u", unit, "-n", "15", "--no-pager", "-o", "cat"])
+        lines = [ln for ln in journal.splitlines() if ln.strip()]
+        signs = ("Error", "error", "Traceback", "denied", "Read-only", "failed")
+        first = next((ln for ln in lines if any(w in ln for w in signs)), lines[-1] if lines else "")
+        return (f"{unit} did not stay up ({last.get('ActiveState')}/{last.get('SubState')})"
+                + (f": {first.strip()[:240]}" if first else "") + f" — journalctl -u {unit}")
 
     def apply(self) -> list[Step]:
         self.a.validate()

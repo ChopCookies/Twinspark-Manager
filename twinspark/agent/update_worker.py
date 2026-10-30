@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -79,6 +80,20 @@ def run(argv: list[str], timeout: float = 120) -> str:
         raise RuntimeError(f"{os.path.basename(argv[0])} {' '.join(argv[1:3])} failed ({p.returncode}): "
                            f"{(p.stderr or p.stdout)[-1500:]}")
     return p.stdout
+
+
+def readable(top: str) -> None:
+    """``chmod -R u+rwX,go+rX,go-w``: the program is read by the service user, written only by root."""
+    for root, dirs, files in os.walk(top):
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            mode = stat.S_IMODE(st.st_mode)
+            want = (mode | 0o644 | (0o111 if stat.S_ISDIR(st.st_mode) or mode & 0o100 else 0)) & ~0o022
+            if want != mode:
+                os.chmod(path, want)
 
 
 class Worker:
@@ -158,6 +173,8 @@ class Worker:
         self.run([*pip, "--upgrade", "-c", paths["constraints"], f"{paths['wheel']}[hf]"], timeout=1800)
         # the same version again (a repair) still replaces the program files
         self.run([*pip, "--force-reinstall", "--no-deps", paths["wheel"]], timeout=600)
+        readable(self.venv)
+
 
     def verify(self) -> None:
         want = self.state["target"]["version"]
@@ -166,6 +183,11 @@ class Worker:
                        timeout=120).strip().splitlines()[-1:]
         if got != [want]:
             raise RuntimeError(f"the new environment reports version {got[0] if got else '?'}, expected {want}")
+        user = self.state.get("service_user")
+        if user and user != "root":
+            # the agent and the controller import it as their own user: root's import above proves less
+            self.run(["runuser", "-u", user, "--", self.py(), "-I", "-c", "import twinspark.cli, twinspark.serve"],
+                     timeout=120)
 
     def rollback(self, rollback: str, reason: str) -> None:
         failed = f"{self.venv}.failed-{self.state['run_id'][:12]}"
@@ -183,6 +205,7 @@ class Worker:
     def main(self) -> dict:
         if self.state.get("state") != "queued":
             raise RuntimeError("the worker only starts a newly queued run")
+        os.umask(0o022)                    # pip's new files must be readable by the service user
         rollback = None
         try:
             self.phase("download")

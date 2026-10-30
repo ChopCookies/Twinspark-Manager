@@ -84,10 +84,23 @@
     "requirements": [
       "Everything from glm-5.3-flash-nvfp4-tp2, plus the drafter repo incoai/GLM-5.3-Flash-DFlash2 on both nodes (staged automatically; Pin pins its commit and injects it into speculative_config).",
       "Image ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 — the author's launcher was written for digest sha256:4def0ef644cb…85a6; Pin resolves the tag and warns when it no longer points at that digest.",
-      "Required patch, checked before every activation: mod glm53-sm121-sparse-attn on both nodes. The launcher mounts docker/sparse_attn_indexer_kpool_sm121.py from the recipe repo over the image's vllm/model_executor/layers/sparse_attn_indexer_kpool.py; without it the engine dies on decodes past ~24K context. Download that file, then: tsm mods file-patch glm53-sm121-sparse-attn --file sparse_attn_indexer_kpool_sm121.py --target /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py",
+      "Required patch, checked before every activation: mod glm53-sm121-sparse-attn on both nodes. The launcher mounts docker/sparse_attn_indexer_kpool_sm121.py from the recipe repo over the image's vllm/model_executor/layers/sparse_attn_indexer_kpool.py; without it the engine dies on decodes past ~24K context. The recipe pins that file (commit e6dcb048, SHA-256 8a3ecfb0…): TwinSpark installs it on both nodes — Mods → Install pinned patch, or `tsm mods required <profile> --install`.",
       "vm.swappiness=0 on both nodes (the author calls it mandatory for GB10 unified memory; keep swap on). `tsm doctor` shows the persistent setting.",
       "Headless nodes: at ~0.85 of 121 GiB per node the margin is a few GiB, and a desktop session takes part of it."
     ],
+    "mod_artifacts": {
+      "glm53-sm121-sparse-attn": {
+        "kind": "file-patch",
+        "repo": "seanlinmt/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark",
+        "commit": "e6dcb04852aa469ad7b17c7156cabeae0f46f497",
+        "path": "docker/sparse_attn_indexer_kpool_sm121.py",
+        "sha256": "8a3ecfb0bab2441dd7417ed00a10d142191496149f88e5fe79fcfaea4b160980",
+        "target": "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py",
+        "license": "Apache-2.0",
+        "image": "ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef644cb2e9814136dcffd5e385e21bc594f48f3b292234051904abe85a6",
+        "why": "SM121 top-k fix for the sparse-attention indexer: without it the engine dies on decodes past ~24K context"
+      }
+    },
     "notes": [
       "Settings follow the author's DFlash2 launcher: max-num-batched-tokens 8192 (a larger prefill batch raises the startup memory peak), kv-cache-dtype fp8_e4m3, block size 2304, eager, marlin MoE, VLLM_ENGINE_READY_TIMEOUT_S=3600 for the ~15 min boot (TwinSpark's own health wait is runtime.health_timeout_s; `tsm plan` shows both).",
       "Not copied from the launcher: its NIC names, addresses and NCCL_IB_HCA (TwinSpark sets those from controller.yaml), and its chat template / reasoning parser glm45 with thinking off by default — this profile keeps deepseek_r1 and thinking on; change behaviour.reasoning_parser if your clients expect glm45.",

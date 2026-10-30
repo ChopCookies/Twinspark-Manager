@@ -36,7 +36,15 @@ _PRE_RANK = {"a": 0, "b": 1, "rc": 2}
 
 
 class ReleaseError(RuntimeError):
-    """No usable release, or a download that is not the published file."""
+    """No usable release, or a download that is not the published file.
+
+    ``kind`` tells the cases apart for the GUI and the CLI: ``none-published`` (GitHub answered, there is simply
+    no release yet: nothing is wrong here), ``unreachable`` (network, DNS, TLS), ``rate-limited``, ``invalid``
+    (a release or a download that is not what the release workflow publishes) and ``error``."""
+
+    def __init__(self, message: str, kind: str = "invalid"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def parse_version(text: str) -> Optional[tuple[int, int, int, int, int]]:
@@ -126,13 +134,18 @@ def choose(releases: list[Release], version: Optional[str] = None, allow_prerele
             if r.version == want:
                 _require_assets(r)
                 return r
-        raise ReleaseError(f"there is no release {want} on GitHub ({REPO})")
+        raise ReleaseError(f"there is no release {want} on GitHub ({REPO})", "none-published")
     for r in releases:
         if r.prerelease and not allow_prerelease:
             continue
         if r.wheel in r.assets and SUMS in r.assets:
             return r
-    raise ReleaseError(f"no release with installable files on GitHub ({REPO}) yet")
+    if not releases:
+        raise ReleaseError(f"no TwinSpark release is published on GitHub ({REPO}) yet — GitHub answered, so this is "
+                           f"not a connection problem; releases appear when a vX.Y.Z tag is pushed", "none-published")
+    raise ReleaseError(f"none of the {len(releases)} release(s) on GitHub ({REPO}) has the files `tsm update` "
+                       f"installs (made by the release workflow)" + ("" if allow_prerelease else
+                                                                     " — or only pre-releases do"), "none-published")
 
 
 def _require_assets(r: Release) -> None:
@@ -221,9 +234,10 @@ async def latest_async(client, *, version: Optional[str] = None, allow_prereleas
 
 def _raise_for(r) -> None:
     if r.status_code == 403 and r.headers.get("x-ratelimit-remaining") == "0":
-        raise ReleaseError("GitHub's rate limit for unauthenticated requests is used up; try again in an hour")
+        raise ReleaseError("GitHub's rate limit for unauthenticated requests is used up; try again in an hour",
+                           "rate-limited")
     if r.status_code >= 400:
-        raise ReleaseError(f"GitHub answered {r.status_code} for {r.request.url}")
+        raise ReleaseError(f"GitHub answered {r.status_code} for {r.request.url}", "error")
 
 
 def summary(current: str, target: Optional[dict[str, Any]]) -> dict[str, Any]:

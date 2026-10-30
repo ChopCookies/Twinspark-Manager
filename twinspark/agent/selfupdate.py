@@ -92,6 +92,12 @@ def running_units() -> list[str]:
     return [u for u in UNITS if _systemctl("is-active", u).stdout.strip() == "active"]
 
 
+def service_user() -> str | None:
+    """The user the agent runs as: the update checks that it can import the new version."""
+    user = _systemctl("show", "-p", "User", "--value", "twinspark-agent.service").stdout.strip()
+    return user if re.fullmatch(r"[a-z_][a-z0-9_.-]{0,31}", user or "") else None
+
+
 def _dir_bytes(path: Path) -> int:
     total = 0
     for root, _dirs, files in os.walk(path):
@@ -203,13 +209,14 @@ def start(params: dict) -> dict:
                                f"version; {free // 2**20} MiB are")
         python = base_python()
         state = {"run_id": rid, "state": "queued", "phase": "queued", "target": target, "venv": str(venv),
-                 "from_version": installed_version(venv), "units": running_units(), "started_at": time.time()}
+                 "from_version": installed_version(venv), "units": running_units(), "service_user": service_user(),
+                 "started_at": time.time()}
         _save(state)
         worker = ROOT / rid / "worker.py"
         shutil.copyfile(Path(__file__).with_name("update_worker.py"), worker)
         os.chmod(worker, 0o600)
         p_run = subprocess.run(
-            ["/usr/bin/systemd-run", f"--unit=twinspark-update-{rid}", "--collect",
+            ["/usr/bin/systemd-run", f"--unit=twinspark-update-{rid}", "--collect", "--property=UMask=0022",
              "--description=TwinSpark update", python, "-I", "-S", str(worker), str(ROOT / rid)],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
         if p_run.returncode != 0:

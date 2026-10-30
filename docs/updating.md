@@ -28,6 +28,21 @@ sudo systemctl restart twinspark-gateway      # node A, only with gateway_mode: 
 This also writes `/etc/twinspark/update-policy.json` (see below). Every later version comes through
 `tsm update`. Until then, `tsm update` and the GUI name each node that still runs an older version.
 
+## Coming from 0.8.0
+
+- If you added a drop-in so that the standalone gateway could start (`ReadWritePaths=/etc/twinspark/secrets` in
+  `/etc/systemd/system/twinspark-gateway.service.d/`), remove it after the update. 0.8.1 reads the vault
+  without writing to it, and the gateway starts with its original sandbox:
+
+  ```bash
+  sudo rm /etc/systemd/system/twinspark-gateway.service.d/10-vault-compat.conf   # the file you added
+  sudo systemctl daemon-reload && sudo systemctl restart twinspark-gateway
+  systemctl is-active twinspark-gateway
+  ```
+
+- A mod directory that a container could not enter (mode 0700) is fixed by installing the mod again.
+  For a recipe's pinned patch, run `tsm mods required <profile> --install`.
+
 ## What happens on the Sparks
 
 `tsm update sparks` asks node A's controller, which works through the nodes one at a time: **node B first,
@@ -40,7 +55,9 @@ node A last**. For each node:
 2. **Backup.** The program environment `/opt/twinspark/venv` is copied to `venv.rollback`.
 3. **Install.** `pip install --upgrade -c constraints-release.txt <wheel>[hf]` installs the dependency
    versions that release was tested with.
-4. **Verify.** The new environment must import and report the target version.
+4. **Verify.** The new environment must import and report the target version, as root and as the services'
+   own user. The install runs with `umask 022`, and program files are made readable for the services, so an
+   operator's restrictive umask cannot leave code only root can read.
 5. **Restart.** The TwinSpark services that were running are restarted: privd, the agent, and on node A the
    gateway (standalone mode) and the controller last. Each must stay up for 20 seconds.
 

@@ -28,7 +28,8 @@ def test_dflash2_matches_the_cited_launcher():
     assert a.mods == ["glm53-sm121-sparse-attn"]                      # the SM121 top-k fix is required
     assert not any(k in a.env for k in ("NCCL_IB_HCA", "NCCL_SOCKET_IFNAME", "VLLM_HOST_IP"))   # node wiring
     req = " ".join(d.source["requirements"])
-    assert "tsm mods file-patch glm53-sm121-sparse-attn" in req and TARGET in req and "swappiness=0" in req
+    assert "glm53-sm121-sparse-attn" in req and "tsm mods required" in req and "swappiness=0" in req
+    assert d.source["mod_artifacts"]["glm53-sm121-sparse-attn"]["target"] == TARGET   # pinned, not prose
 
 
 async def test_the_plan_names_the_patch_and_both_startup_limits(cluster):
