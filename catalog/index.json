@@ -89,9 +89,27 @@
       "engine": "vllm",
       "files": [
         {
+          "path": "twinspark/cookbook/recipes/qwen3.8-flash-next-nvfp4-tp2-vllm030.json",
+          "sha256": "15044fccdb998f08b7abc89a553b5a1ee5d4f03a0941c8c4baa04791aa17c55b",
+          "size": 4434
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "modes": [],
+      "name": "qwen3.8-flash-next-nvfp4-tp2-vllm030",
+      "title": "Qwen3.8-Flash-Next NVFP4 — stock vLLM 0.30, TP2+EP, MTP3",
+      "topology": "tp-ep",
+      "verification": "experimental"
+    },
+    {
+      "default_mode": null,
+      "engine": "vllm",
+      "files": [
+        {
           "path": "twinspark/cookbook/recipes/qwen3.8-flash-next-nvfp4-tp2.json",
-          "sha256": "cc8b79f4954ef024242a93b8f7db0e02f1a730992ac8baf0f808087261005c8e",
-          "size": 1928
+          "sha256": "a420044267fafed07ea816ae83a307950b51a79a445f77504a382f469e5b05f5",
+          "size": 2309
         }
       ],
       "min_twinspark": "0.7.0",

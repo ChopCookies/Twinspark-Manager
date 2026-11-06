@@ -60,6 +60,17 @@ preparation pinned everything, then stopped at `mod(s) not installed`. Now:
 - `tsm mods required PROFILE` shows each mod's state: missing on a node, different between the nodes,
   installed, and the pinned patch or not. GPU behaviour still shows only in a real activation.
 
+### Recipes
+
+- **`qwen3.8-flash-next-nvfp4-tp2-vllm030`:** Qwen3.8-Flash-Next NVFP4 at TP2 + expert parallel with MTP3 on the
+  stock `vllm/vllm-openai:v0.30.0` image, no patches and no custom image. It takes the flags and
+  measurements of Mia's AI Lab's vLLM 0.30 lane. The source measured 52.5 tok/s for one stream and a
+  1.47M-token BF16 KV pool.
+- **`qwen3.8-flash-next-nvfp4-tp2`:** `gpu-memory-utilization` 0.80 instead of 0.85. At 0.835 the same model
+  left both nodes under 1 GiB `MemAvailable` under load, where GB10 boxes hard-reset.
+- [docs/notes/mia-ai-lab.md](docs/notes/mia-ai-lab.md): Mia's AI Lab's other two-Spark kits, and what
+  each one needs before it can become a recipe: SGLang patches, Engram tables, or a TensorFold engine.
+
 ### CI
 
 - **install and services on systemd:** `install.sh` under `umask 077`, unattended single-node setup, then the
