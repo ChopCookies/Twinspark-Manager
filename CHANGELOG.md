@@ -60,6 +60,29 @@ preparation pinned everything, then stopped at `mod(s) not installed`. Now:
 - `tsm mods required PROFILE` shows each mod's state: missing on a node, different between the nodes,
   installed, and the pinned patch or not. GPU behaviour still shows only in a real activation.
 
+### Kits: set-ups that run with their author's own scripts
+
+Mia's AI Lab's fastest two-Spark set-ups run on TensorFold, their own Zig engine. They change almost daily.
+A kit runs them with the author's own scripts instead of a frozen port:
+
+- **`tsm kit get` / `update` / `prepare`** clone the author's repository, pull it, and run its one-time
+  set-up. TwinSpark's model keeps serving meanwhile.
+- **`sudo tsm kit start <kit>`** stops TwinSpark's model on both Sparks. It then runs the kit's `start.sh`
+  as you, never as root, bound to `127.0.0.1`. TwinSpark's gateway forwards the kit's aliases to it, so apps
+  keep TwinSpark's endpoint and keys. The kit's server never receives TwinSpark's backend key.
+- **Hand-back:** `tsm kit stop`, Stop in the GUI, `tsm stop` and a switch to a profile all stop the kit's
+  containers on both Sparks. A switch whose kit containers cannot be stopped fails before anything starts.
+- **Watching:** the dashboard shows a serving kit. The watchdog marks its aliases down while it does not
+  answer. A restarted controller routes it again.
+- **Two kits:**
+  - `mia-deepseek-v4.1-flash-1017`: DeepSeek V4.1 Flash 1017, EXL3 2.9 bpw. The source measured 80.7 tok/s
+    for one request.
+  - `mia-qwen3.8-flash-next-tensorfold`: Qwen3.8 Flash Next NVFP4 with MTP drafts, 67.4 tok/s.
+
+  [docs/kits.md](docs/kits.md)
+- The agents count TensorFold containers as inference engines running outside TwinSpark: Diagnostics lists
+  them and can stop them.
+
 ### Recipes
 
 - **`qwen3.8-flash-next-nvfp4-tp2-vllm030`:** Qwen3.8-Flash-Next NVFP4 at TP2 + expert parallel with MTP3 on the

@@ -781,3 +781,16 @@ test("no published release is information, not a connection error", () => {
   assert.match(down, /callout warn/);
   assert.match(down, /&lt;ConnectError&gt;/);
 });
+
+test("a kit serving through the gateway shows on the dashboard and Stop ends it", () => {
+  const c = client();
+  const st = "{external:{kit:'mia-qwen3.8-flash-next-tensorfold', title:'Qwen3.8 <TensorFold>', state:'serving', aliases:['default','qwen'], url:'http://127.0.0.1:8888', served:'Qwen3.8-Flash-Next', since:0}, routes:[], nodes:{}}";
+  const html = c.run(`dashboardHtml(${st}, {}, [], null)`);
+  assert.match(html, /Qwen3.8 &lt;TensorFold&gt;/);
+  assert.match(html, /model: qwen/);
+  assert.match(html, /tsm kit start mia-qwen3.8-flash-next-tensorfold/);
+  assert.match(html, /data-act="stop" >/);                 // Stop is enabled
+  assert.doesNotMatch(html, /Nothing is serving|New here\?/);
+  const idle = c.run("dashboardHtml({routes:[], nodes:{}}, {}, [], null)");
+  assert.match(idle, /data-act="stop" disabled/);
+});

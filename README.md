@@ -173,6 +173,9 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
   time to first token and tok/s. [docs/cookbook.md](docs/cookbook.md) · [performance lab](docs/perf-lab.md)
 - **Engines:** vLLM and **SGLang**, with an image check before a switch that refuses an image that cannot
   serve the profile. [docs/engines.md](docs/engines.md)
+- **Kits:** set-ups that run with their author's own scripts, such as Mia's AI Lab's TensorFold kits for DeepSeek
+  V4.1 Flash and Qwen3.8 Flash Next. `sudo tsm kit start <kit>` hands the Sparks over, and your apps keep
+  TwinSpark's endpoint and keys. [docs/kits.md](docs/kits.md)
 - **Your apps:** short guides for [Open WebUI, n8n, LiteLLM, Continue, Cherry Studio, Aider and
   OpenCode](docs/integrations/README.md).
 - **Memory aware:** `gpu_memory_utilization` is derived from the unified-memory reserve; page cache is
@@ -358,6 +361,7 @@ All of it as a site: **[chopcookies.github.io/Twinspark-Manager](https://chopcoo
 - [Recipe and split-model workflow](docs/recipe-workflow.md)
 - [The Cookbook: recipe modes, the recipe catalog, community results, the playground](docs/cookbook.md)
 - [Performance lab: what runs on two Sparks, and how fast](docs/perf-lab.md)
+- [Kits: other people's set-ups run by their own scripts (Mia's AI Lab)](docs/kits.md)
 - [Using the Sparks from your apps: Open WebUI, n8n, LiteLLM, Continue, Cherry Studio, Aider, OpenCode](docs/integrations/README.md)
 - [Automatic recipe imports and source updates](docs/recipe-automation.md)
 - [Agent clients and evaluation harnesses](docs/agent-integrations.md)

@@ -1,0 +1,33 @@
+{
+  "name": "mia-deepseek-v4.1-flash-1017",
+  "title": "DeepSeek V4.1 Flash 1017 — EXL3 2.9 bpw on TensorFold (Mia's AI Lab)",
+  "repo": "https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks",
+  "author": "Mia's AI Lab, on BertholomusAI's TensorFold fork",
+  "license": "Apache-2.0",
+  "engine": "TensorFold native (Zig), image built on node A",
+  "model": "Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw",
+  "served_name": "DeepSeek-V4.1-Flash-1017",
+  "container": "dsv41-1017-exl3-tf",
+  "port": 8888,
+  "aliases": ["default", "deepseek"],
+  "min_available_gib": 112,
+  "prepare_needs_idle": true,
+  "measured": {
+    "single_stream_tok_s": 80.7,
+    "aggregate_c4_tok_s": 154.0,
+    "note": "the source's numbers: prose, temperature 0, thinking off, CONTEXT=524288, both GPUs at 2,200 MHz; code 118.1 tok/s at one stream; prefill ~2,150 tok/s from 4K to 256K tokens"
+  },
+  "requirements": [
+    "scripts/local.sh in the checkout (copy scripts/local.sh.example) with WORKER=<user>@<node B's CX7 address>.",
+    "Key-based ssh from node A to node B, and Docker with the NVIDIA runtime on both; git, python3 and the hf CLI on node A.",
+    "An NFS export of node A's Hugging Face cache to node B (the kit's docs/requirements.md): node B reads the checkpoint over it.",
+    "Disk: ~505 GB plus ~25 GB for the image on node A, ~310 GB on node B.",
+    "112 GiB MemAvailable on each Spark when it starts (the kit's own check). With other software on node A, CONTEXT=524288 is the practical limit.",
+    "The same GPU clock ceiling on both Sparks (nvidia-smi -lgc 0,2200): the slower GPU sets the pace."
+  ],
+  "notes": [
+    "The first start builds the engine image (two Zig builds, ~6 minutes), downloads the checkpoint (196 GiB) and Engram's tables (~203 GB), writes each rank's weight file and copies the tables to node B.",
+    "Run `tsm kit prepare` while no large model is loaded: writing the two ~106 GB weight files competes for the Sparks' shared memory.",
+    "The API thinks before it answers unless a request turns thinking off; give replies enough max_tokens."
+  ]
+}

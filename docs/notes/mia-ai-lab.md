@@ -23,12 +23,12 @@ vLLM does not load EXL3 by itself: the lanes either overlay ExLlamaV3 kernels on
 | MiMo V2.6 Flash, SGLang | `lmsysorg/sglang` nightly 2026-09-21 (+ ffmpeg for audio and video) | MXFP4 | 35.0 / 46.0 (EAGLE MTP) | AGPL-3.0 | no: needs a Python patch in every SGLang process |
 | DeepSeek V4.1 Flash, vLLM + EXL3 | `ghcr.io/miaai-lab/deepseek-v4.1-flash-exl3-2x-dgx-sparks:2.9bpw` (public) | EXL3 2.9 bpw | 31.6 | AGPL-3.0 | no: needs Engram tables mounted, plus the kit's memory steps |
 | DeepSeek V4 Flash Vision-Exp, DSpark | `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` + ~35 hotfixes | NVFP4 KV | 38.6 | MIT | no: TwinSpark has `deepseek-v4-flash-0731-b12x` on the eugr path |
-| DeepSeek V4.1 Flash 1017, TensorFold | TensorFold (Zig), built on each node | EXL3 2.9 bpw | 80.7 / 118.1 | Apache-2.0 | no: another engine |
-| Qwen3.8 Flash Next, TensorFold | TensorFold, MTP | NVFP4 / INT4 | 67.4 | not checked | no: another engine |
+| DeepSeek V4.1 Flash 1017, TensorFold | TensorFold (Zig), built on each node | EXL3 2.9 bpw | 80.7 / 118.1 | Apache-2.0 | **kit `mia-deepseek-v4.1-flash-1017`** |
+| Qwen3.8 Flash Next, TensorFold | TensorFold, MTP | NVFP4 / INT4 | 67.4 | Apache-2.0 | **kit `mia-qwen3.8-flash-next-tensorfold`** |
 | GLM 5.3 Flash, TensorFold | TensorFold | EXL3 4-bit | 47.8 | not checked | no: another engine |
 
-Commits read: Qwen3.8 `cd839d0b`, MiMo `201be3e7`, DeepSeek V4.1 EXL3 `6f7d1590`, DeepSeek V4.1 1017
-`31457d05`, DeepSeek V4 DSpark `a8b46367`. Licenses are from each repository's `LICENSE` file.
+Commits read: Qwen3.8 `cd839d0b`, Qwen3.8 TensorFold `dc05c912`, MiMo `201be3e7`, DeepSeek V4.1 EXL3 `6f7d1590`,
+DeepSeek V4.1 1017 `31457d05`, DeepSeek V4 DSpark `a8b46367`. Licenses are from each repository's `LICENSE` file.
 
 ## What TwinSpark takes over, and how
 
@@ -66,7 +66,9 @@ boxes hard-reset.
   but cannot yet substitute one's path into a flag. The kit's `start.sh` also checks a boot margin, drops
   the page cache after loading, and pins the KV pool in bytes. Its speed (31.6 tok/s) is below the
   TensorFold lane of the same model.
-- **A TensorFold engine.** TensorFold serves an OpenAI-compatible API. It starts two ranks
+- **A TensorFold engine.** *(Since then: these lanes run as [kits](../kits.md) with Mia's own scripts, the
+  two below included. The rest of this item explains why they are not ported.)* TensorFold serves an
+  OpenAI-compatible API. It starts two ranks
   (`--tp 2 --rank R --master HOST`), and each rank needs its own preprocessed weight file. Its image is
   built from source on each Spark, and Engram's tables must be on local disk. TwinSpark would need a third
   engine next to vLLM and SGLang, with these preparation steps. These are the fastest lanes listed.
