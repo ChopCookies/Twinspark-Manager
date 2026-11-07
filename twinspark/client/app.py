@@ -143,6 +143,7 @@ class TestIn(BaseModel):
 class ImportIn(BaseModel):
     text: Optional[str] = Field(None, max_length=512 * 1024)
     url: Optional[str] = None
+    expected_sha256: Optional[str] = Field(None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     profile_name: Optional[str] = None
     overrides: dict[str, Any] = Field(default_factory=dict)
     preview: bool = False

@@ -330,7 +330,7 @@ class ControllerConfig(BaseModel):
     metrics_interval_s: float = Field(default=10.0, gt=0)
     # which node downloads from the Hub when no node has the weights yet
     download_node: Literal["A", "B"] = "A"
-    # community recipe folders shown in the Cookbook ("owner/repo:path[@ref]" on GitHub)
+    # GitHub folders ("owner/repo:path[@ref]") and HTTPS Community /api/v1/recipes registries
     recipe_sources: list[str] = Field(default_factory=lambda: ["eugr/spark-vllm-docker:recipes"])
     cookbook: CookbookSettings = Field(default_factory=CookbookSettings)
 

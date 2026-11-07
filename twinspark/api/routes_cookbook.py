@@ -25,7 +25,7 @@ from ..controller.controller import BusyError, Controller, DuplicateProfileError
 from ..controller.integration import IntegrationRequest, RetryRequest, integrate, retry
 from ..cookbook import RecipeImportError, build_draft, catalog, import_text, list_recipes, recipe_detail
 from ..cookbook import community as reports
-from ..cookbook.remote import RemoteError, fetch_text, list_source
+from ..cookbook.remote import RemoteError, fetch_text, list_source, verify_recipe
 from ..cookbook.updates import check_updates
 from ..schemas.job import Job
 from .deps import controller_dep, require_auth
@@ -145,7 +145,7 @@ def import_recipe(name: str, profile_name: Optional[str] = None, mode: Optional[
 @router.get("/community")
 async def community(source: Optional[str] = None, refresh: bool = False,
                     ctrl: Controller = Depends(controller_dep)):
-    """Recipe files in the configured GitHub sources (cached ~10 min)."""
+    """Recipes in configured GitHub folders and Community registries (cached ~10 min)."""
     sources = [source] if source else ctrl.config.recipe_sources
     out: list[dict[str, Any]] = []
     for src in sources:
@@ -159,6 +159,7 @@ async def community(source: Optional[str] = None, refresh: bool = False,
 class ImportRequest(BaseModel):
     text: Optional[str] = Field(None, max_length=512 * 1024)
     url: Optional[str] = None                         # GitHub blob/raw URL or any https URL
+    expected_sha256: Optional[str] = Field(None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     profile_name: Optional[str] = None
     overrides: dict[str, Any] = Field(default_factory=dict)   # eugr template defaults (-e)
     preview: bool = False                             # convert + report, create nothing
@@ -167,6 +168,8 @@ class ImportRequest(BaseModel):
     def _one(self) -> "ImportRequest":
         if bool(self.text) == bool(self.url):
             raise ValueError("send exactly one of text or url")
+        if self.expected_sha256 is not None and not self.url:
+            raise ValueError("expected_sha256 requires a recipe URL")
         return self
 
 
@@ -177,6 +180,7 @@ async def import_any(req: ImportRequest, ctrl: Controller = Depends(controller_d
     if req.url:
         try:
             text = await asyncio.to_thread(fetch_text, req.url)
+            verify_recipe(text, req.expected_sha256)
         except RemoteError as e:
             raise HTTPException(422, str(e))
         ref = req.url
