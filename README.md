@@ -3,9 +3,19 @@
 [![CI](https://github.com/ChopCookies/Twinspark-Manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ChopCookies/Twinspark-Manager/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-chopcookies.github.io-blue)](https://chopcookies.github.io/Twinspark-Manager/)
 
-One web page, one CLI and one stable OpenAI-compatible endpoint for **two NVIDIA DGX Spark
-(GB10) machines**. Switch between community vLLM recipes, manage model files on both nodes,
-and keep the machines headless.
+Manage **two NVIDIA DGX Spark (GB10) machines** from your Mac, Windows PC or Linux workstation.
+The TwinSpark client gives you a local web GUI for switching models, browsing recipes and managing
+the cluster. The Sparks run inference headlessly and keep one stable OpenAI-compatible endpoint.
+
+| Where | What runs there |
+|---|---|
+| Your workstation | `tsm client`: local GUI, saved SSH connections, recipe research and app integrations |
+| Spark A | Controller, OpenAI-compatible gateway, node agent and inference runtime |
+| Spark B | Node agent and inference runtime |
+
+The client does not replace the node services. Install those once on a new cluster; if TwinSpark
+is already running on the Sparks, just install and connect the client. Closing the client ends its
+SSH forwards, but deployments and jobs on the Sparks keep running.
 
 > **Status: alpha (0.8.0).** The control path is covered by automated tests (about 1,600). Real Docker
 > activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
@@ -33,13 +43,27 @@ the model and image online, so it needs internet access. Ctrl-C removes everythi
 Linux and Windows (use `.venv\Scripts\tsm`) work as they are. On macOS the simulated node B needs a
 second loopback address first: `sudo ifconfig lo0 alias 127.0.0.2 up`.
 
-## Install on your two Sparks (about 10 minutes)
+## Get started
+
+### 1. Install the client on your workstation
+
+You need Python 3.12 or later, [pipx](https://pipx.pypa.io/) and an OpenSSH client.
+
+```bash
+pipx install git+https://github.com/ChopCookies/Twinspark-Manager
+tsm client
+```
+
+This opens the GUI at `http://127.0.0.1:18765` by default. If the Sparks already run TwinSpark,
+skip to [Connect to Spark A](#3-connect-to-spark-a). Otherwise, set up the two nodes once.
+
+### 2. Set up the Spark services (new clusters only)
 
 You need: both Sparks cabled QSFP-to-QSFP, Docker (ships with DGX OS), Python 3.12+ (Ubuntu 24.04
 has it), and a user with `sudo`. Setup does not change your network configuration unless you say so
 (see the QSFP step below).
 
-**1. Node A** (the machine that will host the controller and the OpenAI endpoint):
+**On Spark A** (the machine that hosts the controller and the OpenAI endpoint):
 
 ```bash
 git clone https://github.com/ChopCookies/Twinspark-Manager && cd Twinspark-Manager
@@ -60,33 +84,32 @@ detects almost everything and only asks what it cannot know:
 It then writes the configs, creates the secrets and a dedicated SSH key for weight sync,
 installs the systemd units and prints the exact line to run on node B.
 
-**2. Node B** — paste the line node A printed (it carries the shared secrets, treat it like a password):
+**On Spark B** — use the join code Spark A printed. It contains shared secrets; treat it like a password.
+Pass `--join -` and paste the code when prompted to keep it out of shell history and the process list:
 
 ```bash
 git clone https://github.com/ChopCookies/Twinspark-Manager && cd Twinspark-Manager
-sudo ./install.sh --join tsm1.…
+sudo ./install.sh --join -
 ```
 
-Lost the line? `sudo tsm join-code` on node A prints it again. To keep the code out of the process
-list and your shell history, use `--join -` and paste it at the prompt.
+Lost the code? `sudo tsm join-code` on Spark A prints it again.
 
-**3. Open the GUI from your own computer.** Install the workstation client there (macOS, Windows or
-Linux, Python 3.12+) and point it at node A:
+### 3. Connect to Spark A
 
-```bash
-pipx install git+https://github.com/ChopCookies/Twinspark-Manager
-tsm client                                 # opens the GUI on http://127.0.0.1:18765
-```
-
-On **Connection**, add node A's address and your SSH user. The client confirms node A's host key with
-you, logs in over SSH (or Tailscale), reads the keys, and keeps the forwards up — no tunnel to type.
-See [docs/client.md](docs/client.md). The **Get started** page then checks both nodes and shows the
-next step with the exact command.
+In the workstation GUI, open **Connection → Add a Spark** and enter Spark A's LAN or Tailscale
+address and your SSH user. Verify the host key when prompted. The client manages the SSH forwards
+and tries to read the API keys; if your SSH user cannot read the vault, paste the keys from
+`sudo tsm init --show` on Spark A. **Get started** checks both nodes and shows what to do next.
+See the [workstation client guide](docs/client.md) for connection and key storage options.
 
 Without the client it works as before: `ssh -L 8443:localhost:8443 you@node-a`, browse to
 <http://localhost:8443/> and paste the management key (`tsm init --show` prints it again).
 
-**4. Run a model.**
+### 4. Plan and run a model
+
+Use **Cookbook** in the workstation GUI to import a recipe, pin it and review the plan before
+activation. The equivalent CLI commands below run on Spark A, or on your workstation after
+configuring the CLI to use the [client's SSH forward](docs/client.md#connect).
 
 ```bash
 tsm cookbook list                          # built-in dual-Spark recipes
@@ -94,7 +117,7 @@ tsm cookbook show glm-5.3-flash-nvfp4-tp2  # what it needs: image, weights, mods
 tsm cookbook import glm-5.3-flash-nvfp4-tp2
 tsm pin glm-5.3-flash-nvfp4-tp2            # freezes the model commit + image digest (needs Hub + registry access)
 tsm plan glm-5.3-flash-nvfp4-tp2           # the exact docker/vllm commands for A and B, nothing started
-tsm activate glm-5.3-flash-nvfp4-tp2       # downloads the weights once, copies them to B over QSFP, starts
+tsm activate glm-5.3-flash-nvfp4-tp2       # simulates the deployment in dry-run; launches on live nodes
 ```
 
 Each recipe lists what it needs. Some use a public image that pinning resolves and activation pulls (the
@@ -106,7 +129,7 @@ Clients use `http://node-a:8000/v1`, model `default`, with the `inference_api_ke
 (`tsm init --show`). Apps on the computer that runs `tsm client` can use its forward instead; the
 Connection page shows that address and copies the key.
 
-**5. Go live.** While in dry-run, `activate` walks the whole pipeline with simulated
+**Go live when ready.** While in dry-run, `activate` walks the whole pipeline with simulated
 containers, so you can compare `tsm plan` with the command you run by hand today. When it
 matches, stop any hand-started vLLM (`tsm foreign ls`) and on **each** node run:
 
@@ -116,7 +139,8 @@ sudo tsm go-live        # runtime_mode: docker + restarts the agent;  `--revert`
 
 Start small: the `smollm2-135m-smoke` recipe (260 MiB) checks the whole path in a minute. Import it and
 pin it with the image of the recipe you plan to run (`tsm cookbook import smollm2-135m-smoke`, then
-`tsm pin smollm2-135m-smoke --image <image>`). `tsm doctor` checks everything
+`tsm pin smollm2-135m-smoke --image <image>`), then activate the smoke profile with both nodes live.
+`tsm doctor` checks everything
 a fast, stable dual-Spark setup needs (driver parity, RDMA, headless, privd, SSH, disk).
 
 ### Unattended / scripted
@@ -134,7 +158,7 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
 
 ## What you get
 
-- **Workstation client** (`tsm client`, new in 0.6): the GUI on your own computer, connected to node A
+- **Workstation client** (`tsm client`): the GUI on your own computer, connected to node A
   by address over SSH or Tailscale with managed forwards, host-key confirmation and a one-time key
   install; three separate states (client connected · agents compatible · model ready). Recipe research
   and agent-app setup run there, so the Sparks keep only lean services (≈100 MiB on node A, ≈50 MiB on
