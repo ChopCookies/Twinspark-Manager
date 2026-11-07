@@ -46,7 +46,7 @@ def _release(args) -> tuple[Optional[dict], Optional[str]]:
     except releases.ReleaseError as exc:
         return None, str(exc)
     except httpx.HTTPError as exc:
-        return None, f"GitHub is not reachable from this computer ({type(exc).__name__})"
+        return None, f"GitHub is not reachable from this computer ({type(exc).__name__}) — a connection problem"
 
 
 def _sparks(args, refresh: bool = True) -> tuple[Optional[dict], Optional[str]]:

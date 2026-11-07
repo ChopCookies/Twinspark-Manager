@@ -35,7 +35,9 @@ recipe URL. Review the mapped fields, raw arguments, image, mods and requirement
 Import saves the exact reviewed snapshot. Edit the profile, then choose
 **Pin & prepare**. Pin resolves model commits, image digests and drafter commits;
 prepare checks the pinned revision and stages its files. Pinning and preparation
-do not install missing patches or start an inference container.
+do not install missing patches or start an inference container. A patch the recipe pins
+(see [Required patches](#required-patches)) is one step: **Mods → Install pinned patch**,
+or `tsm mods required <profile> --install`, then **Retry** on the failed preparation.
 
 The CLI equivalent is:
 
@@ -62,6 +64,47 @@ missing files need downloading. Unknown patterns fail visibly. Transfer checksum
 failures stop the job before the old deployment is touched. A cache copied from
 an unverified download must first be downloaded/verified on its source node, or
 verification must be explicitly disabled for the stage operation.
+
+## Required patches
+
+A recipe lists its mods in `advanced.mods`. The common case is a patch that replaces one file in the image
+with a file from the recipe author's repository. For that, the recipe can carry the patch itself, pinned,
+in `source.mod_artifacts`:
+
+```json
+"mod_artifacts": {
+  "glm53-sm121-sparse-attn": {
+    "kind": "file-patch",
+    "repo": "seanlinmt/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark",
+    "commit": "e6dcb04852aa469ad7b17c7156cabeae0f46f497",
+    "path": "docker/sparse_attn_indexer_kpool_sm121.py",
+    "sha256": "8a3ecfb0bab2441dd7417ed00a10d142191496149f88e5fe79fcfaea4b160980",
+    "target": "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py",
+    "license": "Apache-2.0",
+    "image": "ghcr.io/tonyd2wild/vllm-glm53-flash@sha256:4def0ef6…",
+    "why": "what breaks without it"
+  }
+}
+```
+
+- **Everything is pinned.** The commit must be a full 40-character commit, never a branch. The file's SHA-256
+  and a license are required. A recipe with an incomplete descriptor is refused when it is imported.
+- **Installing** (Mods → Install pinned patch, or `tsm mods required PROFILE --install`) does this:
+  1. Node A fetches exactly that file from GitHub and refuses it if the SHA-256 differs.
+  2. It builds the mod as `tsm mods file-patch` does. The generated `run.sh` refuses an image without the target
+     file and checks the copy's SHA-256.
+  3. It installs identical content on every node. A node that failed is named. The same command again (it is
+     idempotent) completes the install.
+- **The revision pins it too.** While a switch or a preparation resolves, before anything is downloaded, each
+  node's copy of the mod must be that patch: the generated `run.sh` and the pinned file. Other content
+  installed by hand under the same name stops the job, and the message names the fix. Extra files beside it,
+  such as a README, are ignored.
+- `tsm mods required PROFILE` lists the states. A mod can be missing on a node, differ between the nodes, be
+  installed and identical, and be the recipe's pinned patch or not. Whether the patch works on the GPU only
+  shows in a real activation (its validation record).
+
+A patch the recipe does not pin is installed by hand as before: `tsm mods file-patch NAME --file FILE --target
+PATH`, or `tsm mods install DIR`. `tsm mods install` exits non-zero when any node did not get the mod.
 
 ## Two independent models
 

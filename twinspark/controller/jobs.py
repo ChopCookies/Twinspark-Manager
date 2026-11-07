@@ -84,6 +84,16 @@ def kv_facts_from_log(text: str) -> dict:
     return out
 
 
+
+def _pins_a_patch(rev: ProfileRevision, problems: list[str]) -> bool:
+    """Does the revision's recipe pin one of the mods a node is missing (so TwinSpark can install it)?"""
+    from ..mod_artifacts import ArtifactError, of_source
+    try:
+        pinned = of_source(rev.draft.source)
+    except ArtifactError:
+        return False
+    return any(name in " ".join(problems) for name in pinned)
+
 class ActivationCoordinator:
     def __init__(self, *, config: "ControllerConfig", agents: dict[str, AgentClient],
                  gateway: "Gateway", planner: MemoryPlanner,
@@ -358,7 +368,11 @@ class ActivationCoordinator:
                                                         if c.node == n for m in c.mods}),
                                            need_rdma=multi, hcas=hcas)
             if not pre["ok"]:
-                raise RuntimeError(f"node {n} preflight: " + "; ".join(pre["problems"]))
+                msg = f"node {n} preflight: " + "; ".join(pre["problems"])
+                if "not installed" in msg and _pins_a_patch(rev, pre["problems"]):
+                    from .prerequisites import hint
+                    msg += f" — {hint(rev.profile_name)}"
+                raise RuntimeError(msg)
             warnings += [f"{n}: {w}" for w in pre.get("warnings", [])]
         self.dry_run = any(f.get("runtime_mode") == "dry-run" for f in facts.values())
         if self.dry_run and any(f.get("runtime_mode") != "dry-run" for f in facts.values()):
@@ -381,6 +395,9 @@ class ActivationCoordinator:
                     if len(hashes) > 1:
                         raise RuntimeError(f"mod {m} differs between nodes — reinstall it with "
                                            f"`tsm mods install` so both run identical patches")
+            # a mod the revision pins (source.mod_artifacts) must be that patch, not other content under its name
+            from .prerequisites import check_plan
+            check_plan(rev.profile_name, rev.draft.source, st)
         from .phases import phase
         seen_images = set()
         for c in self.plan.containers:

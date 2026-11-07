@@ -363,6 +363,12 @@ class ProfileDraft(BaseModel):
         if kv is not None and (isinstance(kv, bool) or not isinstance(kv, (int, float))
                                or not math.isfinite(kv) or kv <= 0):
             raise ValueError("source.kv_bytes_per_token must be a positive finite number")
+        if self.source.get("mod_artifacts"):
+            from ..mod_artifacts import ArtifactError, of_source
+            try:
+                of_source(self.source)            # a pinned patch must be complete and pinned, or the recipe is refused
+            except ArtifactError as exc:
+                raise ValueError(f"source.mod_artifacts: {exc}") from None
         if self.identity is not None:
             if self.identity.quantization != self.simple.quantization:
                 raise ValueError("identity.quantization and simple.quantization disagree")

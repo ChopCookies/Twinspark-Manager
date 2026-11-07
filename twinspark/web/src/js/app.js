@@ -765,6 +765,8 @@ function tsmUpdateHtml(info, st) {
     const link = githubLink(rel.html_url);
     html += `<div class="kv">${names.map(n => `<b>Node ${esc(n)}</b><span>${esc(info.versions[n] || "?")}${latest ? (behind.includes(n) ? ` → ${esc(latest)}` : " · up to date") : ""}</span>`).join("")}
       <b>Newest release</b><span>${latest ? `${esc(latest)}${rel.prerelease ? " (pre-release)" : ""}${rel.published_at ? " · " + esc(String(rel.published_at).slice(0, 10)) : ""}${link ? ` · <a href="${esc(link)}" target="_blank" rel="noopener noreferrer">release page</a>` : ""}` : esc(info.release_error || "—")}</span></div>`;
+    if (!latest && info.release_state === "none-published") html += `<div class="callout info"><div><b>No release published yet.</b> GitHub answered: node A's connection is fine. <span class="mono">tsm update</span> installs releases, which appear when the maintainer pushes a version tag.</div></div>`;
+    else if (!latest && info.release_error) html += `<div class="callout warn"><div>${esc(info.release_error)}</div></div>`;
     if (rel.notes) html += `<details><summary>Release notes</summary>${codeBlock(rel.notes)}</details>`;
     if ((info.problems || []).length) html += `<div class="callout warn"><div>${info.problems.map(esc).join("<br>")}</div></div>`;
     const can = info.ready && info.available && st?.state !== "running";
@@ -1988,22 +1990,55 @@ async function deleteFlow(repo, rev) {
 }
 
 /* ============================== mods ============================== */
+function missingModsHtml(missing) {
+  const pinned = missing.filter(m => (m.pinned_by || []).length), other = missing.filter(m => !(m.pinned_by || []).length);
+  return `<div class="callout warn"><div><b>Missing mods</b> — these profiles cannot start until the mod is installed:<ul>${missing.map(m => `<li><span class="mono">${esc(m.name)}</span> — ${m.profiles.map(esc).join(", ")}${(m.pinned_by || []).length ? ` <button class="btn sm primary" data-act="pinned" data-name="${esc(m.name)}" data-profile="${esc(m.pinned_by[0])}">Install pinned patch</button>` : ""}</li>`).join("")}</ul>${pinned.length ? `<p class="small">A recipe pins ${pinned.length > 1 ? "these patches" : "this patch"}: TwinSpark fetches the file at the pinned commit, checks its SHA-256 and installs it on every node.</p>` : ""}${other.length ? `From a spark-vllm-docker checkout: <span class="mono">tsm mods import-eugr ~/spark-vllm-docker --only ${esc(other.map(m => m.name).join(","))}</span>` : ""}</div></div>`;
+}
+/** what a recipe's pinned patch is, per node, before anything is installed */
+function pinnedPatchHtml(m) {
+  const a = m.artifact || {};
+  const link = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/blob\/[0-9a-f]{40}\//.test(a.review_url || "") ? a.review_url : "";
+  const state = { missing: ["missing on a node", "bad"], inconsistent: ["differs between nodes", "warn"], installed: ["installed on every node", "good"] }[m.state] || [m.state, "muted"];
+  return `<div class="kv"><b>Source</b><span class="mono">${esc(a.repo)} @ ${esc(String(a.commit || "").slice(0, 12))}</span><b>File</b><span class="mono">${esc(a.path)}</span>
+    <b>SHA-256</b><span class="mono">${esc(a.sha256)}</span><b>Replaces in the image</b><span class="mono">${esc(a.target)}</span>
+    <b>License</b><span>${esc(a.license || "—")}</span>${a.image ? `<b>Written for</b><span class="mono">${esc(a.image)}</span>` : ""}${a.why ? `<b>Why</b><span>${esc(a.why)}</span>` : ""}</div>
+    ${link ? `<p class="small"><a href="${esc(link)}" target="_blank" rel="noopener noreferrer">Review the file on GitHub</a> (at the pinned commit)</p>` : ""}
+    <p>${tag(state[0], state[1])} ${m.matches_recipe === true ? tag("the pinned patch", "good") : m.matches_recipe === false ? tag("not the pinned patch", "bad") : ""}</p>
+    <div class="small">${Object.entries(m.nodes || {}).map(([n, v]) => `Node ${esc(n)}: ${v.present ? `${esc(sha(v.hash, 8))}${v.matches_recipe === false ? " — other content" : ""}` : "missing"}`).join(" · ")}</div>`;
+}
+async function pinnedPatchFlow(profile, name) {
+  const st = await GET(`/api/v1/profiles/${enc(profile)}/prerequisites`);
+  const m = (st.mods || []).find(x => x.name === name);
+  if (!m || !m.artifact) { toast(`${profile} does not pin a patch for ${name}`, "bad"); return false; }
+  const done = m.state === "installed" && m.matches_recipe === true;
+  let ok = false;
+  await modal({ title: `${done ? "Pinned patch" : "Install the pinned patch"} ${name}`, body: pinnedPatchHtml(m) + (done ? "" : `<p class="small muted">Node A fetches the file from GitHub at the pinned commit, refuses it if the SHA-256 differs, and installs the same mod on every node. Nothing starts; retry the failed preparation or switch afterwards.</p>`),
+    actions: done ? [{ label: "Close" }] : [{ label: "Cancel" }, { label: m.state === "missing" ? "Install on every node" : "Reinstall on every node", cls: "primary", validate: async () => {
+      const r = await POST(`/api/v1/profiles/${enc(profile)}/prerequisites/install`, { mod: name, confirm: "INSTALL PINNED PATCH" });
+      const errs = Object.entries(r.install.results || {}).filter(([, x]) => x.error);
+      if (errs.length || !r.install.ok) toast(errs.map(([n, x]) => `node ${n}: ${x.error}`).join("; ") || "the nodes ended up with different content", "bad");
+      else toast(`installed ${name} on ${Object.keys(r.install.results).join(" + ")} — the recipe's pinned patch`, "good");
+      ok = true; return true;
+    } }] });
+  return ok;
+}
 async function viewMods() {
   const g = S.gen;
   const data = await GET("/api/v1/mods");
   const nodes = [...new Set(data.mods.flatMap(m => Object.keys(m.nodes)))].sort();
   let h = `<div class="view"><div class="view-head"><div><h1>Mods</h1><p>Patch directories (eugr format: a folder with <span class="mono">run.sh</span>) applied inside the container right before vLLM starts, in the order the profile lists them.</p></div>
     <div class="row"><label class="btn primary" style="cursor:pointer">Upload mod (.zip / .tar.gz)<input id="mod-file" type="file" accept=".zip,.tar,.tgz,.tar.gz" class="hidden"/></label></div></div>`;
-  if ((data.missing || []).length) h += `<div class="callout warn"><div><b>Missing mods</b> — these profiles cannot start until the mod is installed:<ul>${data.missing.map(m => `<li><span class="mono">${esc(m.name)}</span> — ${m.profiles.map(esc).join(", ")}</li>`).join("")}</ul>From a spark-vllm-docker checkout: <span class="mono">tsm mods import-eugr ~/spark-vllm-docker --only ${esc(data.missing.map(m => m.name).join(","))}</span></div></div>`;
+  if ((data.missing || []).length) h += missingModsHtml(data.missing);
   for (const [n, e] of Object.entries(data.errors || {})) h += `<div class="callout bad"><div>node ${esc(n)}: ${esc(e)}</div></div>`;
   h += `<div class="card">${data.mods.length ? `<div class="table-wrap"><table><thead><tr><th>Mod</th>${nodes.map(n => `<th>Node ${esc(n)}</th>`).join("")}<th>Used by</th><th></th></tr></thead><tbody>
     ${data.mods.map(m => `<tr><td><b class="mono">${esc(m.name)}</b>${m.summary ? `<div class="sub">${esc(m.summary)}</div>` : ""}${m.consistent ? "" : `<div class="sub" style="color:var(--warn)">differs between nodes — reinstall</div>`}</td>
       ${nodes.map(n => `<td>${m.nodes[n] && m.nodes[n].present ? tag("✓ " + sha(m.nodes[n].hash, 8), "good") : tag("missing", "bad")}</td>`).join("")}
       <td>${m.profiles.map(p => `<a href="#/profiles/${enc(p)}">${esc(p)}</a>`).join(", ") || '<span class="muted">—</span>'}</td>
-      <td class="actions"><button class="btn sm danger" data-act="remove" data-name="${esc(m.name)}">Remove</button></td></tr>`).join("")}
+      <td class="actions">${(m.pinned_by || []).length ? `<button class="btn sm" data-act="pinned" data-name="${esc(m.name)}" data-profile="${esc(m.pinned_by[0])}">Check pinned patch</button>` : ""}<button class="btn sm danger" data-act="remove" data-name="${esc(m.name)}">Remove</button></td></tr>`).join("")}
     </tbody></table></div>` : empty("No mods installed", "Upload a zip of a mod folder, or run tsm mods import-eugr on a spark-vllm-docker checkout.")}</div></div>`;
   if (!render(g, h)) return;
   onAct({
+    pinned: async (el) => { if (await pinnedPatchFlow(el.dataset.profile, el.dataset.name)) route(); },
     remove: async (el) => {
       if (!await confirmBox(`Remove ${el.dataset.name}?`, "Removed from every node. Profiles that list it will fail preflight until it is reinstalled.", { label: "Remove", danger: true })) return;
       const r = await DEL(`/api/v1/mods/${enc(el.dataset.name)}`);
@@ -2022,7 +2057,9 @@ async function viewMods() {
       let bin = ""; for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
       const r = await POST("/api/v1/mods", { name: v.name, archive_b64: btoa(bin) });
       const errs = Object.entries(r.results).filter(([, x]) => x.error);
-      if (errs.length) toast(errs.map(([n, x]) => `node ${n}: ${x.error}`).join("; "), "bad"); else toast(`installed ${v.name} on ${Object.keys(r.results).join(" + ")}`, "good");
+      if (errs.length) toast(errs.map(([n, x]) => `node ${n}: ${x.error}`).join("; ") + " — upload again to finish", "bad");
+      else if (r.consistent === false) toast(`${v.name}: the nodes ended up with different content — upload again`, "bad");
+      else toast(`installed ${v.name} on ${Object.keys(r.results).join(" + ")}`, "good");
       route();
     } catch (err) { fail(err); } finally { e.target.value = ""; }
   };

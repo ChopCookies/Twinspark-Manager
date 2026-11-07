@@ -63,11 +63,27 @@ class SecretsVault:
                     self.key_file.unlink(missing_ok=True)      # left empty by an earlier crash
         raise RuntimeError(f"cannot initialise the vault master key in {self.dir}")
 
-    def _f(self) -> Fernet:
+    def _f(self, create: bool = False) -> Fernet:
+        """The cipher. Reading (``create=False``) opens an existing vault exactly as it is: no directory, no
+        mode change, no new master key. A service that only reads secrets, such as the standalone gateway with
+        ``ProtectSystem=strict``, never writes into ``/etc``. Creating the vault and repairing its mode happen
+        only on a write (``set``, ``ensure``, ``rotate``), which ``tsm init`` and setup do as root."""
         if self._fernet is None:
-            self.dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(self.dir, 0o700)
-            self._fernet = Fernet(self._load_or_create_key())
+            if create:
+                self.dir.mkdir(parents=True, exist_ok=True)
+                if (self.dir.stat().st_mode & 0o777) != 0o700:
+                    os.chmod(self.dir, 0o700)
+                key = self._load_or_create_key()
+            else:
+                try:
+                    key = self.key_file.read_bytes().strip()
+                except FileNotFoundError:
+                    key = b""
+                if not key:
+                    raise RuntimeError(f"the vault in {self.dir} has secrets but no master key "
+                                       f"({self.key_file}); restore it from a backup, or run `sudo tsm init` "
+                                       f"and set the secrets again")
+            self._fernet = Fernet(key)
         return self._fernet
 
     def _owner(self) -> Optional[tuple[int, int]]:
@@ -85,14 +101,14 @@ class SecretsVault:
     def set(self, name: str, value: str) -> None:
         if name not in SECRET_SLOTS:
             raise ValueError(f"'{name}' is not a known secret slot")
-        data = self._f().encrypt(value.encode())
+        data = self._f(create=True).encrypt(value.encode())
         _write_private(self.dir / f"{name}.enc", data, owner=self._owner())
 
     def get(self, name: str) -> str:
         p = self.dir / f"{name}.enc"
-        if not p.exists():
-            return ""
         try:
+            if not p.exists():
+                return ""
             return self._f().decrypt(p.read_bytes()).decode()
         except PermissionError as exc:
             bad = exc.filename or p                    # the secret itself, or the master key

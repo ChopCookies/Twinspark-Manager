@@ -212,10 +212,17 @@ async def mods_overview(ctrl: "Controller") -> dict[str, Any]:
             per_node[n] = {"error": exc.detail}
     names = sorted({m["name"] for v in per_node.values() if isinstance(v, list) for m in v})
     used: dict[str, list[str]] = {}
+    pinned: dict[str, list[str]] = {}                 # mod -> profiles whose recipe pins its patch
+    from ..mod_artifacts import ArtifactError, of_source
     for p in ctrl.list_profiles():
         d = p.working_draft()
         for m in {m for part in d.parts() for m in part.advanced.mods} if d else []:
             used.setdefault(m, []).append(p.name)
+        try:
+            for m in of_source(d.source) if d else {}:
+                pinned.setdefault(m, []).append(p.name)
+        except ArtifactError:
+            pass
     rows = []
     for name in names:
         nodes = {}
@@ -227,9 +234,11 @@ async def mods_overview(ctrl: "Controller") -> dict[str, Any]:
         hashes = {v["hash"] for v in nodes.values() if v["present"]}
         rows.append({"name": name, "nodes": nodes, "consistent": len(hashes) <= 1 and all(
             v["present"] for v in nodes.values()), "profiles": used.get(name, []),
-            "summary": next((v["summary"] for v in nodes.values() if v.get("summary")), "")})
+            "summary": next((v["summary"] for v in nodes.values() if v.get("summary")), ""),
+            "pinned_by": pinned.get(name, [])})
     wanted = sorted(set(used) - set(names))
-    return {"mods": rows, "missing": [{"name": m, "profiles": used[m]} for m in wanted],
+    return {"mods": rows, "missing": [{"name": m, "profiles": used[m], "pinned_by": pinned.get(m, [])}
+                                      for m in wanted],
             "errors": {n: v["error"] for n, v in per_node.items() if isinstance(v, dict)}}
 
 
@@ -245,10 +254,14 @@ async def install_mod(ctrl: "Controller", name: str, archive_b64: str,
         except AgentActionError as exc:
             results[n] = {"error": exc.detail}
     hashes = {r.get("hash") for r in results.values() if "hash" in r}
-    ctrl._audit("user", "mod.install", f"mod/{name}", {"nodes": list(results),
+    failed = sorted(n for n, r in results.items() if "hash" not in r)
+    consistent = len(hashes) == 1 and not failed
+    ctrl._audit("user", "mod.install", f"mod/{name}", {"nodes": list(results), "failed": failed,
                                                        "hash": next(iter(hashes), None)})
-    return {"name": name, "results": results, "consistent": len(hashes) == 1 and all(
-        "hash" in r for r in results.values())}
+    # ok: installed on every node asked, with the same content. The nodes that succeeded keep it, so the same
+    # install again (it is idempotent) only has to reach the ones that failed.
+    return {"name": name, "results": results, "consistent": consistent, "failed": failed, "ok": consistent,
+            "hash": next(iter(hashes)) if len(hashes) == 1 else None}
 
 
 async def remove_mod(ctrl: "Controller", name: str) -> dict[str, Any]:

@@ -83,7 +83,7 @@ def test_an_older_version_can_be_named_to_go_back():
 def test_a_release_without_the_workflow_files_is_not_installable():
     listing = [gh_release("0.8.0", assets=[releases.wheel_name("0.8.0")])]
     with httpx.Client(transport=github(listing)) as c:
-        with pytest.raises(releases.ReleaseError, match="no release with installable files"):
+        with pytest.raises(releases.ReleaseError, match="has the files"):
             releases.latest(c)
         with pytest.raises(releases.ReleaseError, match="lacks"):
             releases.latest(c, version="0.8.0")
@@ -558,3 +558,33 @@ async def test_github_unreachable_is_one_readable_line(cluster):
 
 def test_cluster_helper_is_importable():
     assert Cluster
+
+
+def test_no_published_release_is_told_apart_from_a_connection_problem():
+    with httpx.Client(transport=github([])) as c:
+        with pytest.raises(releases.ReleaseError) as exc:
+            releases.latest(c)
+    assert exc.value.kind == "none-published" and "not a connection problem" in str(exc.value)
+    only_pre = [gh_release("0.9.0rc1", prerelease=True)]
+    with httpx.Client(transport=github(only_pre)) as c:
+        with pytest.raises(releases.ReleaseError) as exc:
+            releases.latest(c)
+    assert exc.value.kind == "none-published" and "pre-releases" in str(exc.value)
+
+
+async def test_the_check_reports_the_release_state(cluster):
+    c = cluster.controller
+
+    async def none(version, allow_prerelease):
+        raise releases.ReleaseError("no TwinSpark release is published", "none-published")
+
+    c.selfupdate.fetch = none
+    info = await c.selfupdate.check(refresh=True)
+    assert info["release_state"] == "none-published" and not info["ready"]
+
+    async def offline(version, allow_prerelease):
+        raise httpx.ConnectError("dns")
+
+    c.selfupdate.fetch = offline
+    assert (await c.selfupdate.check(refresh=True))["release_state"] == "unreachable"
+    await c.aclose()

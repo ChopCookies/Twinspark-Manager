@@ -12,6 +12,10 @@
 # Environment (for staging / tests): TSM_HOME (default /opt/twinspark), TSM_BIN_DIR (default /usr/local/bin),
 # TSM_PYTHON (interpreter to use), TSM_SKIP_APT=1 (never call apt-get).
 set -euo pipefail
+# The services read the program as their own user. An operator's umask 077 would make the new files root-only:
+# root's checks pass, and the agent then fails with "ModuleNotFoundError: twinspark.cli". Secrets get their
+# 0600/0700 modes explicitly, whatever the umask.
+umask 022
 
 TSM_HOME="${TSM_HOME:-/opt/twinspark}"
 TSM_BIN_DIR="${TSM_BIN_DIR:-/usr/local/bin}"
@@ -166,9 +170,9 @@ if command -v git >/dev/null 2>&1 && SHA_NOW="$(git -c safe.directory="$SRC" -C 
 else
   rm -f "$TSM_HOME/source-commit"
 fi
-# code that runs as root (privd) must not be writable by anyone else
+# code that runs as root (privd) must not be writable by anyone else, and the services must be able to read it
 chown -R root:root "$TSM_HOME"
-chmod -R go-w "$TSM_HOME"
+chmod -R u+rwX,go+rX,go-w "$TSM_HOME"
 write_update_policy
 mkdir -p "$TSM_BIN_DIR"
 ln -sf "$TSM_HOME/venv/bin/tsm" "$TSM_BIN_DIR/tsm"

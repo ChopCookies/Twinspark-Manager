@@ -60,6 +60,19 @@ def tree_hash(root: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
+def file_hashes(d: Path, limit: int = 64) -> dict[str, str] | None:
+    """{relative path: sha256} of a small mod — what a recipe's pinned patch is compared with. None for a mod with
+    more files than ``limit`` (eugr's larger mods): its tree hash is still checked across nodes."""
+    out: dict[str, str] = {}
+    for p in sorted(d.rglob("*")):
+        if p.is_file() and not p.is_symlink():
+            if len(out) >= limit:
+                return None
+            with p.open("rb") as f:
+                out[p.relative_to(d).as_posix()] = hashlib.file_digest(f, "sha256").hexdigest()
+    return out
+
+
 def list_mods(mods_dir: str | Path) -> list[dict[str, Any]]:
     root = Path(mods_dir)
     out: list[dict[str, Any]] = []
@@ -81,14 +94,15 @@ def list_mods(mods_dir: str | Path) -> list[dict[str, Any]]:
                     break
         size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file() and not p.is_symlink())
         out.append({"name": d.name, "has_run_sh": run.is_file(), "hash": tree_hash(d),
-                    "size_bytes": size, "summary": summary})
+                    "size_bytes": size, "summary": summary, "files": file_hashes(d)})
     return out
 
 
 def mods_status(mods_dir: str | Path, names: list[str]) -> dict[str, Any]:
     installed = {m["name"]: m for m in list_mods(mods_dir)}
     return {n: {"present": n in installed and installed[n]["has_run_sh"],
-                "hash": installed.get(n, {}).get("hash")} for n in names}
+                "hash": installed.get(n, {}).get("hash"), "files": installed.get(n, {}).get("files")}
+            for n in names}
 
 
 def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, Any]:
@@ -113,9 +127,16 @@ def install_mod(mods_dir: str | Path, name: str, archive_b64: str) -> dict[str, 
         if not (tmp / "run.sh").is_file():
             raise ModError("mod archive must contain run.sh at its top level")
         for p in tmp.rglob("*"):
-            if p.is_file() and not p.is_symlink():
+            if p.is_symlink():
+                continue
+            if p.is_file():
                 mode = 0o755 if (p.suffix == ".sh" or os.access(p, os.X_OK)) else 0o644
                 p.chmod(mode)
+            elif p.is_dir():
+                p.chmod(0o755)
+        # mkdtemp made the mod's own directory 0700: the container (another UID, capabilities dropped) could
+        # not enter the read-only mount and run.sh failed with "permission denied". Mods are public code.
+        tmp.chmod(0o755)
         final = root / name
         with _swap_lock:
             if final.exists():

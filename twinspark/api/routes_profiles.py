@@ -192,6 +192,37 @@ def known_good(name: str, ctrl: Controller = Depends(controller_dep)):
     return rev
 
 
+@router.get("/{name}/prerequisites")
+async def prerequisites(name: str, ctrl: Controller = Depends(controller_dep)):
+    """The profile's required mods on every node, and the recipe's pinned patch for each (if it has one)."""
+    from ..controller.prerequisites import PrerequisiteError, status
+    try:
+        return await status(ctrl, name)
+    except PrerequisiteError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+class PinnedPatchInstall(BaseModel):
+    mod: str = Field(min_length=1, max_length=64)
+    confirm: str
+
+
+@router.post("/{name}/prerequisites/install")
+async def install_prerequisite(name: str, req: PinnedPatchInstall, ctrl: Controller = Depends(controller_dep)):
+    """Fetch the recipe's pinned patch from GitHub, check its SHA-256 and install it on every node."""
+    from ..controller.files import FilesError
+    from ..controller.prerequisites import PrerequisiteError, install
+    from ..mod_artifacts import ArtifactError
+    if req.confirm != "INSTALL PINNED PATCH":
+        raise HTTPException(422, "explicit confirmation is required (confirm: INSTALL PINNED PATCH)")
+    try:
+        return await install(ctrl, name, req.mod)
+    except FilesError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (PrerequisiteError, ArtifactError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @router.get("/{name}/fit")
 def fit(name: str, revision: Optional[str] = None, ctrl: Controller = Depends(controller_dep)):
     """Memory fit + estimated KV pool for the draft (or a revision), next to observed facts."""
