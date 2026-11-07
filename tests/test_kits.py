@@ -174,6 +174,29 @@ async def test_a_switch_does_not_start_while_a_kit_container_cannot_be_stopped(c
     assert not cluster.runtimes["A"].containers and not cluster.runtimes["B"].containers
 
 
+async def test_failed_stop_keeps_the_kit_tracked_and_retries_cleanup(cluster, healthy, monkeypatch):
+    c = cluster.controller
+    await kit_ctl.handover(c, QWEN)
+    kit_running(cluster)
+    await kit_ctl.attach(c, QWEN)
+    worker = cluster.runtimes["B"]
+    with monkeypatch.context() as patch:
+        def stuck(name, grace_s=60):
+            raise RuntimeError("docker stop timed out")
+
+        patch.setattr(worker, "stop_foreign", stuck)
+        result = await kit_ctl.detach(c, stop_containers=True)
+        assert result["problems"] and result["external"]["state"] == "stop-failed"
+        assert kit_ctl.state(c)["containers"]["B"] == "qwen38-fn-tf"
+        await kit_ctl.reattach(c)
+        assert not cluster.gateway.routes["default"].backends
+        with pytest.raises(kit_ctl.KitStateError, match="stop it first"):
+            await kit_ctl.handover(c, QWEN)
+    result = await kit_ctl.detach(c, stop_containers=True)
+    assert result["stopped"] == ["B:qwen38-fn-tf"] and not result["problems"]
+    assert not worker.foreign and kit_ctl.state(c) is None
+
+
 async def test_stop_ends_a_serving_kit(cluster, healthy):
     c = cluster.controller
     await kit_ctl.handover(c, DSV)
@@ -212,7 +235,7 @@ async def test_a_restarted_controller_routes_the_kit_again(cluster, healthy):
 async def test_one_kit_at_a_time(cluster, healthy):
     c = cluster.controller
     await kit_ctl.handover(c, QWEN)
-    with pytest.raises(kit_ctl.KitStateError, match="is serving: stop it first"):
+    with pytest.raises(kit_ctl.KitStateError, match="stop it first"):
         await kit_ctl.handover(c, DSV)
     with pytest.raises(kit_ctl.KitStateError, match="not handed the Sparks"):
         await kit_ctl.attach(c, DSV)

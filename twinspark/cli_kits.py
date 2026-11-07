@@ -220,9 +220,9 @@ def _stop(args, kit: kits.Kit) -> None:
     res = _api(args)("POST", "/api/v1/kits/detach", json={"stop": code != 0, "kit": kit.name}, timeout=300)
     for p in res.get("problems") or []:
         print(f"[tsm] {p}", file=sys.stderr)
-    print(f"{kit.name} stopped. Nothing serves now: tsm activate <profile> brings a TwinSpark model back.")
     if res.get("problems"):
-        sys.exit(1)
+        sys.exit(f"{kit.name} did not stop on every Spark. Its routes are closed; retry stop after fixing the nodes.")
+    print(f"{kit.name} stopped. Nothing serves now: tsm activate <profile> brings a TwinSpark model back.")
 
 
 def _status(args) -> None:

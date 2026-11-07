@@ -79,8 +79,8 @@ async def handover(ctrl: "Controller", name: str, aliases: Optional[list[str]] =
     if ctrl.selfupdate.blocking():
         raise BusyError("TwinSpark is being updated; start the kit when the update has finished")
     cur = state(ctrl)
-    if cur and cur["kit"] != kit.name:
-        raise KitStateError(f"the kit {cur['kit']} is serving: stop it first (tsm kit stop {cur['kit']})")
+    if cur:
+        raise KitStateError(f"the kit {cur['kit']} is still tracked: stop it first (tsm kit stop {cur['kit']})")
     stopped: list[str] = []
     if ctrl.active():
         job = await ctrl.stop()
@@ -102,8 +102,12 @@ async def attach(ctrl: "Controller", name: str, actor: str = "user") -> dict[str
     rec = state(ctrl)
     if not rec or rec["kit"] != name:
         raise KitStateError(f"the kit {name} was not handed the Sparks (tsm kit start {name} does that first)")
+    if rec["state"] != "starting":
+        raise KitStateError(f"the kit {name} is not starting")
     kit = kits.get(name)
     healthy, served = await probe(rec["url"])
+    if state(ctrl) != rec:
+        raise KitStateError(f"the kit {name} changed while checking its health")
     if not healthy:
         raise KitStateError(f"the kit's server does not answer on {rec['url']}/health")
     served = served or kit.served_name
@@ -125,10 +129,13 @@ async def detach(ctrl: "Controller", stop_containers: bool, actor: str = "user",
     for a in rec.get("aliases") or []:
         if ctrl.gateway.routes.get(a) is not None and ctrl.gateway.routes[a].revision_id == f"kit:{rec['kit']}":
             ctrl.gateway.clear_route(a)
+    rec = {**rec, "state": "stopping"}
+    ctrl.store.kv_set(kits.STATE_KEY, rec)
     stopped, problems = await stop_containers_of(ctrl.agents, rec) if stop_containers else ([], [])
-    ctrl.store.kv_set(kits.STATE_KEY, None)
+    remaining = {**rec, "state": "stop-failed"} if problems else None
+    ctrl.store.kv_set(kits.STATE_KEY, remaining)
     ctrl._audit(actor, "kit.detach", f"kit/{rec['kit']}", {"stopped": stopped, "problems": problems})
-    return {"external": None, "was": rec["kit"], "stopped": stopped, "problems": problems}
+    return {"external": remaining, "was": rec["kit"], "stopped": stopped, "problems": problems}
 
 
 async def stop_containers_of(agents: dict[str, Any], rec: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -137,7 +144,10 @@ async def stop_containers_of(agents: dict[str, Any], rec: dict[str, Any]) -> tup
     problems: list[str] = []
     for node, cname in (rec.get("containers") or {}).items():
         agent = agents.get(node)
-        if agent is None or not isinstance(cname, str):
+        if agent is None:
+            problems.append(f"node {node}: agent is not configured")
+            continue
+        if not isinstance(cname, str):
             continue
         try:
             running = {c.get("name") for c in (await agent.call("foreign_list", timeout=30))["foreign"]}
@@ -158,7 +168,7 @@ async def watch(ctrl: "Controller") -> Optional[str]:
         return None
     healthy, _ = await probe(rec["url"])
     current = state(ctrl)
-    if not current or current.get("since") != rec.get("since"):
+    if not current or current.get("state") != "serving" or current.get("since") != rec.get("since"):
         return None                                # handed back meanwhile
     for a in rec["aliases"]:
         if healthy:
@@ -180,4 +190,5 @@ async def reattach(ctrl: "Controller") -> None:
         await watch(ctrl)
     else:
         for a in rec["aliases"]:
-            ctrl.gateway.mark_down(a, f"{rec.get('title') or rec['kit']} is starting", retry_after=30)
+            reason = "is starting" if rec["state"] == "starting" else "has not stopped; retry Stop"
+            ctrl.gateway.mark_down(a, f"{rec.get('title') or rec['kit']} {reason}", retry_after=30)
