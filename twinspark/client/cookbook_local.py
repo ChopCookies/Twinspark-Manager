@@ -25,7 +25,7 @@ from ..cookbook import (
     recipe_detail,
 )
 from ..cookbook import community as reports
-from ..cookbook.remote import RemoteError, fetch_text, list_source
+from ..cookbook.remote import RemoteError, fetch_text, list_source, verify_recipe
 from .app import ImportIn  # module level: FastAPI resolves the (string) annotation from here
 from .session import ClientSession
 
@@ -129,7 +129,7 @@ def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callabl
 
     @app.get("/api/v1/cookbook/community")
     async def community(source: Optional[str] = None, refresh: bool = False):
-        """Recipe files in the configured GitHub sources, fetched from this computer (cached ~10 min)."""
+        """Recipes in configured GitHub folders and registries, fetched from this computer."""
         sources = [source] if source else (session.node_cfg.get("recipe_sources") or ["eugr/spark-vllm-docker:recipes"])
         out: list[dict[str, Any]] = []
         for src in sources:
@@ -143,10 +143,13 @@ def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callabl
     async def import_any(req: ImportIn):
         if bool(req.text) == bool(req.url):
             raise HTTPException(422, "send exactly one of text or url")
+        if req.expected_sha256 is not None and not req.url:
+            raise HTTPException(422, "expected_sha256 requires a recipe URL")
         text, ref = req.text, "pasted"
         if req.url:
             try:
                 text = await asyncio.to_thread(fetch_text, req.url)
+                verify_recipe(text, req.expected_sha256)
             except RemoteError as e:
                 raise HTTPException(422, str(e)) from None
             ref = req.url

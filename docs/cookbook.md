@@ -79,6 +79,28 @@ cookbook:
 The workstation client uses node A's settings and keeps its own copy in its folder. An unreleased build that
 is newer than the catalog keeps its own recipes where both have one.
 
+## Browse TwinSpark Community
+
+To opt in to browsing the public recipe registry, add its HTTPS listing to
+`recipe_sources` in `/etc/twinspark/controller.yaml` on Spark A (keep any other sources you use):
+
+```yaml
+recipe_sources:
+  - eugr/spark-vllm-docker:recipes
+  - https://studio-tools.info/api/v1/recipes
+```
+
+Restart the controller and reconnect the workstation client to pick up the change. In
+**Cookbook → Community**, choose **Preview & import**. TwinSpark reads up to five pages and
+checks the numbered recipe download against the registry's SHA-256 before showing its preview.
+The import uses that reviewed draft; browsing and preview do not start a model or send reports.
+Checksums detect mismatched content, not whether a recipe is safe or tested on your hardware.
+Self-hosted registries must serve their numbered downloads from the same HTTPS API base.
+
+Paste a recipe's **latest** URL manually if you want to follow new versions with the recipe-update
+workflow. Numbered URLs stay fixed. `cookbook.community_url` below is a separate opt-in reporting
+endpoint, not the recipe registry.
+
 ## Community results
 
 How often does a recipe work, how fast is it on other people's Sparks, and what did they change? Results

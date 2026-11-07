@@ -1668,7 +1668,7 @@ async function viewCookbook(tab) {
       const r = await GET(`/api/v1/cookbook/recipes/${enc(el.dataset.name)}`);
       await modal({ title: r.title || r.name, wide: true, body: reportHtml(r.report, r.draft) + `<div class="section-title">Recipe file · ${esc(r.file)}</div>${codeBlock(r.text)}` });
     },
-    preview: (el) => busy(el, () => previewImport({ url: el.dataset.url })),
+    preview: (el) => busy(el, () => previewImport({ url: el.dataset.url, expected_sha256: el.dataset.sha256 || undefined })),
     "catalog-refresh": async (el) => {
       const r = await busy(el, () => POST("/api/v1/cookbook/catalog/refresh"));
       const parts = ["added", "updated", "removed"].filter(k => r[k]?.length).map(k => `${r[k].length} ${k}`);
@@ -1772,11 +1772,11 @@ async function chooseRecipeMode(recipe) {
   return $('input[name="recipe-mode"]:checked', root)?.value || recipe.default_mode || "";
 }
 async function viewCookbookCommunity(g, head, refresh) {
-  render(g, `<div class="view">${head}<div class="card"><div class="loading"><span class="spin"></span> reading GitHub…</div></div></div>`);
+  render(g, `<div class="view">${head}<div class="card"><div class="loading"><span class="spin"></span> reading recipe sources…</div></div></div>`);
   const data = await GET("/api/v1/cookbook/community" + qs({ refresh: refresh ? "true" : "" }));
   render(g, `<div class="view">${head}${data.sources.map(src => `<div class="card"><div class="card-head"><h2 class="mono">${esc(src.source)}</h2><button class="btn sm" data-act="refresh">Refresh</button></div>
-    ${src.error ? `<div class="callout warn"><div>${esc(src.error)}</div></div>` : src.files.length ? `<div class="table-wrap"><table><tbody>${src.files.map(f => `<tr><td class="mono">${esc(f.name)}</td><td class="num small muted">${bytes(f.size)}</td><td class="actions">${f.url ? `<a class="btn sm ghost" href="${esc(f.url)}" target="_blank" rel="noopener">GitHub</a>` : ""}<button class="btn sm primary" data-act="preview" data-url="${esc(f.download_url || f.url)}" data-name="${esc(f.name)}">Preview &amp; import</button></td></tr>`).join("")}</tbody></table></div>` : empty("No recipe files")}
-    </div>`).join("")}<p class="small muted">Add more folders with <span class="mono">recipe_sources</span> in controller.yaml (owner/repo:path[@ref]).</p></div>`);
+    ${src.error ? `<div class="callout warn"><div>${esc(src.error)}</div></div>` : src.files.length ? `<div class="table-wrap"><table><tbody>${src.files.map(f => `<tr><td class="mono">${esc(f.title || f.name)}</td><td class="num small muted">${f.version ? `v${esc(f.version)} · community` : bytes(f.size)}</td><td class="actions">${f.url ? `<a class="btn sm ghost" href="${esc(f.url)}" target="_blank" rel="noopener">GitHub</a>` : ""}<button class="btn sm primary" data-act="preview" data-url="${esc(f.download_url || f.url)}" data-sha256="${esc(f.sha256 || "")}">Preview &amp; import</button></td></tr>`).join("")}</tbody></table></div>` : empty("No recipe files")}
+    ${src.truncated ? `<p class="small muted">Showing the first five registry pages. Browse the Community website for more.</p>` : ""}</div>`).join("")}<p class="small muted">Add GitHub folders (owner/repo:path[@ref]) or HTTPS Community /api/v1/recipes URLs with <span class="mono">recipe_sources</span> in controller.yaml.</p></div>`);
 }
 async function viewRecipeUpdates(g, head) {
   let updates = [];
