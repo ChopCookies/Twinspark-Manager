@@ -98,7 +98,7 @@ async def metrics(live: bool = False, ctrl: Controller = Depends(controller_dep)
     st = ctrl.gateway.routes.get(act.get("alias", "default"))
     if not st or not st.backends:
         return {"ok": False, "active": True, "note": "no backend routed yet"}
-    snaps = [await scrape_metrics(b, headers=ctrl.gateway.backend_headers()) for b in st.backends]
+    snaps = [await scrape_metrics(b, headers=ctrl.gateway.backend_headers(st)) for b in st.backends]
     return {"active": True, **combine_snapshots(snaps)}
 
 

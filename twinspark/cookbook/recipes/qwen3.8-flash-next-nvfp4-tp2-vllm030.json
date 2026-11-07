@@ -1,0 +1,78 @@
+{
+  "name": "qwen3.8-flash-next-nvfp4-tp2-vllm030",
+  "description": "Qwen3.8-Flash-Next NVFP4 on the stock vLLM 0.30.0 image: TP2 + expert parallel, MTP3, BF16 KV, 262K context. No patches, no custom image.",
+  "tags": ["qwen", "moe", "mtp", "experimental"],
+  "simple": {
+    "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "quantization": "nvfp4",
+    "topology": "tp-ep",
+    "context_length": 262144,
+    "concurrency": 8,
+    "thinking": true,
+    "tool_calling": true,
+    "api_alias": "default",
+    "extra_aliases": ["qwen"]
+  },
+  "behaviour": {
+    "reasoning_parser": "qwen3",
+    "tool_call_parser": "qwen3_coder"
+  },
+  "advanced": {
+    "kv_dtype": "auto",
+    "prefix_cache": true,
+    "chunked_prefill": true,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 8192,
+    "gpu_memory_utilization": 0.8,
+    "weight_loader": "safetensors",
+    "speculative_config": {
+      "method": "mtp",
+      "num_speculative_tokens": 3,
+      "disable_eagle_block_drop": true,
+      "index_share_for_mtp_iteration": true
+    },
+    "compilation_config": {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"},
+    "env": {
+      "VLLM_USE_BREAKABLE_CUDAGRAPH": "0",
+      "VLLM_ENGINE_READY_TIMEOUT_S": "1800",
+      "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/tmp/fi_autotune"
+    },
+    "extra_vllm_flags": {
+      "safetensors-load-strategy": "lazy",
+      "mamba-ssm-cache-dtype": "bfloat16",
+      "mm-encoder-tp-mode": "data",
+      "all2all-backend": "allgather_reducescatter",
+      "enable-prompt-tokens-details": true
+    }
+  },
+  "runtime_adapter": "custom",
+  "distributed_backend": "mp",
+  "verification": "experimental",
+  "image_hint": "vllm/vllm-openai:v0.30.0",
+  "source": {
+    "title": "Qwen3.8-Flash-Next NVFP4 — stock vLLM 0.30, TP2+EP, MTP3",
+    "url": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks",
+    "author": "Mia's AI Lab (vLLM 0.30 lane, measurements), based on getrefined's TP2 recipe",
+    "measured": {
+      "single_stream_tok_s": 52.5,
+      "aggregate_c8_tok_s": 194.4,
+      "kv_pool": "1,467,072 tokens (BF16 KV, gpu-memory-utilization 0.80)",
+      "boot": "~11 min until the KV cache is allocated (the source's launch, weights already on both nodes)",
+      "note": "prose, from the source's 'v0.30 stock' column (code: 61.5 / 316.5). Measured with vLLM's default breakable CUDA graphs, which this recipe turns off: on the source's lane that made decode steadier and 13–19% faster at 2+ streams."
+    },
+    "requirements": [
+      "Image vllm/vllm-openai:v0.30.0 (arm64, CUDA 13.0) on both nodes — Pin resolves its digest. It loads the nvidia checkpoint natively (Qwen4Exp); none of the day-0 image's patches are needed.",
+      "~126 GiB free on each node for the checkpoint (133 GB, 11 shards).",
+      "BF16 KV only: v0.30's QSA attention accepts nothing else. FP8 KV (2.64M tokens) needs a backport of vllm#55557 that the source applies as a patch; it is not part of this recipe."
+    ],
+    "notes": [
+      "A port of the source's start-v030.sh (commit cd839d0b) with the same flags and environment, except its reduced draft-vocabulary overlay. That overlay drafts over 47k instead of 248k tokens and measured 5–15% faster decode (prose 57.6 / code 71.5 tok/s at one stream). It is a patch script under AGPL-3.0, so it is not included here.",
+      "gpu-memory-utilization 0.80, not higher: at 0.835 a 6-client soak left both nodes at 0.3–0.9 GiB MemAvailable, where GB10 boxes hard-reset. At 0.80 a 1-hour soak kept 4.5 GiB (node A) and 7.8 GiB (node B), with 1,348 of 1,349 requests correct.",
+      "VLLM_ENGINE_READY_TIMEOUT_S 1800 is TwinSpark's addition: the source documents about 11 minutes to the KV cache allocation, close to vLLM's own 600 s limit.",
+      "FlashInfer autotunes into /tmp inside each container: a persisted cache that differed between the two nodes deadlocked TP2 at the autotune step once.",
+      "The SSM state runs in bfloat16 (the checkpoint asks for float32). This halves the state each step moves. On the source's single-Spark recipe it measured +6.8% decode at one stream and +8.5% at eight.",
+      "vLLM 0.30 fixes the missed prefix-cache hit on the first repeat of a prompt (vllm#54713, vllm#53945): multi-turn TTFT measured 0.28–0.40 s against 0.63 s on the day-0 image.",
+      "Experimental: the flags follow the published lane. Check them with `tsm plan` and the image check against the pinned image."
+    ]
+  }
+}

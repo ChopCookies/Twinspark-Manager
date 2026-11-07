@@ -57,9 +57,13 @@ def probe_argv(docker: str, image_ref: str, script: str, name: str) -> list[str]
             image_ref, "-c", script]
 
 
+# an inference engine started outside TwinSpark (it holds GPU memory a start would also need)
+_ENGINE_WORDS = ("vllm", "sglang", "tensorfold", "tf-dsv41")
+
+
 def _looks_like_vllm(image: str, command: str) -> bool:
     text = f"{image} {command}".lower()
-    return "vllm" in text or "sglang" in text
+    return any(w in text for w in _ENGINE_WORDS)
 
 
 class DockerRuntime:
@@ -174,7 +178,7 @@ class DockerRuntime:
         if not name:
             return False
         out = self._run([self.docker, "top", name, "-eo", "args"], check=False, timeout=10)
-        return "vllm serve" in out or "sglang" in out
+        return any(w in out for w in ("vllm serve", "sglang", "tensorfold-native", "tf-dsv41-lanes"))
 
     def state(self, name: str) -> ContainerStatus:
         out = self._run([self.docker, "inspect", "--format",
