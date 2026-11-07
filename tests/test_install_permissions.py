@@ -181,6 +181,18 @@ def test_units_that_stay_up_pass(tmp_path, monkeypatch):
     assert p.steps[-1].status == "done"
 
 
+@pytest.mark.parametrize("substate", ["listening", "running"])
+def test_socket_activated_terminal_passes_setup_without_a_pid(tmp_path, monkeypatch, substate):
+    clock = [0.0]
+    monkeypatch.setattr(provision.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(provision.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    run = Recorder([(["systemctl", "show"], (0, f"ActiveState=active\nSubState={substate}\n"))])
+    p = provisioner(tmp_path, run)
+    p.start(["twinspark-terminal.service", "twinspark-terminal.socket"])
+    assert p.steps[-1].status == "done"
+    assert clock[0] < p.UNIT_TIMEOUT_S
+
+
 # ---- rendered socket addresses -----------------------------------------------------------------------
 @pytest.mark.parametrize("host,port,want", [("127.0.0.1", 9444, "127.0.0.1:9444"),
                                             ("192.168.100.2", "9444", "192.168.100.2:9444"),
