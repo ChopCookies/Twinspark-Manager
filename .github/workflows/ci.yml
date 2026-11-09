@@ -123,7 +123,7 @@ jobs:
     # socket activation, and an install by an operator whose umask is 077. Every check found a real bug in 0.8.0.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: install.sh under umask 077, then unattended single-node setup
         run: |
           sudo bash -c 'umask 077 && ./install.sh --yes --single --runtime-mode dry-run --skip-checks \
