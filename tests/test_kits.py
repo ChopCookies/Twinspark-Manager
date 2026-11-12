@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import sys
 from pathlib import Path
@@ -132,6 +133,66 @@ async def test_handover_stops_twinsparks_model_and_the_gateway_forwards_to_the_k
     ext = c.status()["external"]
     assert ext["kit"] == QWEN and ext["state"] == "serving" and ext["containers"] == {"A": "qwen38-fn-tf",
                                                                                      "B": "qwen38-fn-tf"}
+
+
+async def test_handover_stops_a_twinspark_container_that_no_active_model_accounts_for(cluster, healthy):
+    """A failed switch or a node that was away can leave a container without an active record. The kit must not
+    load next to it: on GB10 two engines in one Spark's memory freeze the machine."""
+    c = cluster.controller
+    c.create_profile(draft("qwen", Topology.TP2))
+    assert (await cluster.wait_job((await c.activate("qwen")).job_id)).state.value == "completed"
+    c.store.kv_set("active", None)                           # the record is gone, the containers are not
+    assert c.active() is None and all(cluster.runtimes[n].containers for n in "AB")
+    res = await kit_ctl.handover(c, QWEN)
+    assert not any(cluster.runtimes[n].containers for n in "AB")
+    assert res["stopped_twinspark_model"] and "tsm-qwen" in res["stopped_twinspark_model"][0]
+
+
+async def test_handover_with_nothing_running_reports_nothing_stopped(cluster, healthy):
+    res = await kit_ctl.handover(cluster.controller, QWEN)
+    assert res["stopped_twinspark_model"] == [] and set(res["memory"]) == {"A", "B"}
+
+
+async def test_handover_is_refused_while_a_spark_cannot_be_freed(cluster, healthy, monkeypatch):
+    c = cluster.controller
+    c.create_profile(draft("qwen", Topology.TP2))
+    assert (await cluster.wait_job((await c.activate("qwen")).job_id)).state.value == "completed"
+
+    def stuck(name, grace_s=30):
+        raise RuntimeError("docker stop timed out")
+    monkeypatch.setattr(cluster.runtimes["B"], "stop", stuck)
+    with pytest.raises(kit_ctl.HandoverError, match="could not be stopped on every Spark"):
+        await kit_ctl.handover(c, QWEN)
+    assert kit_ctl.state(c) is None                          # nothing was handed over
+    app = create_app(c, "mgmt-key", run_startup=False)
+    with TestClient(app) as client:
+        r = client.post(f"/api/v1/kits/{QWEN}/handover", json={"confirm": QWEN}, headers={"x-api-key": "mgmt-key"})
+    assert r.status_code == 502 and "could not be stopped" in r.json()["detail"]
+
+
+async def test_handover_reports_each_sparks_free_memory_after_the_model_is_gone(cluster, healthy):
+    c = cluster.controller
+    c.create_profile(draft("qwen", Topology.TP2))
+    assert (await cluster.wait_job((await c.activate("qwen")).job_id)).state.value == "completed"
+    res = await kit_ctl.handover(c, QWEN)
+    assert set(res["memory"]) == {"A", "B"} and res["min_available_gib"] == 102
+    for m in res["memory"].values():
+        assert m["available_gib"] > 0 and m["total_gib"] >= m["available_gib"]
+
+
+async def test_doctor_names_the_serving_kits_container_instead_of_warning_about_it(cluster, healthy):
+    c = cluster.controller
+    await kit_ctl.handover(c, QWEN)
+    kit_running(cluster)
+    await kit_ctl.attach(c, QWEN)
+    cluster.runtimes["B"].foreign.append({"name": "someones-vllm", "image": "vllm/vllm-openai:v0.30.0",
+                                          "status": "Up", "command": "vllm serve"})
+    checks = (await c.doctor())["checks"]
+    kit_rows = [x for x in checks if x["check"] == "kit"]
+    assert {x["node"] for x in kit_rows} == {"A", "B"} and all(x["status"] == "pass" for x in kit_rows)
+    warned = [x for x in checks if x["check"] == "foreign vLLM"]
+    assert [x["node"] for x in warned] == ["B"] and "someones-vllm" in warned[0]["detail"]
+    assert "qwen38-fn-tf" not in warned[0]["detail"]
 
 
 async def test_a_kit_that_does_not_answer_is_not_routed(cluster, healthy):
@@ -269,20 +330,28 @@ class FakeApi:
         self.calls.append((method, path, kw.get("json")))
         if path == "/api/v1/status":
             return {"active": {"profile": self.active} if self.active else None}
+        if path == "/api/v1/kits":
+            return {"kits": [], "external": self.external}
+        if path.endswith("/handover"):
+            return {"external": {"kit": QWEN}, "memory": self.memory, "min_available_gib": 102}
         if path.endswith("/attach"):
-            return {"external": {"aliases": ["default", "qwen"], "served": "Qwen3.8-Flash-Next"}}
+            return self.attach
         if path.endswith("/detach"):
             return {"stopped": [], "problems": []}
         return {}
+
+    external = None
+    memory = {"A": {"available_gib": 118.2, "total_gib": 121.6}, "B": {"available_gib": 119.0, "total_gib": 121.6}}
+    attach = {"external": {"aliases": ["default", "qwen"], "served": "Qwen3.8-Flash-Next"}}
 
 
 def checkout(tmp_path: Path, start_code: int = 0) -> Path:
     d = tmp_path / "home" / "twinspark-kits" / QWEN
     (d / "scripts").mkdir(parents=True)
     log = tmp_path / "ran.log"
-    (d / "start.sh").write_text(f'#!/bin/sh\necho "start HOST=$HOST PORT=$PORT args=$* cwd=$PWD" >> {log}\n'
-                                f"exit {start_code}\n")
-    (d / "stop.sh").write_text(f'#!/bin/sh\necho "stop" >> {log}\n')
+    (d / "start.sh").write_text(f'#!/bin/sh\necho "start HOST=$HOST PORT=$PORT NAME=$CONTAINER_NAME args=$* '
+                                f'cwd=$PWD" >> {log}\nexit {start_code}\n')
+    (d / "stop.sh").write_text(f'#!/bin/sh\necho "stop PORT=$PORT NAME=$CONTAINER_NAME" >> {log}\n')
     for f in ("start.sh", "stop.sh"):
         (d / f).chmod(0o755)
     d.chmod(0o755)
@@ -315,22 +384,63 @@ def test_kit_start_hands_over_runs_the_kits_script_bound_to_loopback_and_attache
     assert paths == ["/api/v1/status", f"/api/v1/kits/{QWEN}/handover", f"/api/v1/kits/{QWEN}/attach"]
     assert as_user.calls[1][2] == {"confirm": QWEN, "aliases": None, "port": 8888}
     ran = (tmp_path / "ran.log").read_text()
-    assert f"start HOST=127.0.0.1 PORT=8888 args=--max-tokens 16384 cwd={d}" in ran
+    # loopback, and the container name TwinSpark stops later: whatever the kit's own settings file says
+    assert f"start HOST=127.0.0.1 PORT=8888 NAME=qwen38-fn-tf args=--max-tokens 16384 cwd={d}" in ran
+
+
+def test_kit_start_says_how_much_memory_each_spark_has_and_warns_below_the_kits_need(as_user, tmp_path, capsys):
+    checkout(tmp_path)
+    as_user.memory = {"A": {"available_gib": 96.4, "total_gib": 121.6}, "B": {"available_gib": 119.0,
+                                                                                 "total_gib": 121.6}}
+    cli_kits.cmd_kit(args_for("start"), None)
+    out = capsys.readouterr()
+    assert "node A: 96.4 of 121.6 GiB available" in out.out and "node B: 119.0 of 121.6 GiB available" in out.out
+    assert "asks for 102 GiB available on each Spark" in out.err and "Node A has less" in out.err
+    assert "Node B has less" not in out.err
+
+
+def test_a_kit_that_started_but_cannot_be_routed_is_stopped_again(as_user, tmp_path, capsys):
+    """Its own start succeeded, the attach was refused (no health answer, or the Sparks were taken back
+    meanwhile): an engine nobody can reach must not keep both Sparks' memory."""
+    checkout(tmp_path)
+    as_user.attach = {"detail": "the kit's server does not answer on http://127.0.0.1:8888/health"}
+    with pytest.raises(SystemExit, match="was stopped again"):
+        cli_kits.cmd_kit(args_for("start"), None)
+    assert "does not answer" in capsys.readouterr().err
+    assert (tmp_path / "ran.log").read_text().splitlines()[-1] == "stop PORT=8888 NAME=qwen38-fn-tf"
+    assert as_user.calls[-1] == ("POST", "/api/v1/kits/detach", {"stop": True, "kit": QWEN})
 
 
 def test_a_kit_that_fails_to_start_is_cleaned_up(as_user, tmp_path):
     checkout(tmp_path, start_code=3)
     with pytest.raises(SystemExit, match="did not start. Nothing serves now"):
         cli_kits.cmd_kit(args_for("start"), None)
-    assert (tmp_path / "ran.log").read_text().splitlines()[-1] == "stop"
+    assert (tmp_path / "ran.log").read_text().splitlines()[-1] == "stop PORT=8888 NAME=qwen38-fn-tf"
     assert as_user.calls[-1] == ("POST", "/api/v1/kits/detach", {"stop": True, "kit": QWEN})
 
 
-def test_kit_stop_runs_the_kits_stop_and_releases_the_route(as_user, tmp_path):
+def test_a_start_script_that_cannot_be_run_at_all_still_gives_the_sparks_back(as_user, tmp_path, monkeypatch):
     checkout(tmp_path)
+
+    def cannot(argv, cwd, env=None):
+        if argv[0].endswith("start.sh"):
+            raise FileNotFoundError(2, "No such file or directory", "runuser")
+        return 0
+    monkeypatch.setattr(cli_kits, "_run", cannot)
+    with pytest.raises(SystemExit, match="did not start"):
+        cli_kits.cmd_kit(args_for("start"), None)
+    assert as_user.calls[-1] == ("POST", "/api/v1/kits/detach", {"stop": True, "kit": QWEN})
+
+
+def test_kit_stop_runs_the_kits_stop_and_then_lets_twinspark_check_both_sparks(as_user, tmp_path):
+    """The kit's stop.sh ending with success is not proof: one that cannot reach node B over ssh warns and still
+    exits 0 (Mia's Qwen kit does). TwinSpark asks both agents itself, so a rank left on B is stopped or reported."""
+    checkout(tmp_path)
+    as_user.external = {"kit": QWEN, "port": 9100, "state": "serving"}
     cli_kits.cmd_kit(args_for("stop"), None)
-    assert (tmp_path / "ran.log").read_text() == "stop\n"
-    assert as_user.calls == [("POST", "/api/v1/kits/detach", {"stop": False, "kit": QWEN})]
+    assert (tmp_path / "ran.log").read_text() == "stop PORT=9100 NAME=qwen38-fn-tf\n"   # the port it was started on
+    assert as_user.calls == [("GET", "/api/v1/kits", None),
+                             ("POST", "/api/v1/kits/detach", {"stop": True, "kit": QWEN})]
 
 
 def test_kit_start_refuses_a_folder_everyone_can_write_and_a_remote_controller(as_user, tmp_path):
@@ -341,6 +451,15 @@ def test_kit_start_refuses_a_folder_everyone_can_write_and_a_remote_controller(a
     with pytest.raises(SystemExit, match="writable by every user"):
         cli_kits.cmd_kit(args_for("start"), None)
     assert not as_user.calls                        # nothing was handed over
+
+
+def test_a_home_folder_behind_a_symlink_still_finds_the_kits_scripts(as_user, tmp_path, monkeypatch):
+    """/home on another disk, reached through a symlink: the checkout was refused as "not the kit's"."""
+    d = checkout(tmp_path)
+    (tmp_path / "link").symlink_to(tmp_path / "home")
+    monkeypatch.setattr(cli_kits, "_user", lambda: ("me", tmp_path / "link", os.getuid()))
+    cli_kits.cmd_kit(args_for("start"), None)
+    assert f"cwd={d}" in (tmp_path / "ran.log").read_text()
 
 
 def test_the_scripts_never_run_as_root(monkeypatch, tmp_path):
@@ -357,7 +476,44 @@ def test_the_scripts_never_run_as_root(monkeypatch, tmp_path):
             pwd.getpwnam("nobody")
     monkeypatch.setenv("SUDO_USER", me.pw_name)
     seen = []
-    monkeypatch.setattr(cli_kits.subprocess, "call", lambda argv, **kw: seen.append(argv) or 0)
-    assert cli_kits._run(["./start.sh"], cwd=tmp_path, env={"HOST": "127.0.0.1"}) == 0
-    assert seen[0][:4] == ["runuser", "-u", me.pw_name, "--"]
-    assert f"HOME={me.pw_dir}" in seen[0] and "HOST=127.0.0.1" in seen[0] and seen[0][-1] == "./start.sh"
+    monkeypatch.setattr(cli_kits.subprocess, "call", lambda argv, **kw: seen.append((argv, kw)) or 0)
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/run/user/1000/agent sock")
+    assert cli_kits._run(["./start.sh", "--note", "it's"], cwd=tmp_path, env={"HOST": "127.0.0.1"}) == 0
+    argv, kw = seen[0]
+    # the user's login shell: their PATH (~/.local/bin, where pip puts the hf command), not sudo's
+    assert argv[:4] == ["runuser", "-l", me.pw_name, "-c"] and kw == {}
+    inner = shlex.split(argv[4])
+    assert inner[:4] == ["cd", str(tmp_path), "&&", "exec"] and inner[4] == "env"
+    assert "HOST=127.0.0.1" in inner and "SSH_AUTH_SOCK=/run/user/1000/agent sock" in inner
+    assert inner[-3:] == ["./start.sh", "--note", "it's"]          # arguments survive the shell unchanged
+
+
+def test_as_the_user_themselves_the_scripts_keep_their_environment(monkeypatch, tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("tsm kit runs on node A (Linux)")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(cli_kits, "_user", lambda: ("me", tmp_path, 1000))
+    monkeypatch.setenv("PATH", "/home/me/.local/bin:/usr/bin")
+    argv, kw = cli_kits._as_user(["./start.sh"], tmp_path, {"PORT": "8888"})
+    assert argv == ["./start.sh"] and kw["cwd"] == tmp_path
+    assert kw["env"]["PATH"] == "/home/me/.local/bin:/usr/bin" and kw["env"]["PORT"] == "8888"
+
+
+def test_kit_update_reads_the_version_as_the_user_not_as_root(monkeypatch, tmp_path, capsys):
+    """Root's git refuses a repository that belongs to someone else ("dubious ownership"): under sudo the old
+    code read two empty versions and reported "at the newest version ()"."""
+    if sys.platform == "win32":
+        pytest.skip("tsm kit runs on node A (Linux)")
+    d = checkout(tmp_path)
+    monkeypatch.setattr(cli_kits, "_user", lambda: ("me", tmp_path / "home", os.getuid()))
+    heads = iter(["abc1234", "def5678"])
+    asked = []
+
+    def output(argv, cwd):
+        asked.append((argv, cwd))
+        return next(heads)
+    monkeypatch.setattr(cli_kits, "_output", output)
+    monkeypatch.setattr(cli_kits, "_run", lambda argv, cwd, env=None: 0)
+    cli_kits.cmd_kit(args_for("update"), None)
+    assert "abc1234 → def5678" in capsys.readouterr().out
+    assert asked == [(["git", "rev-parse", "--short", "HEAD"], d)] * 2

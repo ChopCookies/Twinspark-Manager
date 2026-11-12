@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.8.2 — 2026-11-12 — kits, the Community registry, and a second review
+
+Everything since 0.8.1 was merged: Mia's AI Lab's fastest set-ups as kits, the Community recipe registry, and
+the fixes of a fresh review. The review ran the CLI as its own process against real servers and a stand-in
+kit. That showed what unit tests with fakes had not: under `sudo`, a kit's scripts did not get the user's
+`PATH`.
+
+### Kits: set-ups that run with their author's own scripts
+
+Mia's AI Lab's fastest two-Spark set-ups run on TensorFold, their own Zig engine. They change almost daily.
+A kit runs them with the author's own scripts instead of a frozen port:
+
+- **`tsm kit get` / `update` / `prepare`** clone the author's repository, pull it, and run its one-time
+  set-up. TwinSpark's model keeps serving meanwhile.
+- **`sudo tsm kit start <kit>`** stops TwinSpark's model on both Sparks. It then runs the kit's `start.sh`
+  as you, never as root, bound to `127.0.0.1`. TwinSpark's gateway forwards the kit's aliases to it, so apps
+  keep TwinSpark's endpoint and keys. The kit's server never receives TwinSpark's backend key.
+- **Hand-back:** `tsm kit stop`, Stop in the GUI, `tsm stop` and a switch to a profile all stop the kit's
+  containers on both Sparks. A switch whose kit containers cannot be stopped fails before anything starts.
+- **Watching:** the dashboard shows a serving kit. The watchdog marks its aliases down while it does not
+  answer. A restarted controller routes it again.
+- **Two kits:**
+  - `mia-deepseek-v4.1-flash-1017`: DeepSeek V4.1 Flash 1017, EXL3 2.9 bpw. The source measured 80.7 tok/s
+    for one request.
+  - `mia-qwen3.8-flash-next-tensorfold`: Qwen3.8 Flash Next NVFP4 with MTP drafts, 67.4 tok/s.
+
+  [docs/kits.md](docs/kits.md)
+- **Nothing of TwinSpark's stays loaded.** The hand-over stops every TwinSpark container on both Sparks, also
+  one a failed switch left behind without an active model, and refuses while a Spark cannot be freed. It then
+  waits until the memory is free, as a switch does. `tsm kit start` prints what each Spark has available and
+  warns when that is less than the kit asks for.
+- **The scripts get your environment.** Under `sudo` they run in your login shell, so your `PATH` applies.
+  sudo's own `PATH` has no `~/.local/bin`, where `pip install --user` puts the `hf` command the DeepSeek kit
+  downloads with: its first start would have stopped at "hf is not installed".
+- **The container name is set, not assumed.** `tsm kit start` and `stop` pass `HOST`, `PORT` and
+  `CONTAINER_NAME` to the kit's scripts. A different name in the kit's own `scripts/local.sh` would have left
+  TwinSpark stopping a container that does not exist while the real one kept both Sparks' memory.
+- **Stopping is checked on both Sparks.** After the kit's `stop.sh`, TwinSpark asks each Spark itself. Mia's
+  Qwen `stop.sh` ends with success when it cannot reach node B, and the rank there would have stayed loaded.
+  A kit that cannot be stopped stays listed as `stop-failed` until a stop succeeds.
+- **A kit that started but cannot be served is stopped again**, with the reason. Before, it kept running
+  where no client could reach it.
+- **A home folder behind a symlink works.** `tsm kit start` refused such a checkout as "not the kit's".
+- `tsm status`, the dashboard and doctor name a serving kit. Its container is no longer reported as a
+  foreign engine. `tsm kit` lists each kit's container, and `tsm kit update` reads the version under `sudo`
+  too (root's git refused the user's checkout and both versions came back empty).
+- The agents count TensorFold containers as inference engines running outside TwinSpark: Diagnostics lists
+  them and can stop them.
+
+### Recipes
+
+- **`qwen3.8-flash-next-nvfp4-tp2-vllm030`:** Qwen3.8-Flash-Next NVFP4 at TP2 + expert parallel with MTP3 on the
+  stock `vllm/vllm-openai:v0.30.0` image, no patches and no custom image. It takes the flags and
+  measurements of Mia's AI Lab's vLLM 0.30 lane. The source measured 52.5 tok/s for one stream and a
+  1.47M-token BF16 KV pool.
+- **`qwen3.8-flash-next-nvfp4-tp2`:** `gpu-memory-utilization` 0.80 instead of 0.85. At 0.835 the same model
+  left both nodes under 1 GiB `MemAvailable` under load, where GB10 boxes hard-reset.
+- [docs/notes/mia-ai-lab.md](docs/notes/mia-ai-lab.md): Mia's AI Lab's other two-Spark kits, and what
+  each one needs before it can become a recipe: SGLang patches, Engram tables, or a TensorFold engine.
+
+### TwinSpark Community registry
+
+- **Cookbook → Community** also lists an HTTPS recipe registry (`recipe_sources`, a URL ending in
+  `/api/v1/recipes`). Each numbered download is checked against the registry's SHA-256 before its preview is
+  shown. [docs/cookbook.md](docs/cookbook.md#browse-twinspark-community)
+
+### Fixes
+
+- **Pinned patches: the download is bounded.** The file was read whole into node A's controller before its
+  size was checked, and redirects were followed. It is now read only up to the 8 MiB limit, and a redirect is
+  an error. The pinned SHA-256 decided what gets installed before and still does.
+- **Release notes link to real pages.** The notes are this file's section, and its links to `docs/…` led
+  nowhere on a release page and in the GUI's update notes. They now point at the file as it is at the tag.
+- `docs/updating.md` says what to do while no release is published: update by hand.
+
+### CI
+
+- **A kit, end to end.** A stand-in kit (`tests/fake_kit`: a real server behind `start.sh` and `stop.sh`) runs
+  in the test suite against the demo cluster, and in the systemd job under `sudo`. It checks who the scripts
+  run as, their environment, the answer through the gateway, that the kit received no TwinSpark key, and
+  that stop closes the route.
+
 ## 0.8.1 — 2026-10-30 — fixes from the first upgrade of two real Sparks to 0.8.0
 
 The upgrade of a two-Spark cluster to 0.8.0 found the problems below. Each one was worked around on site, and
@@ -59,40 +141,6 @@ preparation pinned everything, then stopped at `mod(s) not installed`. Now:
   content under the patch's name. This check runs while the revision resolves, before anything is downloaded.
 - `tsm mods required PROFILE` shows each mod's state: missing on a node, different between the nodes,
   installed, and the pinned patch or not. GPU behaviour still shows only in a real activation.
-
-### Kits: set-ups that run with their author's own scripts
-
-Mia's AI Lab's fastest two-Spark set-ups run on TensorFold, their own Zig engine. They change almost daily.
-A kit runs them with the author's own scripts instead of a frozen port:
-
-- **`tsm kit get` / `update` / `prepare`** clone the author's repository, pull it, and run its one-time
-  set-up. TwinSpark's model keeps serving meanwhile.
-- **`sudo tsm kit start <kit>`** stops TwinSpark's model on both Sparks. It then runs the kit's `start.sh`
-  as you, never as root, bound to `127.0.0.1`. TwinSpark's gateway forwards the kit's aliases to it, so apps
-  keep TwinSpark's endpoint and keys. The kit's server never receives TwinSpark's backend key.
-- **Hand-back:** `tsm kit stop`, Stop in the GUI, `tsm stop` and a switch to a profile all stop the kit's
-  containers on both Sparks. A switch whose kit containers cannot be stopped fails before anything starts.
-- **Watching:** the dashboard shows a serving kit. The watchdog marks its aliases down while it does not
-  answer. A restarted controller routes it again.
-- **Two kits:**
-  - `mia-deepseek-v4.1-flash-1017`: DeepSeek V4.1 Flash 1017, EXL3 2.9 bpw. The source measured 80.7 tok/s
-    for one request.
-  - `mia-qwen3.8-flash-next-tensorfold`: Qwen3.8 Flash Next NVFP4 with MTP drafts, 67.4 tok/s.
-
-  [docs/kits.md](docs/kits.md)
-- The agents count TensorFold containers as inference engines running outside TwinSpark: Diagnostics lists
-  them and can stop them.
-
-### Recipes
-
-- **`qwen3.8-flash-next-nvfp4-tp2-vllm030`:** Qwen3.8-Flash-Next NVFP4 at TP2 + expert parallel with MTP3 on the
-  stock `vllm/vllm-openai:v0.30.0` image, no patches and no custom image. It takes the flags and
-  measurements of Mia's AI Lab's vLLM 0.30 lane. The source measured 52.5 tok/s for one stream and a
-  1.47M-token BF16 KV pool.
-- **`qwen3.8-flash-next-nvfp4-tp2`:** `gpu-memory-utilization` 0.80 instead of 0.85. At 0.835 the same model
-  left both nodes under 1 GiB `MemAvailable` under load, where GB10 boxes hard-reset.
-- [docs/notes/mia-ai-lab.md](docs/notes/mia-ai-lab.md): Mia's AI Lab's other two-Spark kits, and what
-  each one needs before it can become a recipe: SGLang patches, Engram tables, or a TensorFold engine.
 
 ### CI
 

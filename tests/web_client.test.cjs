@@ -794,3 +794,13 @@ test("a kit serving through the gateway shows on the dashboard and Stop ends it"
   const idle = c.run("dashboardHtml({routes:[], nodes:{}}, {}, [], null)");
   assert.match(idle, /data-act="stop" disabled/);
 });
+
+test("a serving kit's own container is not flagged as a foreign engine on its node card", () => {
+  const c = client();
+  const hw = "{hostname:'spark-a', foreign_inference:[{name:'qwen38-fn-tf'}]}";
+  const kit = "{kit:'mia-qwen3.8-flash-next-tensorfold', containers:{A:'qwen38-fn-tf', B:'qwen38-fn-tf'}}";
+  assert.doesNotMatch(c.run(`nodeCard('A', ${hw}, {}, ${kit})`), /foreign vLLM/);
+  assert.match(c.run(`nodeCard('A', ${hw}, {}, null)`), /foreign vLLM/);              // no kit serving: a warning
+  const other = "{hostname:'spark-a', foreign_inference:[{name:'qwen38-fn-tf'}, {name:'someones-vllm'}]}";
+  assert.match(c.run(`nodeCard('A', ${other}, {}, ${kit})`), /foreign vLLM/);         // something else runs too
+});
