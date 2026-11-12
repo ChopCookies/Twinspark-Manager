@@ -50,6 +50,7 @@ nav:
       - Automatic imports and source updates: recipe-automation.md
       - Memory planning: memory-planning.md
       - Engines (vLLM, SGLang): engines.md
+      - "Kits: other people's set-ups (Mia's AI Lab)": kits.md
   - Measuring:
       - Performance lab: perf-lab.md
       - Benchmarks: benchmarks.md
@@ -77,4 +78,5 @@ nav:
       - DeepSeek V4 two-node start-up: notes/deepseek-v4-flash-two-node-startup.md
       - GLM MTP research: notes/glm-mtp-research.md
       - Researched profiles: notes/researched-profiles.md
+      - "Mia's AI Lab recipes": notes/mia-ai-lab.md
       - Review of 0.2 (German): notes/review-0.2-alpha.de.md

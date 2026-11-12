@@ -61,7 +61,7 @@ tsm = "twinspark.cli:main"
 include = ["twinspark*"]
 
 [tool.setuptools.package-data]
-twinspark = ["cookbook/recipes/*.json", "cookbook/recipes/*.yaml", "cookbook/recipes/*.yml",
+twinspark = ["cookbook/recipes/*.json", "cookbook/recipes/*.yaml", "cookbook/recipes/*.yml", "cookbook/kits/*.json",
              "web/dist/*.html", "web/dist/css/*.css", "web/dist/js/*.js", "web/dist/vendor/*"]
 
 [tool.ruff]

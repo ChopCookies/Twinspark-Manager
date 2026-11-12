@@ -1455,6 +1455,7 @@ def build_parser() -> argparse.ArgumentParser:
         cli_client,
         cli_gateway,
         cli_keys,
+        cli_kits,
         cli_metrics,
         cli_qsfp,
         cli_remote,
@@ -1470,6 +1471,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_remote.add_parsers(sub, cmd)
     cli_qsfp.add_parsers(sub, cmd)
     cli_update.add_parsers(sub, cmd)
+    cli_kits.add_parsers(sub, cmd)
     from . import demo
     demo.add_parsers(sub, cmd)
     sub.add_parser("first-night").set_defaults(fn=cmd_first_night)      # no help=: not in `tsm --help`

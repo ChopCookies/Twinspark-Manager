@@ -11,9 +11,11 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
 
+from .. import kits
 from ..schemas.enums import ActivationStage
 from ..schemas.job import Job, JobStep
 from ..schemas.profile import ProfileRevision
+from . import kits as kit_ctl
 from .agent_client import AgentActionError, AgentClient
 from .launch import LaunchError, LaunchPlan, LaunchPlanner
 from .measurements import Measurements, kv_memory_from_log, resolve_kv
@@ -542,8 +544,18 @@ class ActivationCoordinator:
             stopped += res["stopped"]
         for a in self.drained:
             self.gateway.clear_route(a)
+        kit_note = ""
+        ext = self.store.kv_get(kits.STATE_KEY) if self.store is not None else None
+        if isinstance(ext, dict) and ext.get("kit"):
+            # a kit served instead of TwinSpark's model: its containers hold the GPUs the new model needs
+            gone, problems = await kit_ctl.stop_containers_of(self.agents, ext)
+            if problems:
+                raise RuntimeError(f"the kit {ext['kit']} could not be stopped: {'; '.join(problems)}")
+            self.store.kv_set(kits.STATE_KEY, None)
+            kit_note = f"; stopped the kit {ext['kit']}" + (f" ({', '.join(gone)})" if gone else "")
         return (f"stopped {len(stopped)} TwinSpark container(s)" + (f": {stopped}" if stopped else "")
-                + (f" (node {', '.join(skipped)} unreachable, not part of this deployment)" if skipped else ""))
+                + (f" (node {', '.join(skipped)} unreachable, not part of this deployment)" if skipped else "")
+                + kit_note)
 
     async def _reclaim(self, job: Job, rev: ProfileRevision, step: JobStep) -> str:
         """Unified memory is released asynchronously after a container exits: drop the

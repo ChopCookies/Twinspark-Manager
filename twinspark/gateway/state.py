@@ -35,7 +35,7 @@ from .gateway import Gateway, RouteState
 FORMAT = "twinspark-gateway/1"
 log = logging.getLogger("twinspark.gateway.state")
 _ROUTE_FIELDS = ("backends", "served_model", "revision_id", "max_model_len", "draining", "down_reason",
-                 "retry_after", "backend_nodes")
+                 "retry_after", "backend_nodes", "keyless")
 
 
 def export_state(gw: Gateway, version: int) -> dict[str, Any]:
@@ -62,6 +62,7 @@ def apply_state(gw: Gateway, doc: dict[str, Any]) -> None:
         st.max_model_len, st.draining = r.get("max_model_len"), bool(r.get("draining"))
         st.down_reason, st.retry_after = r.get("down_reason"), int(r.get("retry_after") or 10)
         st.backend_nodes = dict(r.get("backend_nodes") or {})
+        st.keyless = bool(r.get("keyless"))
         routes[alias] = st
     keys = [k for k in doc.get("keys") or [] if isinstance(k, dict)]
     on_change, gw.on_change = gw.on_change, None
