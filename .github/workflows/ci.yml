@@ -154,6 +154,28 @@ jobs:
           sudo tsm update policy
       - name: the terminal socket listens on its address
         run: systemctl show -p Listen twinspark-terminal.socket | tee /dev/stderr | grep -q '127.0.0.1:9444'
+      - name: a kit runs under sudo as the calling user, and the gateway forwards to it without TwinSpark's key
+        # tests/fake_kit stands in for a kit's own scripts (a real server behind start.sh / stop.sh). Under sudo
+        # they must run as the caller in a login shell, bound to loopback, and reach clients only via the gateway.
+        run: |
+          kit=mia-qwen3.8-flash-next-tensorfold
+          cp -r tests/fake_kit "$HOME/fake-kit"
+          sudo tsm kit start "$kit" --dir "$HOME/fake-kit" --yes
+          cat "$HOME/fake-kit/run.log"
+          grep -q "^start user=$(id -un) HOST=127.0.0.1 PORT=8888 CONTAINER_NAME=qwen38-fn-tf " "$HOME/fake-kit/run.log"
+          key=$(sudo /opt/twinspark/venv/bin/python -I -c "from twinspark.security import SecretsVault as V; \
+            print(V('/etc/twinspark/secrets').get('inference_api_key'))")
+          chat() { curl -s -o chat.json -w '%{http_code}' -H "Authorization: Bearer $key" \
+            -H 'content-type: application/json' \
+            -d '{"model":"default","messages":[{"role":"user","content":"hi"}]}' http://127.0.0.1:8000/v1/chat/completions; }
+          for i in $(seq 1 20); do [ "$(chat)" = 200 ] && break; sleep 1; done
+          [ "$(chat)" = 200 ] || { echo "::error::the gateway does not forward to the kit"; cat chat.json; exit 1; }
+          python3 -c 'import json; d = json.load(open("chat.json")); assert d["model"] == "Fake-Kit-Model", d; assert d["seen_authorization"] is None, d'
+          sudo tsm status | tee /dev/stderr | grep -q "the kit $kit is serving"
+          sudo tsm kit stop "$kit" --dir "$HOME/fake-kit" --yes
+          for i in $(seq 1 20); do [ "$(chat)" != 200 ] && break; sleep 1; done
+          [ "$(chat)" != 200 ] || { echo "::error::the kit's route is still open after tsm kit stop"; exit 1; }
+          ! curl -fsS --max-time 3 http://127.0.0.1:8888/health
       - name: journals
         if: failure()
         run: sudo journalctl -u 'twinspark-*' -n 200 --no-pager

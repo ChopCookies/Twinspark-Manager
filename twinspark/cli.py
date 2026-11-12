@@ -193,6 +193,11 @@ def cmd_status(args, api: Api):
             reason = f" — {h['reason']}" if h.get("reason") else ""
             print(f"half {h['node']}    {h['state']:9} {h['model']} as {', '.join(h['aliases'])}, started by "
                   f"{h.get('label') or h['revision_id']} {_ago(h.get('since'))}{perf}{reason}")
+    elif st.get("external"):
+        # a kit serves with its author's own scripts (tsm kit): not a TwinSpark profile, but not "nothing" either
+        x = st["external"]
+        print(f"active    - (the kit {x['kit']} is {x.get('state')} on {x.get('url')} as "
+              f"{', '.join(x.get('aliases') or [])}, since {_ago(x.get('since'))}; tsm kit status)")
     else:
         print("active    -")
     gp = st.get("gateway_process") or {}

@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from twinspark.releases import CONSTRAINTS, SUMS, TAG_RE, is_prerelease, wheel_name  # noqa: E402
+from twinspark.releases import CONSTRAINTS, REPO, SUMS, TAG_RE, is_prerelease, wheel_name  # noqa: E402
 
 
 def project_version(root: Path = ROOT) -> str:
@@ -38,8 +38,21 @@ def check_tag(tag: str, version: str) -> None:
         raise SystemExit(f"tag {tag} does not match pyproject.toml's version {version}: bump the version first")
 
 
-def notes(changelog: str, version: str) -> str:
-    """The body of ``## <version> — …`` up to the next ``## `` heading."""
+# an inline Markdown link whose target is a path in this repository (no scheme, no leading "#" or "/")
+_REL_LINK = re.compile(r"(?<!!)\[([^\]\n]+)\]\((?![a-zA-Z][a-zA-Z0-9+.-]*:|#|/)([^)\s]+)\)")
+
+
+def absolute_links(body: str, tag: str) -> str:
+    """Repository paths in links become the file at this release's tag. CHANGELOG.md links to ``docs/…``; on a
+    release page and in the GUI's update notes such a link is read against another address and leads nowhere.
+    Text in backticks is left as it is."""
+    base = f"https://github.com/{REPO}/blob/{tag}/"
+    parts = re.split(r"(`[^`\n]*`)", body)
+    return "".join(part if part.startswith("`") else _REL_LINK.sub(rf"[\1]({base}\2)", part) for part in parts)
+
+
+def notes(changelog: str, version: str, tag: str | None = None) -> str:
+    """The body of ``## <version> — …`` up to the next ``## `` heading; with ``tag``, links made absolute."""
     m = re.search(rf"(?m)^## {re.escape(version)}(?: .*)?$", changelog)
     if not m:
         raise SystemExit(f"CHANGELOG.md has no section for {version}")
@@ -49,6 +62,8 @@ def notes(changelog: str, version: str) -> str:
     if not body:
         raise SystemExit(f"the CHANGELOG.md section for {version} is empty")
     title = m.group(0)[3:].strip()
+    if tag:
+        body = absolute_links(body, tag)
     return f"**{title}**\n\n{body}\n"
 
 
@@ -72,7 +87,7 @@ def prepare(tag: str, dist: Path, notes_out: Path, root: Path = ROOT) -> dict:
         raise SystemExit(f"dist/ holds other wheels too: {', '.join(others)}")
     shutil.copyfile(root / "constraints" / "release.txt", dist / CONSTRAINTS)
     sums = write_sums(dist)
-    notes_out.write_text(notes((root / "CHANGELOG.md").read_text(encoding="utf-8"), version),
+    notes_out.write_text(notes((root / "CHANGELOG.md").read_text(encoding="utf-8"), version, tag=tag),
                          encoding="utf-8", newline="\n")
     return {"version": version, "prerelease": is_prerelease(version), "sums": sums}
 

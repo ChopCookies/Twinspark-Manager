@@ -613,7 +613,7 @@ function dashboardHtml(st, series, profs, job) {
   html += `<div class="grid cols-2">`;
   for (const n of Object.keys(st.nodes || {}).sort()) {
     const hw = st.nodes[n] || {}, t = (st.telemetry || {})[n] || {};
-    html += nodeCard(n, hw, t);
+    html += nodeCard(n, hw, t, st.external);
   }
   html += `</div>`;
 
@@ -663,7 +663,7 @@ async function routingFlow() {
 function tile(k, v, unit, series, color, digits = 0) {
   return `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${v == null ? "—" : (typeof v === "number" ? num(v, digits) : esc(v))}${v != null && unit ? `<small>${esc(unit)}</small>` : ""}</div>${series ? spark(series, color) : ""}</div>`;
 }
-function nodeCard(n, hw, t) {
+function nodeCard(n, hw, t, external) {
   if (!hw || hw.error) return `<div class="card"><div class="card-head"><h2>Node ${esc(n)}</h2>${tag("unreachable", "bad")}</div><div class="muted small">${esc((hw && hw.error) || t.error || "no facts yet — agent not reachable at startup")}</div></div>`;
   const total = t.mem_total_gib ?? null;
   const avail = t.mem_available_gib;
@@ -677,7 +677,9 @@ function nodeCard(n, hw, t) {
   if (hw.runtime_mode === "dry-run") warns.push(tag("dry-run", "warn"));
   if (hw.desktop_running) warns.push(tag(`desktop ${gib(hw.desktop_rss_gib)}`, "warn"));
   if (hw.privd_available === false) warns.push(tag("no privd", "warn"));
-  if ((hw.foreign_inference || []).length) warns.push(tag("foreign vLLM", "bad"));
+  // a kit's own container (tsm kit start) runs outside TwinSpark on purpose: it is not a warning
+  const kitContainer = external && external.containers ? external.containers[n] : null;
+  if ((hw.foreign_inference || []).some(c => c.name !== kitContainer)) warns.push(tag("foreign vLLM", "bad"));
   return `<div class="card"><div class="card-head"><h2>Node ${esc(n)} <span class="muted small mono">${esc(hw.hostname || "")}</span></h2><div class="chip-row">${lvl ? tag(lvl, levelClass(lvl)) : ""}${warns.join("")}</div></div>
     ${hostTiles(t)}
     <div class="row between small"><span>Shared memory · ${gib(used)} used of ${gib(total)}</span><span class="muted">${gib(avail)} available</span></div>

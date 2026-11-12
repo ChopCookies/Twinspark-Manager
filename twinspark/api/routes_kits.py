@@ -47,6 +47,8 @@ async def handover(name: str, req: Handover, ctrl: Controller = Depends(controll
         return await kit_ctl.handover(ctrl, name, req.aliases, req.port)
     except (BusyError, kit_ctl.KitStateError) as exc:
         raise HTTPException(409, str(exc)) from exc
+    except kit_ctl.HandoverError as exc:
+        raise HTTPException(502, str(exc)) from exc
     except kits.KitError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
