@@ -714,7 +714,7 @@ def cmd_cookbook(args, api: Api):
         for src in data["sources"]:
             print(f"# {src['source']}" + (f"  — {src['error']}" if src.get("error") else ""))
             for f in src.get("files", []):
-                print(f"  {f['name']:48} {f.get('url') or ''}")
+                print(f"  {f['name']:48} {f.get('download_url') or f.get('url') or ''}")
         print("\nimport one: tsm cookbook import-recipe <url>")
     elif args.action == "import-recipe":
         if not args.name:

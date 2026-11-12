@@ -916,8 +916,7 @@ class Provisioner:
                 f"install under a restrictive umask: sudo chmod -R u+rwX,go+rX,go-w {home}, then run setup again")
 
     def _unit_problem(self, unit: str) -> Optional[str]:
-        """None once ``unit`` is active and running with the same PID for UNIT_SETTLE_S; else why not, with the
-        unit's last journal lines. A unit that restarts in a loop never passes."""
+        """Check for a stable service PID or an active socket listener, including socket activation."""
         deadline, since, pid, last = time.monotonic() + self.UNIT_TIMEOUT_S, None, None, {}
         while time.monotonic() < deadline:
             rc, out = self.run(["systemctl", "show", unit, "-p", "ActiveState", "-p", "SubState",
@@ -927,7 +926,8 @@ class Provisioner:
                 return None                              # cannot tell (not systemd); never block setup on it
             if last.get("Type") == "oneshot" and last["ActiveState"] in ("active", "inactive"):
                 return None
-            running = last["ActiveState"] == "active" and last.get("SubState") == "running"
+            substates = ("listening", "running") if unit.endswith(".socket") else ("running",)
+            running = last["ActiveState"] == "active" and last.get("SubState") in substates
             if running and last.get("MainPID") == pid and since is not None:
                 if time.monotonic() - since >= self.UNIT_SETTLE_S:
                     return None
