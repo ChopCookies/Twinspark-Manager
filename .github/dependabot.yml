@@ -13,6 +13,11 @@ updates:
   # raised by hand (docs/development.md); Dependabot only proposes new pins here.
   - package-ecosystem: pip
     directory: /constraints
+    # minimum.txt pins the oldest versions pyproject.toml allows, and CI tests them. Raising them to the newest
+    # releases would make that job test the newest versions twice: only a person raises them, together with
+    # the floors.
+    exclude-paths:
+      - "minimum.txt"
     schedule:
       interval: weekly
       day: monday

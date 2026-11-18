@@ -75,6 +75,12 @@ A kit runs them with the author's own scripts instead of a frozen port:
   nowhere on a release page and in the GUI's update notes. They now point at the file as it is at the tag.
 - `docs/updating.md` says what to do while no release is published: update by hand.
 
+### Dependencies
+
+- Release pins: FastAPI 0.162.5, pydantic 2.14.3, websockets 17.4, anyio 4.16.0, hf-xet 1.8.0, and patch
+  releases of click, filelock, annotated-doc and typing-inspection. The oldest supported versions
+  (`constraints/minimum.txt`) stay as they are, and Dependabot no longer proposes to raise them.
+
 ### CI
 
 - **A kit, end to end.** A stand-in kit (`tests/fake_kit`: a real server behind `start.sh` and `stop.sh`) runs
