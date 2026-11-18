@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.2 — 2026-11-12 — kits, the Community registry, and a second review
+## 0.8.2 — 2026-11-18 — kits, the Community registry, and a second review
 
 Everything since 0.8.1 was merged: Mia's AI Lab's fastest set-ups as kits, the Community recipe registry, and
 the fixes of a fresh review. The review ran the CLI as its own process against real servers and a stand-in
