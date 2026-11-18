@@ -7,14 +7,15 @@
     sudo tsm kit start NAME          # TwinSpark's model stops, the kit's start.sh runs, the gateway forwards to it
     sudo tsm kit stop NAME           # the kit's stop.sh; nothing serves until you activate a profile
 
-Run them on node A. The kit's scripts run as you (with ``sudo``: as the user who ran sudo), never as root: they use
-your ssh key to node B and your Docker. TwinSpark only stops its own model, routes, and stops the kit's
-containers by name when you switch back.
+Run them on node A. The kit's scripts run as you (with ``sudo``: as the user who ran sudo, in that user's login
+shell), never as root: they use your ssh key to node B, your Docker and your PATH. TwinSpark only stops its own
+model, routes, and stops the kit's containers by name when you switch back.
 """
 
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -47,18 +48,38 @@ def _user() -> tuple[str, Path, Optional[int]]:
 
 
 def _checkout(args, kit: kits.Kit, home: Path) -> Path:
-    return Path(args.dir).expanduser().resolve() if args.dir else home / KITS_HOME / kit.name
+    # resolved in both cases: a home folder behind a symlink must not make the scripts look "outside" it
+    return (Path(args.dir).expanduser() if args.dir else home / KITS_HOME / kit.name).resolve()
+
+
+def _as_user(argv: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> tuple[list[str], dict[str, Any]]:
+    """The command and the subprocess arguments that run ``argv`` in ``cwd`` as the kit's user.
+
+    As root (sudo) it runs in that user's login shell: sudo's own PATH has no ``~/.local/bin``, which is where
+    ``pip install --user`` puts the ``hf`` command the kits download with. An ssh agent that sudo was told to
+    keep (``sudo --preserve-env=SSH_AUTH_SOCK``) is passed on; without one the scripts use the user's key files."""
+    name, _, _ = _user()
+    extra = dict(env or {})
+    if os.geteuid() != 0:
+        return argv, {"cwd": cwd, "env": {**os.environ, **extra}}
+    if os.environ.get("SSH_AUTH_SOCK"):
+        extra.setdefault("SSH_AUTH_SOCK", os.environ["SSH_AUTH_SOCK"])
+    inner = (f"cd {shlex.quote(str(cwd))} && exec env "
+             + " ".join(shlex.quote(f"{k}={v}") for k, v in extra.items()) + " " + shlex.join(argv))
+    return ["runuser", "-l", name, "-c", inner], {}
 
 
 def _run(argv: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> int:
-    """Run as the kit's user. As root (sudo), through runuser with that user's HOME."""
-    name, home, _ = _user()
-    extra = dict(env or {})
-    if os.geteuid() == 0:
-        argv = ["runuser", "-u", name, "--", "env", f"HOME={home}", f"USER={name}", f"LOGNAME={name}",
-                *(f"{k}={v}" for k, v in extra.items()), *argv]
-        return subprocess.call(argv, cwd=cwd)
-    return subprocess.call(argv, cwd=cwd, env={**os.environ, **extra})
+    """Run as the kit's user, with this terminal. Returns the exit status."""
+    cmd, kw = _as_user(argv, cwd, env)
+    return subprocess.call(cmd, **kw)
+
+
+def _output(argv: list[str], cwd: Path) -> str:
+    """The command's output, run as the kit's user ("" when it fails)."""
+    cmd, kw = _as_user(argv, cwd)
+    p = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, **kw)
+    return p.stdout.strip() if p.returncode == 0 else ""
 
 
 def _owned(path: Path, uid: Optional[int]) -> None:
@@ -107,7 +128,8 @@ def _list(args) -> None:
             mark = f"   ← {external.get('state')}, aliases {', '.join(external.get('aliases') or [])}"
         m = k.measured
         speed = f"{m['single_stream_tok_s']} tok/s one request" if m.get("single_stream_tok_s") else ""
-        print(f"{k.name}{mark}\n    {k.title}\n    {k.engine} · {k.model} · {speed}\n    {k.repo}")
+        print(f"{k.name}{mark}\n    {k.title}\n    {k.engine} · {k.model} · {speed}\n"
+              f"    container {k.container} on each Spark · port {k.port} on node A\n    {k.repo}")
     if not catalog:
         print("no kits")
 
@@ -144,12 +166,13 @@ def _update(args, kit: kits.Kit) -> None:
     _, home, uid = _user()
     path = _checkout(args, kit, home)
     _owned(path, uid)
-    before = subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"], capture_output=True,
-                            text=True).stdout.strip()
+    # as the user: root's git refuses a repository that belongs to someone else ("dubious ownership")
+    before = _output(["git", "rev-parse", "--short", "HEAD"], cwd=path)
     if _run(["git", "pull", "--ff-only"], cwd=path) != 0:
         sys.exit("git pull failed (local changes? see git status in the checkout)")
-    after = subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"], capture_output=True,
-                           text=True).stdout.strip()
+    after = _output(["git", "rev-parse", "--short", "HEAD"], cwd=path)
+    if not after:
+        sys.exit(f"{path} is not a git checkout: tsm kit get {kit.name}")
     if before == after:
         print(f"{kit.name} is at the newest version ({after})")
     else:
@@ -185,39 +208,78 @@ def _start(args, kit: kits.Kit) -> None:
     _ask(args, f"{what}{kit.name}'s start.sh runs on 127.0.0.1:{port} and the gateway forwards "
                f"{', '.join(args.alias or kit.aliases)} to it (its first start downloads and builds for a long "
                f"time: tsm kit prepare {kit.name} does that while TwinSpark's model keeps serving). Go on?")
-    api("POST", f"/api/v1/kits/{kit.name}/handover", json={"confirm": kit.name, "aliases": args.alias or None,
-                                                             "port": port}, timeout=900)
-    env = {"HOST": "127.0.0.1", "PORT": str(port)}
-    print(f"[tsm] running {script.relative_to(path)} in {path} (HOST=127.0.0.1 PORT={port})", flush=True)
+    handed = api("POST", f"/api/v1/kits/{kit.name}/handover",
+                 json={"confirm": kit.name, "aliases": args.alias or None, "port": port}, timeout=900)
+    _memory_report(kit, handed)
+    env = kit.env(port)
+    print(f"[tsm] running {script.relative_to(path)} in {path} ({' '.join(f'{k}={v}' for k, v in env.items())})",
+          flush=True)
     try:
         code = _run([str(script), *args.extra], cwd=path, env=env)
     except KeyboardInterrupt:
         code = 130                                  # interrupted: clean up like any other failed start
+    except OSError as exc:                          # the script could not be run at all: the Sparks are handed
+        print(f"[tsm] cannot run {kit.start}: {exc}", file=sys.stderr)       # over already, so give them back
+        code = 126
     if code != 0:
         print(f"[tsm] {kit.start} ended with code {code}: cleaning up with {kit.stop}", file=sys.stderr)
-        stop = path / kit.stop.removeprefix("./")
-        if stop.is_file():
-            _run([str(stop)], cwd=path)
-        api("POST", "/api/v1/kits/detach", json={"stop": True, "kit": kit.name}, timeout=300)
+        _give_back(api, kit, path, env)
         sys.exit(f"{kit.name} did not start. Nothing serves now: tsm activate <profile> brings a TwinSpark model "
                  f"back.")
-    res = api("POST", f"/api/v1/kits/{kit.name}/attach", timeout=60)
-    ext = res.get("external") or {}
+    res = api("POST", f"/api/v1/kits/{kit.name}/attach", timeout=60, ok=(409,))
+    ext = res.get("external") if isinstance(res, dict) else None
+    if not ext:
+        # the kit's own start succeeded, yet TwinSpark cannot route to it (or the Sparks were taken back
+        # meanwhile): an engine nobody can reach must not keep both Sparks' memory
+        why = res.get("detail") if isinstance(res, dict) else res
+        print(f"[tsm] {kit.name} started but cannot be served through the gateway: {why}", file=sys.stderr)
+        _give_back(api, kit, path, env)
+        sys.exit(f"{kit.name} was stopped again. Nothing serves now: tsm activate <profile> brings a TwinSpark "
+                 f"model back.")
     print(f"\n{kit.title} serves through TwinSpark's gateway: model {', '.join(ext.get('aliases') or [])} "
-          f"(served as {ext.get('served')}). tsm kit stop {kit.name} ends it.")
+          f"(served as {ext.get('served')}). sudo tsm kit stop {kit.name} ends it.")
+
+
+def _memory_report(kit: kits.Kit, handed: Any) -> None:
+    """What each Spark has free now that TwinSpark's model is gone, against what the kit asks for."""
+    memory = handed.get("memory") if isinstance(handed, dict) else None
+    need = kit.min_available_gib
+    for node, m in sorted((memory or {}).items()):
+        if m.get("error"):
+            print(f"[tsm] node {node}: memory unknown ({m['error']})", file=sys.stderr)
+            continue
+        print(f"[tsm] node {node}: {m['available_gib']:.1f} of {m['total_gib']:.1f} GiB available", flush=True)
+        if need and m["available_gib"] < need:
+            print(f"[tsm] WARNING: {kit.name} asks for {need:g} GiB available on each Spark with its default "
+                  f"settings. Node {node} has less: the kit's own check may refuse to start. Close other programs "
+                  f"on the node, or lower the kit's context in its scripts/local.sh.", file=sys.stderr)
+
+
+def _give_back(api, kit: kits.Kit, path: Path, env: dict[str, str]) -> None:
+    """The kit's own stop, then TwinSpark checks both Sparks itself and stops what still runs there."""
+    stop = path / kit.stop.removeprefix("./")
+    if stop.is_file():
+        _run([str(stop)], cwd=path, env=env)
+    res = api("POST", "/api/v1/kits/detach", json={"stop": True, "kit": kit.name}, timeout=300)
+    for p in (res.get("problems") if isinstance(res, dict) else None) or []:
+        print(f"[tsm] {p}", file=sys.stderr)
 
 
 def _stop(args, kit: kits.Kit) -> None:
     _on_node_a(args)
     _, home, uid = _user()
     path = _checkout(args, kit, home)
-    code = 1
+    api = _api(args)
+    ext = api("GET", "/api/v1/kits").get("external") or {}
+    port = ext.get("port") if ext.get("kit") == kit.name else None
     if (path / kit.stop.removeprefix("./")).is_file():
         _owned(path, uid)
-        code = _run([str(_script(path, kit.stop))], cwd=path)
+        _run([str(_script(path, kit.stop))], cwd=path, env=kit.env(port))
     else:
         print(f"[tsm] no checkout at {path}: TwinSpark stops the kit's containers by name", file=sys.stderr)
-    res = _api(args)("POST", "/api/v1/kits/detach", json={"stop": code != 0, "kit": kit.name}, timeout=300)
+    # Whatever the kit's stop reported: TwinSpark looks at both Sparks itself. A stop script that could not reach
+    # node B can still end with success, and a rank left there holds that Spark's memory.
+    res = api("POST", "/api/v1/kits/detach", json={"stop": True, "kit": kit.name}, timeout=300)
     for p in res.get("problems") or []:
         print(f"[tsm] {p}", file=sys.stderr)
     if res.get("problems"):

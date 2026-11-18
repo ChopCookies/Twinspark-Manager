@@ -2,8 +2,8 @@
 
 The controller never runs a kit's scripts: ``tsm kit start`` runs them as the operator on node A. Here:
 
-* ``handover`` stops TwinSpark's model on both Sparks and records that the kit is starting; the kit's aliases
-  answer 503 "starting" meanwhile.
+* ``handover`` stops TwinSpark's containers on both Sparks, waits until their memory is free again (as a switch
+  does), and records that the kit is starting; the kit's aliases answer 503 "starting" meanwhile.
 * ``attach`` checks the kit's server on ``127.0.0.1:<port>`` and routes the aliases to it. The gateway sends it no
   backend key (it is not TwinSpark's engine); clients keep TwinSpark's endpoint and keys.
 * ``detach`` closes the routes and, when asked, stops the kit's containers by name on both Sparks (a switch to a
@@ -13,6 +13,7 @@ The controller never runs a kit's scripts: ``tsm kit start`` runs them as the op
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -27,10 +28,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("twinspark.controller.kits")
 HEALTH_TIMEOUT_S = 5.0
+SETTLE_MAX_S = 90.0             # how long a node's memory may take to come back after its containers stopped
 
 
 class KitStateError(RuntimeError):
     """The request does not fit what is serving now (409)."""
+
+
+class HandoverError(RuntimeError):
+    """The Sparks could not be freed for the kit (502): nothing was handed over."""
 
 
 def state(ctrl: "Controller") -> Optional[dict[str, Any]]:
@@ -81,12 +87,15 @@ async def handover(ctrl: "Controller", name: str, aliases: Optional[list[str]] =
     cur = state(ctrl)
     if cur:
         raise KitStateError(f"the kit {cur['kit']} is still tracked: stop it first (tsm kit stop {cur['kit']})")
-    stopped: list[str] = []
-    if ctrl.active():
-        job = await ctrl.stop()
-        if job.error:
-            raise RuntimeError(f"TwinSpark's model could not be stopped: {job.error}")
-        stopped = [s.message for s in job.steps if s.message]
+    # Always, not only with an active model: a failed switch or an unreachable node can leave a TwinSpark
+    # container behind, and the kit must never load next to one (on GB10, running out of memory freezes the node).
+    was_active = bool(ctrl.active())
+    job = await ctrl.stop()
+    if job.error:
+        raise HandoverError(f"TwinSpark's containers could not be stopped on every Spark: {job.error}")
+    # the stop job's step reads "stopped [<node:container>, …]": an empty list means nothing was running
+    stopped = [s.message for s in job.steps if s.message and s.message != "stopped []"]
+    memory = await settle_memory(ctrl, reclaim=was_active or bool(stopped))
     rec = {"kit": kit.name, "title": kit.title, "state": "starting", "aliases": use, "port": port,
            "url": f"http://127.0.0.1:{port}", "served": None, "containers": {n: kit.container for n in ctrl.agents},
            "since": time.time(), "by": actor}
@@ -94,8 +103,39 @@ async def handover(ctrl: "Controller", name: str, aliases: Optional[list[str]] =
     for a in use:
         ctrl.gateway.set_route(a, [], kit.served_name, revision_id=f"kit:{kit.name}", keyless=True)
         ctrl.gateway.mark_down(a, f"{kit.title} is starting", retry_after=30)
-    ctrl._audit(actor, "kit.handover", f"kit/{kit.name}", {"aliases": use, "stopped": stopped})
-    return {"external": rec, "stopped_twinspark_model": stopped}
+    ctrl._audit(actor, "kit.handover", f"kit/{kit.name}", {"aliases": use, "stopped": stopped, "memory": memory})
+    return {"external": rec, "stopped_twinspark_model": stopped, "memory": memory,
+            "min_available_gib": kit.min_available_gib}
+
+
+async def settle_memory(ctrl: "Controller", reclaim: bool = True) -> dict[str, dict[str, Any]]:
+    """Each node's available memory, once it has stopped changing. After a model was stopped this is what a
+    switch does before it starts the next one: the page cache is released (``runtime.drop_caches_before_start``)
+    and MemAvailable is read until it is stable. The kit's own start checks its memory the moment it runs."""
+    rt = ctrl.config.runtime
+    out: dict[str, dict[str, Any]] = {}
+    for node, agent in sorted(ctrl.agents.items()):
+        try:
+            tel: dict[str, Any] = {}
+            deadline = time.monotonic()
+            if reclaim:
+                rec = await agent.call("reclaim_memory", drop_caches=rt.drop_caches_before_start, timeout=180)
+                tel = rec.get("after") or {}
+                deadline += 1.0 if rec.get("dry_run") else SETTLE_MAX_S
+            last, stable = -1.0, 0
+            while True:
+                tel = await agent.call("memory_telemetry")
+                avail = float(tel.get("mem_available_gib") or 0)
+                stable = stable + 1 if abs(avail - last) < 0.5 else 0
+                last = avail
+                if stable >= 2 or time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(min(max(ctrl.poll_interval, 0.01), 3.0))
+            out[node] = {"available_gib": round(float(tel.get("mem_available_gib") or 0), 1),
+                         "total_gib": round(float(tel.get("mem_total_gib") or 0), 1)}
+        except AgentActionError as exc:
+            out[node] = {"error": exc.detail}
+    return out
 
 
 async def attach(ctrl: "Controller", name: str, actor: str = "user") -> dict[str, Any]:

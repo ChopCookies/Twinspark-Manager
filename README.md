@@ -17,7 +17,7 @@ The client does not replace the node services. Install those once on a new clust
 is already running on the Sparks, just install and connect the client. Closing the client ends its
 SSH forwards, but deployments and jobs on the Sparks keep running.
 
-> **Status: alpha (0.8.1).** The control path is covered by automated tests (about 1,600). Real Docker
+> **Status: alpha (0.8.2).** The control path is covered by automated tests (about 1,600). Real Docker
 > activation, chat, streaming and shutdown passed on two DGX Sparks with a 135M model (single node
 > and two-node PP2) on 2026-09-28, at the code of that day — see the
 > [validation note](docs/notes/small-model-validation-2026-09-28.md). Large models, other topologies

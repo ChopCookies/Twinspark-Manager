@@ -100,6 +100,36 @@ async def test_fetch_takes_exactly_the_pinned_file_and_checks_it():
             await ma.fetch(art(), c)
 
 
+async def test_fetch_stops_reading_an_oversized_file_and_follows_no_redirect():
+    """The file is pinned by hash, so wrong content is refused anyway. But the whole body used to be read into
+    node A's controller before its size was looked at, and a redirect was followed wherever it led."""
+    read = []
+
+    class Endless(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(64):                               # 64 MiB offered; the limit is 8
+                read.append(1)
+                yield b"x" * (1024 * 1024)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Endless()))) as c:
+        with pytest.raises(ma.ArtifactError, match="larger than 8 MiB"):
+            await ma.fetch(art(), c)
+    assert len(read) <= ma.MAX_FILE // (1024 * 1024) + 2      # it stopped at the limit, not at the end
+
+    hops = []
+
+    def redirecting(request):
+        hops.append(str(request.url))
+        if "elsewhere" in str(request.url):
+            return httpx.Response(200, content=PATCH)
+        return httpx.Response(302, headers={"location": "https://elsewhere.example/patch.py"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirecting), follow_redirects=True) as c:
+        with pytest.raises(ma.ArtifactError, match="302"):
+            await ma.fetch(art(), c)
+    assert hops == [ma.raw_url(art())]
+
+
 # ---- the GLM recipe ------------------------------------------------------------------------------------
 def test_the_glm_dflash2_recipe_pins_its_patch():
     d = build_draft("glm-5.3-flash-nvfp4-dflash2-tp2")

@@ -7,7 +7,7 @@ runs DeepSeek V4.1 Flash and Qwen3.8 Flash Next on TensorFold, a separate engine
 A **kit** runs such a set-up exactly as its author publishes it. TwinSpark steps aside and keeps your
 endpoint:
 
-1. `sudo tsm kit start <kit>` stops TwinSpark's model on both Sparks.
+1. `sudo tsm kit start <kit>` stops TwinSpark's model on both Sparks and waits until their memory is free.
 2. It runs the kit's own `start.sh` on node A, as you.
 3. TwinSpark's gateway forwards your requests to the kit's server.
 
@@ -53,22 +53,36 @@ tsm activate <profile>                               # back to a TwinSpark model
 ```
 
 **Stop** in the GUI, `tsm stop` and a switch to a profile all stop the kit's containers on both Sparks.
+One kit serves at a time: stop a kit before you start it again or start another.
 
 ## What TwinSpark does, and what it does not
 
 - **The kit's scripts run as you, never as root.** With `sudo tsm kit start`, they run as the user who ran
-  `sudo`, with your ssh key and your Docker. The checkout must be yours and not writable by every user.
-- **The controller never runs a kit's code.** It stops TwinSpark's own model, routes, watches the kit's
+  `sudo`, in that user's login shell: your `PATH` (with `~/.local/bin`, where `pip install --user` puts the
+  `hf` command), your ssh key files and your Docker. A key that only an ssh agent holds needs
+  `sudo --preserve-env=SSH_AUTH_SOCK tsm kit start …`. The checkout must be yours and not writable by every
+  user.
+- **The controller never runs a kit's code.** It stops TwinSpark's own containers, routes, watches the kit's
   `/health`, and stops the kit's containers by name.
-- **The kit's server listens on `127.0.0.1` only.** `tsm kit start` sets `HOST=127.0.0.1` and `PORT` for it.
-  Your apps reach it only through the gateway, with TwinSpark's keys. The gateway never sends TwinSpark's
-  backend key to it.
-- **The kit checks its own memory.** For example, the DeepSeek kit refuses to start below 112 GiB available on
-  either Spark. If it does not start, `tsm kit start` runs the kit's `stop.sh` and releases the Sparks.
+- **The kit's server listens on `127.0.0.1` only.** `tsm kit start` and `stop` set three variables for the
+  kit's scripts: `HOST=127.0.0.1`, `PORT`, and `CONTAINER_NAME`. They win over the kit's own
+  `scripts/local.sh`, so the containers always carry the name TwinSpark stops. Your apps reach the kit only
+  through the gateway, with TwinSpark's keys. The gateway never sends TwinSpark's backend key to it.
+- **Nothing of TwinSpark's stays loaded.** The hand-over stops every TwinSpark container on both Sparks, also
+  one that a failed switch left behind, and refuses while a Spark cannot be reached. On GB10, two engines in
+  one Spark's memory freeze the machine.
+- **Memory.** After the hand-over, `tsm kit start` prints what each Spark has available and warns when it is
+  less than the kit asks for with its default settings. The kit's own check decides: the DeepSeek kit refuses
+  to start below 112 GiB available on either Spark. If the kit does not start, or starts but cannot be
+  served, `tsm kit start` runs the kit's `stop.sh` and releases the Sparks.
+- **Stopping is checked.** After the kit's `stop.sh`, TwinSpark asks both Sparks itself and stops a container
+  that still runs. A stop script that could not reach node B can end with success all the same. If a
+  container cannot be stopped, the kit stays listed as `stop-failed`: fix the node and stop again.
 - **The watchdog only reports.** While the kit does not answer, its aliases answer 503 and the dashboard says
-  why. TwinSpark does not restart it: `sudo tsm kit start <kit>` again, or switch to a profile.
-- **What you see.** While a kit serves, TwinSpark's own serving metrics stay empty. The kit's logs are the
-  container's: `docker logs -f <container>` on each Spark (`tsm kit` names the container).
+  why. TwinSpark does not restart it: `sudo tsm kit stop <kit>` and start it again, or switch to a profile.
+- **What you see.** While a kit serves, TwinSpark's own serving metrics stay empty. `tsm status` and the
+  dashboard name the kit, and doctor lists its container instead of warning about a foreign engine. The
+  kit's logs are the container's: `docker logs -f <container>` on each Spark (`tsm kit` names the container).
 - **Model files.** A kit downloads into its own Hugging Face cache (by default `~/.cache/huggingface` of your
   user), not TwinSpark's (`/var/lib/twinspark/hf-cache`). The same checkpoint used by both takes disk twice.
 - **The first start is long.** The image, the checkpoint (and for DeepSeek, ~200 GB of tables and the weight
@@ -85,6 +99,8 @@ A kit is one JSON file in `twinspark/cookbook/kits/`. It names:
 - the port;
 - the aliases;
 - the scripts, relative to the checkout;
+- `script_env`, if its scripts read the address, the port and the container name from other variables than
+  `HOST`, `PORT` and `CONTAINER_NAME`;
 - what it needs and what its author measured.
 
 Scripts outside the checkout, other hosts than GitHub and container names Docker would not accept are refused

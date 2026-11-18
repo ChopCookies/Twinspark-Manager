@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import re
 import shutil
 from pathlib import Path
 
@@ -35,6 +36,26 @@ def test_release_notes_are_the_changelog_section():
     with pytest.raises(SystemExit, match="empty"):
         ra.notes("## 1.0.0\n\n## 0.9.0\n- x\n", "1.0.0")
     assert ra.notes((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), __version__)   # this version has one
+
+
+def test_release_notes_link_to_the_files_of_that_release():
+    """CHANGELOG.md links to docs with repository paths. On a release page, and in the GUI's update notes, those
+    are read against another address and lead nowhere: they must point at the file as it is at the tag."""
+    text = ("## 1.2.0 — title\n\n- see [docs/kits.md](docs/kits.md) and "
+            "[the cookbook](docs/cookbook.md#browse-twinspark-community)\n"
+            "- [upstream](https://example.com/x), [a section](#fixes), [mail](mailto:a@example.com)\n"
+            "- code stays as it is: `[not](a/link.md)`\n")
+    out = ra.notes(text, "1.2.0", tag="v1.2.0")
+    base = f"https://github.com/{releases.REPO}/blob/v1.2.0/"
+    assert f"[docs/kits.md]({base}docs/kits.md)" in out
+    assert f"[the cookbook]({base}docs/cookbook.md#browse-twinspark-community)" in out
+    assert "[upstream](https://example.com/x)" in out and "[a section](#fixes)" in out
+    assert "[mail](mailto:a@example.com)" in out and "`[not](a/link.md)`" in out
+    # every relative link of the real changelog section names a file that exists
+    real = ra.notes((ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), __version__, tag=f"v{__version__}")
+    here = f"https://github.com/{releases.REPO}/blob/v{__version__}/"
+    linked = re.findall(rf"\]\({re.escape(here)}([^)#]+)", real)
+    assert all((ROOT / path).exists() for path in linked), linked
 
 
 def test_prepare_writes_checksums_that_the_updater_accepts(tmp_path):

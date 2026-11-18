@@ -31,7 +31,7 @@ def test_the_older_qwen_recipe_no_longer_runs_the_nodes_out_of_memory():
 
 async def test_the_plan_is_the_published_launch(cluster):
     c = cluster.controller
-    c.config.runtime.health_timeout_s = 2400     # the shipped default (the test cluster waits 5 s)
+    c.config.runtime.health_timeout_s = 1800     # what `tsm setup` writes (the test cluster waits 5 s)
     d = build_draft(NAME)
     d.identity = draft("qwen", Topology.TP_EP, repo=d.simple.model).identity
     d.name = "qwen"

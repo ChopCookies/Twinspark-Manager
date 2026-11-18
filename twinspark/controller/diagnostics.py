@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from .. import __version__
+from .. import __version__, kits
 from .agent_client import AgentActionError
 
 if TYPE_CHECKING:
@@ -164,7 +164,15 @@ async def doctor(ctrl: "Controller") -> dict[str, Any]:
         if pc > 20:
             _check(res, "page cache", n, "info", f"{pc:.0f} GiB page cache",
                    "dropped automatically before each launch when tsm-privd runs")
+        # a kit's containers (tsm kit start) run outside TwinSpark on purpose: they are named, not warned about
+        ext = ctrl.store.kv_get(kits.STATE_KEY)
+        kit_name = (ext.get("containers") or {}).get(n) if isinstance(ext, dict) else None
         foreign = f.get("foreign_inference") or []
+        mine = [c for c in foreign if c.get("name") == kit_name]
+        foreign = [c for c in foreign if c.get("name") != kit_name]
+        if mine and isinstance(ext, dict):
+            _check(res, "kit", n, "pass", f"{ext.get('kit')} ({ext.get('state')}): container {kit_name}",
+                   "started with tsm kit start; a switch to a profile or Stop ends it")
         if foreign:
             _check(res, "foreign vLLM", n, "warn",
                    "running outside TwinSpark: " + ", ".join(c["name"] for c in foreign),
