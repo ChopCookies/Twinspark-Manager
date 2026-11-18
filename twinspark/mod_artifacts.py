@@ -171,18 +171,26 @@ async def fetch(art: dict[str, Any], client=None) -> bytes:
     """The pinned file from GitHub, checked against its SHA-256."""
     import httpx
     own = client is None
-    client = client or httpx.AsyncClient(follow_redirects=True, timeout=60)
+    client = client or httpx.AsyncClient(timeout=60)
+    url = raw_url(art)
+    too_large = ArtifactError(f"{art['name']}: the file is larger than {MAX_FILE // 2**20} MiB")
+    data = bytearray()
     try:
-        r = await client.get(raw_url(art))
-        if r.status_code != 200:
-            raise ArtifactError(f"{art['name']}: GitHub answered {r.status_code} for {raw_url(art)}")
-        data = r.content
+        # A file at a commit is served directly: a redirect is not followed. The body is read only up to the
+        # limit, so a pin that points at a huge file costs node A neither its memory nor the whole download.
+        async with client.stream("GET", url, follow_redirects=False) as r:
+            if r.status_code != 200:
+                raise ArtifactError(f"{art['name']}: GitHub answered {r.status_code} for {url}")
+            if int(r.headers.get("content-length") or 0) > MAX_FILE:
+                raise too_large
+            async for chunk in r.aiter_bytes():
+                data += chunk
+                if len(data) > MAX_FILE:
+                    raise too_large
     except httpx.HTTPError as exc:
         raise ArtifactError(f"{art['name']}: GitHub is not reachable ({type(exc).__name__})") from exc
     finally:
         if own:
             await client.aclose()
-    if len(data) > MAX_FILE:
-        raise ArtifactError(f"{art['name']}: the file is larger than {MAX_FILE // 2**20} MiB")
-    files(art, data)                         # raises on a hash mismatch
-    return data
+    files(art, bytes(data))                  # raises on a hash mismatch
+    return bytes(data)

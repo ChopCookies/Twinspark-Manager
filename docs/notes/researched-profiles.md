@@ -427,6 +427,10 @@ not a dual-Spark model** — it wants 4× DGX Spark (or a Hopper/Grace node) at 
 precision, or a genuinely high-quality NVFP4 community convert plus a smaller context ceiling.
 Revisit if/when such a convert ships and you accept ~93 GiB/node weights with minimal KV.
 
+> **Update (2026-11):** EXL3 at 2.9 bits per weight fits it: ~99.5 GiB per Spark, served at TP2 by
+> Mia's AI Lab with vLLM plus ExLlamaV3 kernels or with TensorFold. TwinSpark has no recipe for it yet;
+> see [Mia's AI Lab recipes](mia-ai-lab.md).
+
 ---
 
 ## 5.5 Community-tested dual-Spark set-ups — the ground truth to copy from

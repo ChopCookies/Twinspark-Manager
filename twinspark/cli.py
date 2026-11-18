@@ -193,6 +193,11 @@ def cmd_status(args, api: Api):
             reason = f" — {h['reason']}" if h.get("reason") else ""
             print(f"half {h['node']}    {h['state']:9} {h['model']} as {', '.join(h['aliases'])}, started by "
                   f"{h.get('label') or h['revision_id']} {_ago(h.get('since'))}{perf}{reason}")
+    elif st.get("external"):
+        # a kit serves with its author's own scripts (tsm kit): not a TwinSpark profile, but not "nothing" either
+        x = st["external"]
+        print(f"active    - (the kit {x['kit']} is {x.get('state')} on {x.get('url')} as "
+              f"{', '.join(x.get('aliases') or [])}, since {_ago(x.get('since'))}; tsm kit status)")
     else:
         print("active    -")
     gp = st.get("gateway_process") or {}
@@ -1455,6 +1460,7 @@ def build_parser() -> argparse.ArgumentParser:
         cli_client,
         cli_gateway,
         cli_keys,
+        cli_kits,
         cli_metrics,
         cli_qsfp,
         cli_remote,
@@ -1470,6 +1476,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_remote.add_parsers(sub, cmd)
     cli_qsfp.add_parsers(sub, cmd)
     cli_update.add_parsers(sub, cmd)
+    cli_kits.add_parsers(sub, cmd)
     from . import demo
     demo.add_parsers(sub, cmd)
     sub.add_parser("first-night").set_defaults(fn=cmd_first_night)      # no help=: not in `tsm --help`

@@ -72,6 +72,8 @@ class RouteState:
     _tok: itertools.count = field(default_factory=itertools.count, repr=False)
     _down_until: dict = field(default_factory=dict, repr=False)
     backend_nodes: dict = field(default_factory=dict)              # backend URL -> node (for weights)
+    # a kit's server (twinspark.kits): it is not TwinSpark's engine, so it never receives the backend key
+    keyless: bool = False
     _per_backend: dict = field(default_factory=dict, repr=False)   # backend URL -> requests in flight
     _credit: dict = field(default_factory=dict, repr=False)        # smooth weighted round robin
     _remote: Optional[dict] = field(default=None, repr=False)      # a standalone gateway's report (state.py)
@@ -235,8 +237,9 @@ class Gateway:
 
     def set_route(self, alias: str, backends: list[str], served_model: str,
                   revision_id: Optional[str] = None, max_model_len: Optional[int] = None,
-                  nodes: Optional[dict[str, str]] = None) -> None:
+                  nodes: Optional[dict[str, str]] = None, keyless: bool = False) -> None:
         st = self.routes.setdefault(alias, RouteState(alias))
+        st.keyless = keyless
         if nodes is not None:
             st.backend_nodes = {b: nodes[b] for b in backends if b in nodes}
         st.backends = list(backends)
@@ -317,6 +320,7 @@ class Gateway:
             st.revision_id = None
             st.max_model_len = None
             st.down_reason = None
+            st.keyless = False
             self._changed()
 
     def aliases_for_revision_prefix(self, profile_name: str) -> list[str]:
@@ -396,9 +400,9 @@ class Gateway:
         # clients that use the served (profile) name directly
         return next((st for st in self.routes.values() if st.served_model == name), None)
 
-    def backend_headers(self) -> dict[str, str]:
+    def backend_headers(self, st: Optional[RouteState] = None) -> dict[str, str]:
         h = {"content-type": "application/json"}
-        if self.backend_api_key:
+        if self.backend_api_key and not (st is not None and st.keyless):
             h["authorization"] = f"Bearer {self.backend_api_key}"
         return h
 
@@ -416,7 +420,7 @@ class Gateway:
             t = self.routes.get(cfg["alias"])
             if t is None or t.alias == alias or not t.backends or t.draining or t.down_reason:
                 return None
-            return t, t.served_model or t.alias, self.backend_headers(), f"alias:{t.alias}"
+            return t, t.served_model or t.alias, self.backend_headers(t), f"alias:{t.alias}"
         if cfg.get("url") and cfg.get("model"):
             base = _external_base(cfg["url"])
             t = self.fallback_routes.get(alias)

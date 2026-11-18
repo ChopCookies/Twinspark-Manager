@@ -537,9 +537,11 @@ class Controller:
                                  "model_revision": part.identity.model_revision,
                                  "image": part.identity.image_ref, "aliases": part.draft.simple.aliases}
                                 for part in rev.parts()]
+        from . import kits as kit_ctl
         return {
             "active": act,
             "active_detail": detail,
+            "external": kit_ctl.state(self),       # a kit serving instead of TwinSpark's model (twinspark.kits)
             "busy": self.busy(),
             "current_job": self.current_job,
             "staging": [f"{r}@{s[:8]}" for (r, s) in self._staging],
@@ -946,6 +948,12 @@ class Controller:
             failed_nodes: list[str] = []
             stopped = await self._stop_everything(aliases, failed_nodes)
             self.store.kv_set("active", None)
+            from . import kits as kit_ctl
+            if kit_ctl.state(self):
+                # a kit that serves instead of TwinSpark's model stops too: "stop" means nothing serves
+                gone = await kit_ctl.detach(self, stop_containers=True)
+                stopped += gone["stopped"]
+                failed_nodes += [p.split(":", 1)[0].removeprefix("node ") for p in gone["problems"]]
             if failed_nodes:
                 # Be honest: containers on an unreachable node may still be running (and holding
                 # its GPU memory). The reachable nodes are stopped and the route is closed.
@@ -1050,8 +1058,14 @@ class Controller:
         """Start-up without an interrupted switch: re-attach what still runs, autostart otherwise."""
         active = self.active()
         if not active:
+            from . import kits as kit_ctl
+            ext = kit_ctl.state(self)
+            keep = set(ext["aliases"]) if ext else set()
             for alias in list(self.gateway.routes):  # a standalone gateway may still route a stopped model
-                self.gateway.remove_route(alias)
+                if alias not in keep:
+                    self.gateway.remove_route(alias)
+            if ext:
+                await kit_ctl.reattach(self)
             return None
         await self._wait_for_agents(self.config.startup_wait_s)
         if self.busy() or self.active() != active:
@@ -1167,7 +1181,8 @@ class Controller:
             return None
         rev = self.active_revision()
         if rev is None:
-            return None
+            from . import kits as kit_ctl
+            return await kit_ctl.watch(self)    # a kit serving instead (nothing to recover: it is not ours)
         plan = self.serving_plan(rev)          # a half that is down (its switch failed) is not watched
         if not plan.containers:
             return None

@@ -781,3 +781,26 @@ test("no published release is information, not a connection error", () => {
   assert.match(down, /callout warn/);
   assert.match(down, /&lt;ConnectError&gt;/);
 });
+
+test("a kit serving through the gateway shows on the dashboard and Stop ends it", () => {
+  const c = client();
+  const st = "{external:{kit:'mia-qwen3.8-flash-next-tensorfold', title:'Qwen3.8 <TensorFold>', state:'serving', aliases:['default','qwen'], url:'http://127.0.0.1:8888', served:'Qwen3.8-Flash-Next', since:0}, routes:[], nodes:{}}";
+  const html = c.run(`dashboardHtml(${st}, {}, [], null)`);
+  assert.match(html, /Qwen3.8 &lt;TensorFold&gt;/);
+  assert.match(html, /model: qwen/);
+  assert.match(html, /tsm kit start mia-qwen3.8-flash-next-tensorfold/);
+  assert.match(html, /data-act="stop" >/);                 // Stop is enabled
+  assert.doesNotMatch(html, /Nothing is serving|New here\?/);
+  const idle = c.run("dashboardHtml({routes:[], nodes:{}}, {}, [], null)");
+  assert.match(idle, /data-act="stop" disabled/);
+});
+
+test("a serving kit's own container is not flagged as a foreign engine on its node card", () => {
+  const c = client();
+  const hw = "{hostname:'spark-a', foreign_inference:[{name:'qwen38-fn-tf'}]}";
+  const kit = "{kit:'mia-qwen3.8-flash-next-tensorfold', containers:{A:'qwen38-fn-tf', B:'qwen38-fn-tf'}}";
+  assert.doesNotMatch(c.run(`nodeCard('A', ${hw}, {}, ${kit})`), /foreign vLLM/);
+  assert.match(c.run(`nodeCard('A', ${hw}, {}, null)`), /foreign vLLM/);              // no kit serving: a warning
+  const other = "{hostname:'spark-a', foreign_inference:[{name:'qwen38-fn-tf'}, {name:'someones-vllm'}]}";
+  assert.match(c.run(`nodeCard('A', ${other}, {}, ${kit})`), /foreign vLLM/);         // something else runs too
+});

@@ -24,7 +24,7 @@
     "kv_dtype": "fp8",
     "prefix_cache": true,
     "max_num_batched_tokens": 32768,
-    "gpu_memory_utilization": 0.85,
+    "gpu_memory_utilization": 0.8,
     "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
     "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"}
   },
@@ -42,6 +42,8 @@
       "The 47.7 GiB n-gram (PLE) table stays resident at TP2 unless the image carries the disk-backed patch; keep torch.compile off when it is resident (a second table copy can reboot the Sparks)."
     ],
     "notes": [
+      "gpu-memory-utilization 0.80 (was 0.85): Mia's AI Lab measured that 0.835 left both nodes at 0.3–0.9 GiB MemAvailable under a 6-client soak, where GB10 boxes hard-reset. Decode speed does not depend on it; the KV pool shrinks by about 6 GiB per node.",
+      "On the stock vLLM 0.30.0 image, without patches or a custom image: recipe qwen3.8-flash-next-nvfp4-tp2-vllm030.",
       "Native context 262K (YaRN to ~1M). Artificial Analysis rates it very verbose.",
       "Experimental: flags follow the published recipe; verify with `tsm plan` against the pinned image."
     ]

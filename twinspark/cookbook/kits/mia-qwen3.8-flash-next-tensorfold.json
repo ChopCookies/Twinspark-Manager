@@ -1,0 +1,32 @@
+{
+  "name": "mia-qwen3.8-flash-next-tensorfold",
+  "title": "Qwen3.8 Flash Next — NVFP4 on TensorFold with MTP drafts (Mia's AI Lab)",
+  "repo": "https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold",
+  "author": "Mia's AI Lab, on TensorFold",
+  "license": "Apache-2.0",
+  "engine": "TensorFold native (Zig), published image",
+  "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+  "served_name": "Qwen3.8-Flash-Next",
+  "container": "qwen38-fn-tf",
+  "port": 8888,
+  "aliases": ["default", "qwen"],
+  "min_available_gib": 102,
+  "measured": {
+    "single_stream_tok_s": 67.4,
+    "aggregate_c4_tok_s": 152.2,
+    "aggregate_c8_tok_s": 231.2,
+    "ttft_s": 0.104,
+    "note": "the source's numbers (sparkDash, 2026-10-07): 390.1 tok/s at 16 requests; prefill 2,458–2,757 tok/s from 4K to 256K tokens. The INT4-AutoRound checkpoint (QUANT=int4ar) measured 89.3 tok/s at one request."
+  },
+  "requirements": [
+    "scripts/local.sh in the checkout (copy scripts/local.sh.example) with WORKER=<user>@<node B's address>.",
+    "Key-based ssh from node A to node B; Docker with the NVIDIA runtime, your user in the docker group, and rsync on both.",
+    "~150 GB free disk on each Spark (the checkpoint is ~133 GB; node B needs only the image with WORKER_WEIGHTS=nfs).",
+    "~102 GiB MemAvailable on each Spark for the default 1,048,576-token window (~72 GiB at CONTEXT=262144); the kit checks it before it starts."
+  ],
+  "notes": [
+    "The first start pulls the engine image on both Sparks, downloads the checkpoint on node A and copies it to node B. Later starts take about two minutes.",
+    "KV cache FP8 by default (lossy, ~1.8x the pool); KV_DTYPE=bf16 in scripts/local.sh is exact.",
+    "If other work on a Spark takes memory after the start, a long prompt can end both ranks (the kit's issue #7). Keep the Sparks free of other GPU work while the kit serves."
+  ]
+}

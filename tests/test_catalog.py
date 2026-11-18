@@ -93,7 +93,8 @@ def cat(tmp_path):
 def test_nothing_changes_while_the_catalog_equals_the_package(repo, cat):
     with repo.client() as client:
         changes = cat.refresh(client)
-    assert changes["added"] == changes["updated"] == changes["removed"] == [] and changes["recipes"] == 6
+    shipped = len(json.loads((Path(__file__).parents[1] / "catalog" / "index.json").read_text())["recipes"])
+    assert changes["added"] == changes["updated"] == changes["removed"] == [] and changes["recipes"] == shipped
     # every file was the package's own: only the index was downloaded
     assert repo.requests == [URL]
     rows = {r["name"]: r for r in cookbook.list_recipes()}

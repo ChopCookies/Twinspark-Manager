@@ -120,6 +120,7 @@ process so that the running `tsm.exe` can be replaced. Close `tsm client` window
 | "updates are switched off by /etc/twinspark/update-policy.json" | the node's policy | `sudo tsm update policy on` on that node, if you want it |
 | "… missing — run sudo ./install.sh --no-setup once" | no policy file yet | the first update by hand writes it |
 | "was not installed by install.sh" | a node run from a checkout or a hand-made venv | update it by hand |
+| "no TwinSpark release is published on GitHub yet" | GitHub answered, but the project has no release with installable files | update by hand until one exists: the commands under "The first time" above work for every version |
 | "GitHub is not reachable from node A" | node A has no internet, or GitHub's API limit is used up | try later; the Sparks need GitHub and PyPI for an update |
 | "the update failed and was rolled back" | the new version did not install, import or stay up | `journalctl -u 'twinspark-update-*'` and `journalctl -u twinspark-agent` on that node |
 | "lost its update record" / "the update worker stopped without finishing" | the worker was killed (reboot, OOM) | check `/opt/twinspark/venv` on that node: `venv.rollback` holds the previous environment |

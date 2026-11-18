@@ -155,7 +155,7 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
             return _error(404, f"unknown model/alias: {str(model)[:120]!r}", "model_not_found")
         if not gateway.allows(key, st.alias):
             return _error(403, f"this key may not use {st.alias!r}", "permission_denied")
-        target, served, backend_base_headers, fallback = st, st.served_model, gateway.backend_headers(), None
+        target, served, backend_base_headers, fallback = st, st.served_model, gateway.backend_headers(st), None
         if st.draining or not st.backends or st.down_reason:
             fb = gateway.fallback_for(st.alias)
             if fb is None:

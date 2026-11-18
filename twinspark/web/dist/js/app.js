@@ -544,6 +544,17 @@ async function stopFlow(el) {
   return true;
 }
 
+// a kit (Mia's AI Lab, …) serves with its author's own scripts: TwinSpark's gateway forwards to it (tsm kit)
+function kitServingHtml(x) {
+  const serving = x.state === "serving";
+  return `<div class="card accent"><div class="hero"><div class="grow">
+      <div class="title">${dot(serving ? "good" : "warn")} ${esc(x.title || x.kit)} ${tag("kit", "muted")} ${(x.aliases || []).map(a => tag("model: " + a, "info")).join(" ")}</div>
+      <div class="model">${esc(x.served || "")} · ${serving ? "served" : "starting"} by its own scripts on <span class="mono">${esc(x.url || "")}</span></div>
+      <div class="model faint">Started with <span class="mono">tsm kit start ${esc(x.kit)}</span> on node A; the gateway forwards to it. Stop ends it on both Sparks.</div></div>
+      <div class="kv" style="min-width:260px"><b>Since</b><span>${esc(ago(x.since))}</span><b>Kit</b><span class="mono">${esc(x.kit)}</span></div>
+    </div></div>`;
+}
+
 function dashboardHtml(st, series, profs, job) {
   const act = st.active, det = st.active_detail || {}, m = st.metrics || {};
   const obs = det.observed || {}, kv = obs.kv || {};
@@ -555,11 +566,11 @@ function dashboardHtml(st, series, profs, job) {
     <div class="row">
       <select id="qs-profile" style="width:auto;min-width:220px">${pinned.length ? pinned.map(p => `<option value="${esc(p.name)}" ${p.active ? "selected" : ""}>${esc(p.name)}${p.active ? " (active)" : ""}</option>`).join("") : `<option value="">no pinned profiles</option>`}</select>
       <button class="btn primary" data-act="activate" ${pinned.length && !st.busy ? "" : "disabled"}>${icon("play")}Switch</button>
-      <button class="btn danger" data-act="stop" ${act && !st.busy ? "" : "disabled"}>${icon("stop")}Stop</button>
+      <button class="btn danger" data-act="stop" ${(act || st.external) && !st.busy ? "" : "disabled"}>${icon("stop")}Stop</button>
     </div></div>`;
 
   if (job) html += jobBanner(job);
-  if (!act && !job) html += `<div class="callout info"><div><b>New here?</b> The <a href="#/start">Get started</a> checklist shows what is set up and what is next.</div></div>`;
+  if (!act && !st.external && !job) html += `<div class="callout info"><div><b>New here?</b> The <a href="#/start">Get started</a> checklist shows what is set up and what is next.</div></div>`;
   if (st.update?.state === "running") html += `<div class="callout info"><div><b>TwinSpark is being updated</b> to ${esc(st.update.target?.version || "")} · ${esc(st.update.waiting || st.update.phase || "")} · the model keeps serving <a href="#/updates">Follow the update</a></div></div>`;
   if (["running", "failed"].includes(st.maintenance?.state)) html += `<div class="callout warn"><div><b>Cluster reserved for maintenance</b> · ${esc(st.maintenance.phase)}${st.maintenance.error ? ` · ${esc(st.maintenance.error)}` : ""} <a href="#/updates">Open update progress</a></div></div>`;
   const gp = st.gateway_process || {};
@@ -591,6 +602,8 @@ function dashboardHtml(st, series, profs, job) {
       </div>
       ${m.ok === false || !st.metrics ? `<p class="small muted" style="margin:10px 0 0">Serving metrics appear after the first scrape (every ${esc(10)} s).</p>` : ""}
     </div>${halvesHtml(st)}`;
+  } else if (st.external) {
+    html += kitServingHtml(st.external);
   } else {
     html += `<div class="card"><div class="empty"><b>Nothing is serving</b>${pinned.length ? "Pick a profile above and switch." : "Import a recipe from the Cookbook, pin it, then switch."}</div>
       <div class="row" style="justify-content:center">${pinned.length ? "" : `<a class="btn primary" href="#/cookbook">Open the cookbook</a>`}</div></div>`;
@@ -600,7 +613,7 @@ function dashboardHtml(st, series, profs, job) {
   html += `<div class="grid cols-2">`;
   for (const n of Object.keys(st.nodes || {}).sort()) {
     const hw = st.nodes[n] || {}, t = (st.telemetry || {})[n] || {};
-    html += nodeCard(n, hw, t);
+    html += nodeCard(n, hw, t, st.external);
   }
   html += `</div>`;
 
@@ -650,7 +663,7 @@ async function routingFlow() {
 function tile(k, v, unit, series, color, digits = 0) {
   return `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${v == null ? "—" : (typeof v === "number" ? num(v, digits) : esc(v))}${v != null && unit ? `<small>${esc(unit)}</small>` : ""}</div>${series ? spark(series, color) : ""}</div>`;
 }
-function nodeCard(n, hw, t) {
+function nodeCard(n, hw, t, external) {
   if (!hw || hw.error) return `<div class="card"><div class="card-head"><h2>Node ${esc(n)}</h2>${tag("unreachable", "bad")}</div><div class="muted small">${esc((hw && hw.error) || t.error || "no facts yet — agent not reachable at startup")}</div></div>`;
   const total = t.mem_total_gib ?? null;
   const avail = t.mem_available_gib;
@@ -664,7 +677,9 @@ function nodeCard(n, hw, t) {
   if (hw.runtime_mode === "dry-run") warns.push(tag("dry-run", "warn"));
   if (hw.desktop_running) warns.push(tag(`desktop ${gib(hw.desktop_rss_gib)}`, "warn"));
   if (hw.privd_available === false) warns.push(tag("no privd", "warn"));
-  if ((hw.foreign_inference || []).length) warns.push(tag("foreign vLLM", "bad"));
+  // a kit's own container (tsm kit start) runs outside TwinSpark on purpose: it is not a warning
+  const kitContainer = external && external.containers ? external.containers[n] : null;
+  if ((hw.foreign_inference || []).some(c => c.name !== kitContainer)) warns.push(tag("foreign vLLM", "bad"));
   return `<div class="card"><div class="card-head"><h2>Node ${esc(n)} <span class="muted small mono">${esc(hw.hostname || "")}</span></h2><div class="chip-row">${lvl ? tag(lvl, levelClass(lvl)) : ""}${warns.join("")}</div></div>
     ${hostTiles(t)}
     <div class="row between small"><span>Shared memory · ${gib(used)} used of ${gib(total)}</span><span class="muted">${gib(avail)} available</span></div>
