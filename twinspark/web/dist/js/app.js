@@ -310,12 +310,17 @@ async function ping() {
   } catch (e) { pill.innerHTML = `${dot("bad")} offline`; pill.className = "pill bad"; }
 }
 let pingTimer = null;
+function tabHidden() { return typeof document !== "undefined" && document.hidden === true; }
 async function boot() {
   S.unlocked = true;
   if (typeof clientBoot === "function") await clientBoot();
   if (!S.unlocked) return;
   $("#nav").innerHTML = NAV.map(([id, label]) => `<a href="#/${id}" data-nav="${id}">${icon(id)}${esc(label)}</a>`).join("");
-  ping(); clearInterval(pingTimer); pingTimer = setInterval(ping, 6000);
+  ping(); clearInterval(pingTimer); pingTimer = setInterval(() => { if (!tabHidden()) ping(); }, 6000);
+  if (typeof document !== "undefined" && document.addEventListener && !S._visBound) {
+    S._visBound = true;
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && S.unlocked) ping(); });
+  }
   route();
 }
 
@@ -340,7 +345,7 @@ const ROUTES = [
   [/^\/audit$/, () => viewAudit()],
   [/^\/logs$/, () => viewLogs()],
 ];
-function every(fn, ms) { const g = S.gen; const t = setInterval(() => { if (g !== S.gen) return clearInterval(t); fn(); }, ms); S.timers.push(t); }
+function every(fn, ms) { const g = S.gen; const t = setInterval(() => { if (g !== S.gen) return clearInterval(t); if (!tabHidden()) fn(); }, ms); S.timers.push(t); }
 function current(g) { return g === S.gen; }
 async function route() {
   if (!S.unlocked) return;
@@ -722,14 +727,22 @@ async function viewSystem() {
   const g = S.gen;
   render(g, `<div class="view"><div class="view-head"><div><h1>System status</h1><p>Compare both nodes while you experiment.</p></div><a class="btn" href="#/updates">Updates & reboots</a></div><div id="system-content"></div></div>`);
   let loading = false;
+  let cachedHist = null;
+  let histAt = 0;
   const draw = async () => {
     if (loading) return; loading = true;
     try {
-      const [data, status, hist] = await Promise.all([GET("/api/v1/system/telemetry"), GET("/api/v1/status"),
-        GET("/api/v1/system/metrics/history?hours=24").catch(() => null)]);
+      const now = Date.now();
+      const wantHist = !cachedHist || now - histAt >= 60000;
+      const [data, status, freshHist] = await Promise.all([
+        GET("/api/v1/system/telemetry"),
+        GET("/api/v1/status"),
+        wantHist ? GET("/api/v1/system/metrics/history?hours=24").catch(() => null) : null,
+      ]);
+      if (freshHist) { cachedHist = freshHist; histAt = now; }
       if (!current(g)) return;
       const names = [...new Set([...Object.keys(status.nodes || {}), ...Object.keys(data.nodes)])].sort();
-      $("#system-content").innerHTML = `<p class="small muted">Sampled every ${num(data.interval_s)} s · recent history stays in memory · — means unavailable, not zero.</p>` + (names.length ? `<div class="grid cols-2">${names.map(n => systemNode(n, data.nodes[n] || {}, data.history[n] || [], data.interval_s)).join("")}</div>` : empty("No nodes connected", "Configure node A and B to see their system readings.")) + historyCard(hist, names);
+      $("#system-content").innerHTML = `<p class="small muted">Sampled every ${num(data.interval_s)} s · recent history stays in memory · — means unavailable, not zero.</p>` + (names.length ? `<div class="grid cols-2">${names.map(n => systemNode(n, data.nodes[n] || {}, data.history[n] || [], data.interval_s)).join("")}</div>` : empty("No nodes connected", "Configure node A and B to see their system readings.")) + historyCard(cachedHist, names);
     } catch (e) { if (current(g)) $("#system-content").innerHTML = `<div class="callout warn">${esc(e.message)} · Retrying automatically.</div>`; }
     finally { loading = false; }
   };

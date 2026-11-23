@@ -256,7 +256,7 @@ async def run_sync(reg: "TaskRegistry", tid: str, rt: "RuntimeSettings", repo: s
         reg.update(tid, detail="[dry-run] " + shlex.join(argv))
         return {"dry_run": True, "argv": argv}
     rels = await asyncio.to_thread(sync_files, repo_dir, rev, include)
-    sizes = sync_file_sizes(src_hub.resolve(), rels)
+    sizes = await asyncio.to_thread(sync_file_sizes, src_hub, rels)
     total = sum(sizes.values())
     groups = partition_by_size(sizes, streams)
     started = time.time()

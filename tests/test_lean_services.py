@@ -145,3 +145,11 @@ def test_the_standalone_gateway_stays_small():
     for heavy in ("fastapi", "pydantic", "twinspark.controller.controller", "twinspark.schemas.config",
                   "twinspark.cookbook", "twinspark.controller.app"):
         assert heavy not in mods, f"the gateway imports {heavy}"
+
+
+def test_cli_and_token_comparison_do_not_load_networking_or_crypto():
+    mods = _modules_after("from twinspark import cli\n"
+                          "from twinspark.security import tokens_equal\n"
+                          "assert tokens_equal('a', 'a')")
+    assert "httpx" not in mods
+    assert "cryptography" not in mods

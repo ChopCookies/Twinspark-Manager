@@ -10,9 +10,10 @@ from __future__ import annotations
 import os
 import secrets as _secrets
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from cryptography.fernet import Fernet
+if TYPE_CHECKING:  # pragma: no cover - type names only
+    from cryptography.fernet import Fernet
 
 SECRET_SLOTS = {
     "hf_token", "ngc_api_key",
@@ -47,6 +48,7 @@ class SecretsVault:
         self._fernet: Optional[Fernet] = None
 
     def _load_or_create_key(self) -> bytes:
+        from cryptography.fernet import Fernet
         for _ in range(3):
             try:
                 key = self.key_file.read_bytes().strip()
@@ -69,6 +71,7 @@ class SecretsVault:
         ``ProtectSystem=strict``, never writes into ``/etc``. Creating the vault and repairing its mode happen
         only on a write (``set``, ``ensure``, ``rotate``), which ``tsm init`` and setup do as root."""
         if self._fernet is None:
+            from cryptography.fernet import Fernet
             if create:
                 self.dir.mkdir(parents=True, exist_ok=True)
                 if (self.dir.stat().st_mode & 0o777) != 0o700:

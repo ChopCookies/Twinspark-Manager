@@ -196,11 +196,14 @@ def partition_by_size(sizes: dict[str, int], buckets: int) -> list[list[str]]:
 
 # ---- hashing ---------------------------------------------------------------------------
 def _hash_file(path: Path, want_sha256: bool, want_sha1: bool, size: int) -> dict[str, str]:
+    if want_sha256 and not want_sha1:
+        with path.open("rb") as fh:
+            return {"sha256": hashlib.file_digest(fh, "sha256").hexdigest()}
     sha256, sha1 = hashlib.sha256(), hashlib.sha1()
     if want_sha1:
         sha1.update(f"blob {size}\0".encode())
     with path.open("rb") as fh:
-        while chunk := fh.read(16 * 1024 ** 2):
+        while chunk := fh.read(4 * 1024 ** 2):
             if want_sha256:
                 sha256.update(chunk)
             if want_sha1:
