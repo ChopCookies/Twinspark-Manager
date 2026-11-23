@@ -32,8 +32,6 @@ import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
-import httpx
-
 from . import __version__
 
 DEFAULT_API = "http://127.0.0.1:8443"
@@ -49,6 +47,8 @@ class Api:
 
     def __call__(self, method: str, path: str, *, ok: tuple[int, ...] = (), timeout: float = 120,
                  **kw) -> Any:
+        import httpx
+
         headers = {"x-api-key": self.key} if self.key else {}
         try:
             r = httpx.request(method, f"{self.base}{path}", headers=headers, timeout=timeout, **kw)

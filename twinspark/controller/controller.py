@@ -1094,14 +1094,17 @@ class Controller:
         """After a power cut both Sparks boot at once; the other node's agent may come up a minute
         after this controller. Wait (bounded) so autostart sees the real state of both nodes.
         Returns the nodes that are still unreachable when the wait ends."""
+        async def probe(name: str, agent: AgentClient) -> Optional[str]:
+            try:
+                await agent.call("hardware_facts", timeout=8)
+            except Exception:  # noqa: BLE001 - not up yet is the expected case here
+                return name
+            return None
+
         deadline = time.monotonic() + max(0.0, timeout_s)
         while True:
-            down = []
-            for n, a in self.agents.items():
-                try:
-                    await a.call("hardware_facts", timeout=8)
-                except Exception:  # noqa: BLE001 - not up yet is the expected case here
-                    down.append(n)
+            results = await asyncio.gather(*(probe(n, a) for n, a in self.agents.items()))
+            down = [n for n in results if n is not None]
             if not down or time.monotonic() >= deadline:
                 if down:
                     log.warning("starting without node(s) %s: they did not answer within %ss",
@@ -1345,9 +1348,11 @@ class Controller:
     async def _scrape_group(self, g: dict, act: dict) -> tuple[list[dict], list[tuple], dict]:
         """Scrape one group's backends; keeps their raw samples for /metrics. A split half's numbers go to
         its own sampler (its own model, alias and revision, so its own history)."""
+        items = list(g["backends"].items())
+        headers = self.gateway.backend_headers()
+        scraped = await asyncio.gather(*(scrape_metrics(b, headers=headers, raw=True) for b, _ in items))
         snaps, pairs = [], []
-        for b, labels in g["backends"].items():
-            snap = await scrape_metrics(b, headers=self.gateway.backend_headers(), raw=True)
+        for (b, labels), snap in zip(items, scraped, strict=True):
             samples = snap.pop("samples", None)
             if samples is not None:
                 prev = self.backend_samples.get(b)

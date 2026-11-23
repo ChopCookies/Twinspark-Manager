@@ -19,7 +19,7 @@ const REMOTE_FEATURES = [
   ["wol", "Wake-on-LAN setting", "turn Wake-on-LAN on for a network port"],
 ];
 const REMOTE_SOURCES = ["agent", "controller", "privd", "terminal", "docker", "kernel", "previous-boot", "ssh", "network", "containerd", "networkd", "nvidia"];
-const R = { ws: null, term: null, fit: null, ro: null, watch: null, node: null, ov: null, reach: null };
+const R = { ws: null, term: null, fit: null, ro: null, watch: null, opening: null, node: null, ov: null, reach: null };
 
 /* keys a phone keyboard lacks; each is sent to the remote shell exactly like the real key */
 const TERM_KEYS = { Esc: "\x1b", Tab: "\t", "Ctrl-C": "\x03", "Ctrl-D": "\x04", "Ctrl-L": "\x0c", "↑": "\x1b[A", "↓": "\x1b[B", "←": "\x1b[D", "→": "\x1b[C" };
@@ -31,6 +31,7 @@ const remoteDur = (s) => { if (!s) return "—"; const d = Math.floor(s / 86400)
 function closeTerminal(reason) {
   const { ws, term, ro, watch } = R;
   R.ws = R.term = R.fit = R.ro = R.watch = null;
+  R.opening = null;
   if (watch) clearInterval(watch);
   if (ro) { try { ro.disconnect(); } catch { /* already gone */ } }
   if (ws) { try { ws.onclose = null; ws.close(); } catch { /* already closed */ } }
@@ -48,19 +49,69 @@ function setTermState(text, live) {
   const wrap = $("#r-termwrap");
   if (wrap) wrap.classList.toggle("hidden", !live);
 }
+let xtermPromise = null;
+let xtermStyle = null;
+function loadTerminalAsset(url, css = false) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement(css ? "link" : "script");
+    if (css) { el.rel = "stylesheet"; el.href = url; } else { el.src = url; }
+    el.onload = () => resolve();
+    el.onerror = () => { el.remove(); reject(new Error(`could not load ${url}`)); };
+    document.head.appendChild(el);
+  });
+}
+function ensureXterm() {
+  if (xtermPromise) return xtermPromise;
+  xtermStyle ||= loadTerminalAsset("vendor/xterm.css", true).catch(err => { xtermStyle = null; throw err; });
+  const scripts = (async () => {
+    if (typeof Terminal === "undefined") await loadTerminalAsset("vendor/xterm.js");
+    if (typeof FitAddon === "undefined") await loadTerminalAsset("vendor/addon-fit.js");
+    if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+      throw new Error("the terminal widget did not load — reload the page");
+    }
+  })();
+  // Wait for both loads before retrying, and reuse the assets that succeeded.
+  xtermPromise = Promise.allSettled([xtermStyle, scripts])
+    .then(results => { for (const r of results) if (r.status === "rejected") throw r.reason; })
+    .catch(err => { xtermPromise = null; throw err; });
+  return xtermPromise;
+}
 async function openTerminal(node) {
-  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") throw new Error("the terminal widget did not load (vendor/xterm.js) — reload the page");
   closeTerminal();
+  const pending = R.opening = Symbol(), g = S.gen;
+  const stillOpening = () => R.opening === pending && current(g) && S.unlocked;
+  setTermState("loading terminal…", true);
+  try { await ensureXterm(); }
+  catch (e) {
+    if (R.opening !== pending) return;
+    closeTerminal();
+    if (current(g)) throw e;
+    return;
+  }
+  if (!stillOpening()) {
+    if (R.opening === pending) closeTerminal();
+    return;
+  }
   setTermState("connecting…", true);
   const box = $("#r-termbox");
-  const term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", theme: { background: "#050a14", foreground: "#d7e3f4", cursor: "#6aa7ff" } });
+  const term = R.term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", theme: { background: "#050a14", foreground: "#d7e3f4", cursor: "#6aa7ff" } });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(box);
   fit.fit();
   let t;
   try { t = await POST("/api/v1/remote/terminal/ticket", { node, cols: term.cols, rows: term.rows }); }
-  catch (e) { term.dispose(); closeTerminal(); throw e; }
+  catch (e) {
+    if (R.opening !== pending) return;
+    closeTerminal();
+    if (current(g)) throw e;
+    return;
+  }
+  if (!stillOpening()) {
+    if (R.opening === pending) closeTerminal();
+    return;
+  }
+  R.opening = null;
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   // through the workstation client the socket also carries this tab's session key (a browser cannot set headers)
   const ws = new WebSocket(`${proto}//${location.host}${t.ws_path}?ticket=${enc(t.ticket)}${S.client ? "&client_key=" + enc(S.key) : ""}`);
@@ -189,7 +240,7 @@ async function remoteDraw(g, node) {
   const t = $("#r-term");
   // the terminal card is only rebuilt when the node's capabilities change, never while a session is open
   const key = `${remoteOn(n, "terminal")}|${n.terminal_service}`;
-  if (t.dataset.key !== key && !R.ws) { t.innerHTML = remoteTerminalHtml(n); t.dataset.key = key; }
+  if (t.dataset.key !== key && !R.ws && !R.opening) { t.innerHTML = remoteTerminalHtml(n); t.dataset.key = key; }
   $("#r-support").dataset.key || ($("#r-support").innerHTML = remoteSupportHtml(n), $("#r-support").dataset.key = "1");
 }
 

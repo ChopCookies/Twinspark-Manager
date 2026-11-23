@@ -10,7 +10,7 @@ function client() {
   const element = id => {
     if (!elements.has(id)) elements.set(id, {
       value: "", innerHTML: "", textContent: "", disabled: false,
-      classList: { add() {}, remove() {} },
+      classList: { add() {}, remove() {}, toggle() {} },
     });
     return elements.get(id);
   };
@@ -302,19 +302,52 @@ test("startup and remote modules coexist with integrations navigation and route 
   assert.deepEqual(JSON.parse(c.run("JSON.stringify(visited)")), ["start", "remote:B", "integrations"]);
 });
 
-test("HTML loads merged GUI modules and terminal assets in dependency order", () => {
+test("HTML loads merged GUI modules in dependency order and defers xterm vendor assets", () => {
   const source = path.join(__dirname, "../twinspark/web/src");
   const html = fs.readFileSync(path.join(source, "index.html"), "utf8");
   const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map(match => match[1]);
   for (const script of scripts) assert.equal(fs.existsSync(path.join(source, script)), true, script);
   assert.equal(scripts[0], "js/app.js");
   assert.ok(scripts.indexOf("js/start.js") > scripts.indexOf("js/app.js"));
-  assert.ok(scripts.indexOf("js/remote.js") > scripts.indexOf("vendor/xterm.js"));
-  assert.ok(scripts.indexOf("js/remote.js") > scripts.indexOf("vendor/addon-fit.js"));
+  assert.ok(scripts.includes("js/remote.js"));
+  assert.ok(!scripts.includes("vendor/xterm.js"));
+  assert.ok(!scripts.includes("vendor/addon-fit.js"));
+  assert.ok(!html.includes("vendor/xterm.css"));
+  for (const asset of ["vendor/xterm.js", "vendor/addon-fit.js", "vendor/xterm.css"]) {
+    assert.equal(fs.existsSync(path.join(source, asset)), true, asset);
+  }
+  const remoteJs = fs.readFileSync(path.join(source, "js/remote.js"), "utf8");
+  assert.match(remoteJs, /vendor\/xterm\.js/);
+  assert.match(remoteJs, /vendor\/addon-fit\.js/);
+  assert.match(remoteJs, /vendor\/xterm\.css/);
   const css = fs.readFileSync(path.join(source, "css/style.css"), "utf8");
   assert.doesNotMatch(css, /^(<<<<<<<|=======|>>>>>>>)/m);
   assert.match(css, /\.integration-details/);
   assert.match(css, /\.start-step/);
   assert.match(css, /\.term-box/);
   assert.match(css, /\.recipe-changes td/);
+});
+
+test("terminal loads its styles and scripts once, and disconnect cancels a pending open", async () => {
+  const c = client();
+  c.run(fs.readFileSync(path.join(__dirname, "../twinspark/web/src/js/remote.js"), "utf8"));
+  const assets = [];
+  c.context.document.createElement = tag => ({ tag, remove() {} });
+  c.context.document.head = { appendChild: el => assets.push(el) };
+  c.run("S.unlocked = true; api = () => { throw new Error('cancelled terminal requested a ticket'); };");
+  const opening = c.run("openTerminal('A')");
+  assert.equal(c.run("ensureXterm() === ensureXterm()"), true);
+  assert.deepEqual(assets.map(a => a.href || a.src), ["vendor/xterm.css", "vendor/xterm.js"]);
+  c.run("closeTerminal('disconnected')");
+  c.run("globalThis.Terminal = class { constructor() { throw new Error('cancelled terminal opened'); } };");
+  assets[1].onload();
+  await Promise.resolve();
+  assert.equal(assets[2].src, "vendor/addon-fit.js");
+  c.run("globalThis.FitAddon = {}");
+  assets[2].onload();
+  assets[0].onload();
+  await opening;
+  assert.equal(c.element("#r-termstate").textContent, "disconnected");
+  await c.run("ensureXterm()");
+  assert.equal(assets.length, 3);
 });

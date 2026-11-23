@@ -38,10 +38,9 @@ def _revision(ctrl: Controller, name: str, ref: str) -> ProfileRevision:
     return rev
 
 
-def _summary(p: Profile, ctrl: Controller) -> dict:
+def _summary(p: Profile, active_name: Optional[str]) -> dict:
     d = p.working_draft()
     last = p.latest()
-    act = ctrl.active()
     return {
         "name": p.name, "description": p.description,
         "model": d.simple.model if d else None,
@@ -61,7 +60,7 @@ def _summary(p: Profile, ctrl: Controller) -> dict:
         "pinned": last is not None,
         "draft_differs": bool(last and p.draft and p.draft.model_dump(exclude={"identity"}) !=
                               last.draft.model_dump(exclude={"identity"})),
-        "active": bool(act and act.get("profile") == p.name),
+        "active": active_name == p.name,
         "warnings": d.warnings() if d else [],
         "updated_at": p.updated_at,
     }
@@ -71,7 +70,8 @@ def _summary(p: Profile, ctrl: Controller) -> dict:
 def list_profiles(summary: bool = False, ctrl: Controller = Depends(controller_dep)):
     ps = ctrl.list_profiles()
     if summary:
-        return [_summary(p, ctrl) for p in ps]
+        active_name = (ctrl.active() or {}).get("profile")
+        return [_summary(p, active_name) for p in ps]
     return [p.model_dump(mode="json") for p in ps]
 
 

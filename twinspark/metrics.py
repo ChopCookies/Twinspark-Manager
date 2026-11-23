@@ -117,11 +117,16 @@ def _suffix(name: str) -> str:
 
 
 _AVERAGED = {"kv-cache-usage", "prefix-hit-rate"}      # fractions reported once per engine/rank
+_METRIC_TAGS = frozenset(_METRICS.values())
 
 
-def _parse_text(text: str) -> dict[str, float]:
+def _parse_prometheus(
+    text: str, *, include_samples: bool,
+) -> tuple[dict[str, float], list[tuple[str, str, dict[str, str], float]]]:
+    """Single-pass Prometheus parser for both summary values and optional EXPORT samples."""
     found: dict[str, float] = {}
     counts: dict[str, int] = {}
+    samples: list[tuple[str, str, dict[str, str], float]] = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -129,11 +134,21 @@ def _parse_text(text: str) -> dict[str, float]:
         m = _SAMPLE_RE.match(line)
         if not m:
             continue
-        name = m.group(1)
-        if name.endswith("_bucket"):
-            continue
-        tag = _METRICS.get(_suffix(name))
-        if tag is None:
+        raw_name = m.group(1)
+        sname = _suffix(raw_name)
+        tag = None if raw_name.endswith("_bucket") else _METRICS.get(sname)
+        target = None
+        part = ""
+        if include_samples:
+            target = EXPORT.get(sname)
+            if target is None:
+                for suffix in _HIST_PARTS:
+                    if sname.endswith(suffix) and EXPORT.get(sname[:-len(suffix)], ("", ""))[1] == "histogram":
+                        target, part = EXPORT[sname[:-len(suffix)]], suffix
+                        break
+            if target is not None and target[1] == "histogram" and not part:
+                target = None
+        if tag is None and target is None:
             continue
         try:
             num = float(m.group(3))
@@ -141,11 +156,18 @@ def _parse_text(text: str) -> dict[str, float]:
             continue
         if num != num:            # NaN
             continue
-        found[tag] = found.get(tag, 0.0) + num
-        counts[tag] = counts.get(tag, 0) + 1
+        if tag is not None:
+            found[tag] = found.get(tag, 0.0) + num
+            counts[tag] = counts.get(tag, 0) + 1
+        if target is not None:
+            samples.append((target[0], part, _labels(m.group(2)), num))
     for tag in _AVERAGED & set(found):
         found[tag] = found[tag] / counts[tag]
-    return found
+    return found, samples
+
+
+def _parse_text(text: str) -> dict[str, float]:
+    return _parse_prometheus(text, include_samples=False)[0]
 
 
 def _labels(text: Optional[str]) -> dict[str, str]:
@@ -158,49 +180,28 @@ def _labels(text: Optional[str]) -> dict[str, str]:
 def parse_samples(text: str) -> list[tuple[str, str, dict[str, str], float]]:
     """The samples of the ``EXPORT`` families: ``(twinspark name, part, labels, value)``; ``part`` is
     ``_bucket`` / ``_sum`` / ``_count`` for histograms, "" otherwise. vLLM's ``model_name`` label is kept."""
-    out: list[tuple[str, str, dict[str, str], float]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = _SAMPLE_RE.match(line)
-        if not m:
-            continue
-        name, part = _suffix(m.group(1)), ""
-        target = EXPORT.get(name)
-        if target is None:
-            for suffix in _HIST_PARTS:
-                if name.endswith(suffix) and EXPORT.get(name[:-len(suffix)], ("", ""))[1] == "histogram":
-                    target, part = EXPORT[name[:-len(suffix)]], suffix
-                    break
-        if target is None or (target[1] == "histogram" and not part):
-            continue
-        try:
-            value = float(m.group(3))
-        except ValueError:
-            continue
-        if value != value:
-            continue
-        out.append((target[0], part, _labels(m.group(2)), value))
-    return out
+    return _parse_prometheus(text, include_samples=True)[1]
 
 
-def _buckets(samples: Iterable[tuple], family: str) -> dict[float, float]:
-    """Cumulative counts per upper bound of one histogram, summed over its label sets (engines, ranks)."""
-    out: dict[float, float] = {}
+def _buckets_all(samples: Iterable[tuple], families: dict[str, str]) -> dict[str, dict[float, float]]:
+    """Single-pass cumulative bucket extraction for all requested histogram families."""
+    by_family = {fam: key for key, fam in families.items()}
+    out: dict[str, dict[float, float]] = {key: {} for key in families}
     for name, part, labels, value in samples:
-        if name == family and part == "_bucket" and "le" in labels:
+        if part == "_bucket" and "le" in labels:
+            key = by_family.get(name)
+            if key is None:
+                continue
             try:
                 le = float(labels["le"])
             except ValueError:
                 continue
-            out[le] = out.get(le, 0.0) + value
+            b = out[key]
+            b[le] = b.get(le, 0.0) + value
     return out
 
 
-def quantile(q: float, buckets: dict[float, float]) -> Optional[float]:
-    """``histogram_quantile`` as Prometheus computes it (linear within the bucket)."""
-    items = sorted(buckets.items())
+def _quantile_sorted(q: float, items: list[tuple[float, float]]) -> Optional[float]:
     if not items or items[-1][1] <= 0:
         return None
     rank = q * items[-1][1]
@@ -216,6 +217,11 @@ def quantile(q: float, buckets: dict[float, float]) -> Optional[float]:
     return prev_le
 
 
+def quantile(q: float, buckets: dict[float, float]) -> Optional[float]:
+    """``histogram_quantile`` as Prometheus computes it (linear within the bucket)."""
+    return _quantile_sorted(q, sorted(buckets.items()))
+
+
 def windowed(pairs: Iterable[tuple[Optional[list], list]]) -> dict[str, Optional[float]]:
     """p50/p95/p99 (ms) of the requests that finished between two scrapes, over several backends.
 
@@ -225,17 +231,20 @@ def windowed(pairs: Iterable[tuple[Optional[list], list]]) -> dict[str, Optional
     for prev, cur in pairs:
         if prev is None:
             continue                    # the first scrape of a backend opens the window
-        for key, family in WINDOWED.items():
-            now = _buckets(cur, family)
-            before = _buckets(prev or [], family)
+        now_all = _buckets_all(cur, WINDOWED)
+        before_all = _buckets_all(prev or [], WINDOWED)
+        for key in WINDOWED:
+            now, before = now_all[key], before_all[key]
             reset = any(now.get(le, 0.0) < c for le, c in before.items())
+            dst = merged[key]
             for le, c in now.items():
                 delta = c if reset else c - before.get(le, 0.0)
-                merged[key][le] = merged[key].get(le, 0.0) + max(0.0, delta)
+                dst[le] = dst.get(le, 0.0) + max(0.0, delta)
     out: dict[str, Optional[float]] = {}
     for key, buckets in merged.items():
+        items = sorted(buckets.items())
         for q in (50, 95, 99):
-            v = quantile(q / 100, buckets)
+            v = _quantile_sorted(q / 100, items)
             out[f"{key}_p{q}_ms"] = None if v is None else round(v * 1000, 1)
     return out
 
@@ -280,10 +289,10 @@ async def scrape_metrics(base_url: str, *, timeout: float = 5.0,
             if r.status_code == 404:
                 return {"base_url": base_url, "ok": False, "error": "no /metrics endpoint"}
             r.raise_for_status()
-            values = _parse_text(r.text)
+            values, samples = _parse_prometheus(r.text, include_samples=raw)
             snap = {"base_url": base_url, "ok": True, "error": None, "ts": time.time(), **values, **derive(values)}
             if raw:
-                snap["samples"] = parse_samples(r.text)
+                snap["samples"] = samples
             return snap
         except httpx.HTTPError as exc:
             return {"base_url": base_url, "ok": False, "error": str(exc) or type(exc).__name__}
@@ -342,7 +351,7 @@ def combine_snapshots(snaps: list[dict]) -> dict:
         return ok[0]
     merged: dict = {"ok": True, "error": None, "ts": max(s["ts"] for s in ok),
                     "base_url": ", ".join(s["base_url"] for s in ok)}
-    tags = {k for s in ok for k in s if k in set(_METRICS.values())}
+    tags = {k for s in ok for k in s if k in _METRIC_TAGS}
     values = {}
     for k in tags:
         nums = [s[k] for s in ok if s.get(k) is not None]

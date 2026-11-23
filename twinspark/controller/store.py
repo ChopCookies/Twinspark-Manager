@@ -51,6 +51,7 @@ class Store:
                 """CREATE TABLE IF NOT EXISTS jobs(
                     job_id TEXT PRIMARY KEY, doc TEXT NOT NULL, updated TEXT)"""
             )
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated DESC)")
             self.conn.execute(
                 """CREATE TABLE IF NOT EXISTS audit(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, doc TEXT NOT NULL)"""

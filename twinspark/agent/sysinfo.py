@@ -214,12 +214,23 @@ def other_processes(proc: str = "/proc", limit: int = 5, min_mib: int = 100,
         pids = [p for p in os.listdir(proc) if p.isdigit()][:max_pids]
     except OSError:
         return []
+    min_kb = min_mib * 1024
+    try:
+        page_kb = os.sysconf("SC_PAGE_SIZE") // 1024 if hasattr(os, "sysconf") else 0
+    except (ValueError, OSError):
+        page_kb = 0
+    min_pages = (min_kb + page_kb - 1) // page_kb if page_kb > 0 else 0
     for pid in pids:
+        statm = _read(f"{proc}/{pid}/statm") if min_pages else None
+        if statm is not None:
+            parts = statm.split()
+            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) < min_pages:
+                continue
         status = _read(f"{proc}/{pid}/status")
         if not status:
             continue
         m = re.search(r"^VmRSS:\s+(\d+)", status, re.M)
-        if not m or int(m.group(1)) < min_mib * 1024:          # kernel threads have no VmRSS
+        if not m or int(m.group(1)) < min_kb:          # kernel threads have no VmRSS
             continue
         nm = re.search(r"^Name:\s*(.+)$", status, re.M)
         comm = nm.group(1).strip() if nm else "?"

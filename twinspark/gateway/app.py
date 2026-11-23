@@ -167,7 +167,7 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
             target, served, backend_base_headers, fallback = fb
 
         body["model"] = served
-        payload = json.dumps(body).encode()
+        payload = json.dumps(body, separators=(",", ":")).encode()
         tok = target.acquire()
         upstream = None
         backend = None
@@ -243,8 +243,8 @@ def build_gateway_app(gateway: Gateway, *, max_response_bytes: int | None = None
             return _error(502, "compatibility checks require uncompressed upstream responses", "backend_error")
 
         connection_headers = {h.strip().lower() for h in upstream.headers.get("connection", "").split(",")}
-        headers = {k: v for k, v in upstream.headers.items()
-                   if k.lower() not in _HOP_BY_HOP | connection_headers}
+        skip_headers = _HOP_BY_HOP | connection_headers
+        headers = {k: v for k, v in upstream.headers.items() if k.lower() not in skip_headers}
         headers.update(extra)
 
         async def body_iter():
