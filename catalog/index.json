@@ -7,13 +7,13 @@
       "files": [
         {
           "path": "twinspark/cookbook/recipes/deepseek-v4-flash-0731-b12x.yaml",
-          "sha256": "f7e9b47d5ea439df11ed3ddc34dd7827d91bb68051d1ce760b5b27b45fcf4318",
-          "size": 2704
+          "sha256": "b7eaaf045468e8264639f988f7cab68906de8c51837017619ea82b5b2e1af946",
+          "size": 2853
         },
         {
           "path": "twinspark/cookbook/recipes/deepseek-v4-flash-0731-b12x.meta.json",
-          "sha256": "50dc757de5a5a22960bd730fe2124c0a1b99a419b36b3637c2db53737c8b5c10",
-          "size": 1518
+          "sha256": "9730d19e3f51649b738dd511b914e55229b23246d91c3da73f64017155531657",
+          "size": 1876
         }
       ],
       "min_twinspark": "0.7.0",
@@ -83,6 +83,27 @@
       "title": "MiMo-V2.6-Flash-RL — TP2, 300K, fp8 KV",
       "topology": "tp2",
       "verification": "experimental"
+    },
+    {
+      "default_mode": "vision",
+      "engine": "vllm",
+      "files": [
+        {
+          "path": "twinspark/cookbook/recipes/qwen3.8-27b-nvfp4-dflash2-tp2.json",
+          "sha256": "da8a449e2e93d64daae97a1a5afb6e85067684d5378cc35e478b213b7fe98017",
+          "size": 4212
+        }
+      ],
+      "min_twinspark": "0.7.0",
+      "model": "nvidia/Qwen3.8-27B-NVFP4",
+      "modes": [
+        "vision",
+        "text-only"
+      ],
+      "name": "qwen3.8-27b-nvfp4-dflash2-tp2",
+      "title": "Qwen3.8-27B NVFP4 — TP2 + DFlash2 on stock vLLM 0.31 (NVIDIA)",
+      "topology": "tp2",
+      "verification": "community"
     },
     {
       "default_mode": null,

@@ -26,6 +26,7 @@ from ..cookbook import (
 )
 from ..cookbook import community as reports
 from ..cookbook.remote import RemoteError, fetch_text, list_source, verify_recipe
+from ..schemas.config import DEFAULT_RECIPE_SOURCES
 from .app import ImportIn  # module level: FastAPI resolves the (string) annotation from here
 from .session import ClientSession
 
@@ -83,7 +84,7 @@ def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callabl
         for r in recipes:
             r["imported_as"] = sorted(n for n, src in existing.items() if src == r["name"])
         return {"recipes": recipes, "sources": session.node_cfg.get("recipe_sources")
-                or ["eugr/spark-vllm-docker:recipes"], "where": "client", "catalog": cat.status(),
+                or list(DEFAULT_RECIPE_SOURCES), "where": "client", "catalog": cat.status(),
                 "community": {"enabled": bool(_settings(session).get("community_url"))}}
 
     @app.get("/api/v1/cookbook/catalog")
@@ -130,7 +131,7 @@ def add_cookbook_routes(app: FastAPI, session: ClientSession, connected: Callabl
     @app.get("/api/v1/cookbook/community")
     async def community(source: Optional[str] = None, refresh: bool = False):
         """Recipes in configured GitHub folders and registries, fetched from this computer."""
-        sources = [source] if source else (session.node_cfg.get("recipe_sources") or ["eugr/spark-vllm-docker:recipes"])
+        sources = [source] if source else (session.node_cfg.get("recipe_sources") or list(DEFAULT_RECIPE_SOURCES))
         out: list[dict[str, Any]] = []
         for src in sources:
             try:

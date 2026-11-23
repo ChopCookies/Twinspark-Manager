@@ -8,6 +8,9 @@ Built-in recipes live in :mod:`twinspark.cookbook.recipes`:
 * ``*.yaml`` — eugr/spark-vllm-docker recipes, converted on the fly by
   :mod:`twinspark.cookbook.eugr` (the same importer used for your own files).
 
+Imported by URL or pasted, a recipe can also be one of NVIDIA's DGX Spark recipes
+(:mod:`twinspark.cookbook.nvidia`).
+
 Importing creates a real profile with every setting in its working draft;
 pinning (commit sha + image digest) turns it into an activatable revision.
 Import never downloads anything and never touches the running vLLM.
@@ -29,7 +32,8 @@ from .. import __version__
 from ..schemas.enums import VerificationStatus
 from ..schemas.profile import ProfileDraft
 from . import catalog
-from .eugr import RecipeImportError, parse_eugr_recipe, slugify
+from .eugr import RecipeImportError, load_yaml, parse_eugr_document, parse_eugr_recipe, slugify
+from .nvidia import is_nvidia_recipe, parse_nvidia_document
 from .tracking import record_import
 
 RECIPES_DIR = Path(__file__).resolve().parent / "recipes"
@@ -244,7 +248,7 @@ def import_eugr(text: str, profile_name: Optional[str] = None,
 
 def import_text(text: str, profile_name: Optional[str] = None, source_ref: Optional[str] = None,
                 overrides: Optional[dict[str, Any]] = None) -> tuple[ProfileDraft, dict]:
-    """Any supported recipe text: a TwinSpark draft (JSON) or an eugr recipe (YAML)."""
+    """Any supported recipe text: a TwinSpark draft (JSON), an eugr recipe or an NVIDIA recipe (YAML)."""
     if len(text.encode("utf-8")) > 512 * 1024:
         raise RecipeImportError("recipe file larger than 512 KiB")
     stripped = text.lstrip("\ufeff \t\r\n")
@@ -263,7 +267,11 @@ def import_text(text: str, profile_name: Optional[str] = None, source_ref: Optio
             draft.source.setdefault("ref", source_ref)
         return record_import(draft, text, source_ref, "twinspark"), {
             "format": "twinspark", "mapped": {}, "dropped": [], "raw": [], "notes": []}
-    draft, report = parse_eugr_recipe(stripped, profile_name, overrides=overrides, source_ref=source_ref)
+    doc = load_yaml(stripped)
+    if is_nvidia_recipe(doc):
+        draft, report = parse_nvidia_document(doc, profile_name, overrides=overrides, source_ref=source_ref)
+        return record_import(draft, text, source_ref, "nvidia", overrides), report
+    draft, report = parse_eugr_document(doc, profile_name, overrides=overrides, source_ref=source_ref)
     report["format"] = "eugr"
     return record_import(draft, text, source_ref, "eugr", overrides), report
 

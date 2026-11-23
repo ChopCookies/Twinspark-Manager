@@ -2,10 +2,16 @@
 
 Read-only, unauthenticated, cached for a few minutes (the GitHub API allows 60
 anonymous requests an hour — one listing per source per refresh is plenty).
+
+A source is ``owner/repo:path[@ref]``. A path with ``*`` is a pattern over the whole repository: NVIDIA keeps one
+``recipe.yaml`` per model and machine in nested folders (``models/<org>/<model>/dgx-spark-2gpu/linux/vllm/…``),
+and ``NVIDIA/local-ai-inference-recipes:models/*/dgx-spark-2gpu/linux/vllm/*recipe.yaml`` lists all of them with
+one request (the Git tree of the repository). ``*`` matches across folders.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -20,7 +26,9 @@ from ..netguard import UnsafeURL
 from ..netguard import check_public_url as _check_public_url
 from . import raw_url
 
-_SOURCE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+):([A-Za-z0-9_./-]*?)(?:@([A-Za-z0-9_./-]+))?$")
+_SOURCE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+):([A-Za-z0-9_.*/-]*?)(?:@([A-Za-z0-9_./-]+))?$")
+_TREE_PATH = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_./-]{0,399}$")
+MAX_TREE_FILES = 400
 MAX_RECIPE_BYTES = 512 * 1024
 _TTL = 600.0
 _cache: dict[str, tuple[float, Any]] = {}
@@ -54,6 +62,12 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
         _cache[key] = (time.time(), deepcopy(out))
         return out
     owner, repo, path, ref = parse_source(src)
+    if "*" in path:
+        out = _list_tree(src, owner, repo, path, ref, client)
+        _cache[key] = (time.time(), deepcopy(out))
+        return out
+    if ".." in path.split("/"):
+        raise RemoteError("recipe source path must not contain '..'")
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     c = _client(client)
     try:
@@ -90,6 +104,65 @@ def list_source(src: str, client: Optional[httpx.Client] = None, refresh: bool =
     files.sort(key=lambda item: item["name"].lower())
     _cache[key] = (time.time(), deepcopy(out))
     return out
+
+
+def _github_json(url: str, client: Optional[httpx.Client], what: str) -> Any:
+    c = _client(client)
+    try:
+        r = c.get(url, headers={"accept": "application/vnd.github+json"})
+    except httpx.HTTPError as exc:
+        raise RemoteError(f"GitHub not reachable ({type(exc).__name__})") from exc
+    finally:
+        if client is None:
+            c.close()
+    if r.status_code == 403 and "rate limit" in r.text.lower():
+        raise RemoteError("GitHub API rate limit reached — try again in an hour or import by URL")
+    if r.status_code in (404, 409, 422):
+        raise RemoteError(f"{what} not found")
+    if r.status_code != 200:
+        raise RemoteError(f"GitHub returned HTTP {r.status_code}")
+    try:
+        return r.json()
+    except ValueError as exc:
+        raise RemoteError("GitHub returned an invalid listing") from exc
+
+
+def _list_tree(src: str, owner: str, repo: str, pattern: str, ref: Optional[str],
+               client: Optional[httpx.Client]) -> dict[str, Any]:
+    """Files of a whole repository that match a ``*`` pattern: one request for the repository's Git tree."""
+    if ".." in pattern.split("/") or pattern.startswith("/") or (ref and ".." in ref.split("/")):
+        raise RemoteError("recipe source pattern must stay inside the repository")
+    rev = ref or "HEAD"
+    doc = _github_json(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{rev}?recursive=1", client,
+                       f"{owner}/{repo}@{rev}")
+    tree = doc.get("tree") if isinstance(doc, dict) else None
+    if not isinstance(tree, list):
+        raise RemoteError("GitHub returned an invalid repository tree")
+    prefix = pattern.split("*", 1)[0]
+    prefix = prefix[:prefix.rfind("/") + 1]                       # the folder the pattern starts in
+    files: list[dict[str, Any]] = []
+    for item in tree:
+        if not isinstance(item, dict) or item.get("type") != "blob":
+            continue
+        path = item.get("path")
+        if (not isinstance(path, str) or not _TREE_PATH.match(path) or ".." in path.split("/")
+                or not path.lower().endswith((".yaml", ".yml", ".json")) or path.lower().endswith(".meta.json")
+                or not fnmatch.fnmatchcase(path, pattern)):
+            continue
+        name = path.rsplit("/", 1)[-1]
+        title = path[len(prefix):]
+        if name.lower() in ("recipe.yaml", "recipe.yml", "recipe.json"):
+            title = title.rsplit("/", 1)[0]                       # the folders are the name
+        size = item.get("size")
+        files.append({"name": name, "title": title, "path": path,
+                      "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                      "url": f"https://github.com/{owner}/{repo}/blob/{rev}/{path}",
+                      "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{rev}/{path}",
+                      "sha": item.get("sha") if isinstance(item.get("sha"), str) else None})
+    files.sort(key=lambda f: f["title"].lower())
+    truncated = bool(doc.get("truncated")) or len(files) > MAX_TREE_FILES
+    return {"source": src, "kind": "tree", "repo": f"{owner}/{repo}", "path": pattern, "ref": ref,
+            "files": files[:MAX_TREE_FILES], "truncated": truncated, "fetched_at": time.time()}
 
 
 MAX_REGISTRY_PAGES = 5

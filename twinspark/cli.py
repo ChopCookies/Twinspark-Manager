@@ -719,7 +719,7 @@ def cmd_cookbook(args, api: Api):
         for src in data["sources"]:
             print(f"# {src['source']}" + (f"  — {src['error']}" if src.get("error") else ""))
             for f in src.get("files", []):
-                print(f"  {f['name']:48} {f.get('download_url') or f.get('url') or ''}")
+                print(f"  {f.get('title') or f['name']:48} {f.get('download_url') or f.get('url') or ''}")
         print("\nimport one: tsm cookbook import-recipe <url>")
     elif args.action == "import-recipe":
         if not args.name:
@@ -1384,7 +1384,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("container", nargs="?")
     s.add_argument("--tail", type=int, default=200)
 
-    s = cmd("cookbook", cmd_cookbook, "recipes: built-in, community (eugr), import")
+    s = cmd("cookbook", cmd_cookbook, "recipes: built-in, community (eugr, NVIDIA), import")
     s.add_argument("action", choices=["list", "show", "import", "community", "import-recipe", "refresh", "report",
                                       "stats"])
     s.add_argument("name", nargs="?", help="recipe name, a file/URL for import-recipe, a profile for report")

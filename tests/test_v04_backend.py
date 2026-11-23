@@ -65,7 +65,7 @@ def test_eugr_recipe_import_is_faithful():
     assert (b.reasoning_parser, b.tool_call_parser) == ("deepseek_v4", "deepseek_v4")
     assert b.manage_thinking_kwarg is False            # the recipe's own kwargs win
     assert a.kv_dtype == "fp8" and a.block_size == 256 and a.max_num_seqs == 8
-    assert a.gpu_memory_utilization == 0.85 and a.weight_loader == "instanttensor"
+    assert a.gpu_memory_utilization == 0.8 and a.weight_loader == "instanttensor"   # upstream lowered 0.85
     assert a.speculative_config["method"] == "dspark"
     assert a.speculative_config["num_speculative_tokens"] == 5
     assert a.compilation_config == {"cudagraph_mode": "FULL_AND_PIECEWISE", "custom_ops": ["all"]}
