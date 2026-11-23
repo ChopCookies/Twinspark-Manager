@@ -11,6 +11,7 @@ current version.
 | [small-model-validation-2026-09-28.md](small-model-validation-2026-09-28.md) | First real-hardware run (SmolLM2-135M, single node and PP2), and how to repeat it with `scripts/dev_cluster.py` |
 | [deepseek-v4-flash-two-node-startup.md](deepseek-v4-flash-two-node-startup.md) | A working DeepSeek V4 Flash launch with eugr's launcher, the reference for the built-in recipe |
 | [researched-profiles.md](researched-profiles.md) | Desk research behind the built-in profiles: memory budgets, quantisations, topologies |
+| [nvidia-recipes.md](nvidia-recipes.md) | NVIDIA's own DGX Spark recipes and what else changed for two Sparks from late October to November 2026: what was built in, what is in Community, what does not fit |
 | [mia-ai-lab.md](mia-ai-lab.md) | Mia's AI Lab two-Spark kits (vLLM, SGLang, EXL3, TensorFold): what became a recipe and what each other one needs |
 | [glm-mtp-research.md](glm-mtp-research.md) | GLM models and speculative decoding on two Sparks |
 | [review-0.2-alpha.de.md](review-0.2-alpha.de.md) | Review of the 0.2 alpha (German): what was broken and how it was fixed |

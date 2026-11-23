@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### NVIDIA's DGX Spark recipes
+
+NVIDIA now publishes its own DGX Spark recipes
+([NVIDIA/local-ai-inference-recipes](https://github.com/NVIDIA/local-ai-inference-recipes)), each validated and
+measured on NVIDIA's Sparks. [docs/cookbook.md](docs/cookbook.md#nvidias-recipes)
+
+- **Cookbook → Community lists NVIDIA's two-Spark recipes** next to eugr's, by default. A source path with `*`
+  is a pattern over a whole repository, read with one GitHub request. If you set `recipe_sources` yourself,
+  add `NVIDIA/local-ai-inference-recipes:models/*/dgx-spark-2gpu/linux/vllm/*recipe.yaml` to see them.
+- **Import an NVIDIA recipe by link or paste.** TwinSpark takes the image, the checkpoint, the vLLM flags and
+  the environment. It leaves out the per-node flags and the `docker run`'s network wiring and token, which come
+  from `controller.yaml` and the vault. The report lists what went where. Recipes for four or eight Sparks,
+  llama.cpp recipes and commands that need a shell are refused with the reason.
+- **New built-in recipe `qwen3.8-27b-nvfp4-dflash2-tp2`:** Qwen3.8-27B NVFP4 over both Sparks with the
+  z-lab DFlash2 drafter, on the stock `vllm/vllm-openai:v0.31.0` image. NVIDIA measured 54.7 tok/s for one
+  request. A text-only mode drops the vision encoder.
+
+### Fixes
+
+- **An imported recipe's drafter is staged and pinned.** eugr's and NVIDIA's recipes name drafters in
+  `--speculative-config` (`"model": …` or the dotted `--speculative_config.model …`). The import pinned only
+  the target model, so the start failed offline unless the drafter was already in the Hugging Face cache.
+  The dotted form now becomes the structured speculative settings, as the JSON form does.
+- **`deepseek-v4-flash-0731-b12x` uses `gpu_memory_utilization` 0.8,** as eugr's recipe does since
+  2026-10-26. That leaves room for host and distributed-worker allocations in the Sparks' shared memory. The
+  recipe's measurements were made at 0.85; with `max-model-len auto` the context can come out shorter.
+- `tsm cookbook community` shows a recipe's title, not only its file name.
+
+[docs/notes/nvidia-recipes.md](docs/notes/nvidia-recipes.md) records what else changed for two Sparks since
+late October and why it was not added.
+
 ## 0.8.2 — 2026-11-18 — kits, the Community registry, and a second review
 
 Everything since 0.8.1 was merged: Mia's AI Lab's fastest set-ups as kits, the Community recipe registry, and

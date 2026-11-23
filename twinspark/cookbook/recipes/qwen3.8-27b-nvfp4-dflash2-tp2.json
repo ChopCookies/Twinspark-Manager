@@ -1,0 +1,93 @@
+{
+  "name": "qwen3.8-27b-nvfp4-dflash2-tp2",
+  "description": "Qwen3.8-27B NVFP4 over both Sparks (TP2) with the z-lab DFlash2 drafter, 8 tokens a step, on the stock vLLM 0.31.0 image. NVIDIA's validated two-Spark recipe: no patches, no custom image.",
+  "tags": ["qwen", "dense", "dflash2", "vision"],
+  "simple": {
+    "model": "nvidia/Qwen3.8-27B-NVFP4",
+    "quantization": "nvfp4",
+    "topology": "tp2",
+    "context_length": 262144,
+    "concurrency": 8,
+    "thinking": true,
+    "tool_calling": true,
+    "api_alias": "default",
+    "extra_aliases": ["qwen-27b"]
+  },
+  "behaviour": {
+    "reasoning_parser": "qwen3",
+    "tool_call_parser": "qwen3_xml"
+  },
+  "advanced": {
+    "kv_dtype": "fp8",
+    "prefix_cache": true,
+    "chunked_prefill": true,
+    "trust_remote_code": true,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.8,
+    "weight_loader": "safetensors",
+    "speculative_config": {
+      "method": "dflash",
+      "model": "z-lab/Qwen3.8-27B-DFlash2",
+      "num_speculative_tokens": 8,
+      "draft_tensor_parallel_size": 2
+    },
+    "extra_models": ["z-lab/Qwen3.8-27B-DFlash2"],
+    "env": {
+      "VLLM_USE_V2_MODEL_RUNNER": "1",
+      "VLLM_FLOAT32_MATMUL_PRECISION": "high"
+    },
+    "extra_vllm_flags": {
+      "async-scheduling": true
+    }
+  },
+  "runtime_adapter": "custom",
+  "distributed_backend": "mp",
+  "verification": "community",
+  "image_hint": "vllm/vllm-openai:v0.31.0",
+  "source": {
+    "title": "Qwen3.8-27B NVFP4 — TP2 + DFlash2 on stock vLLM 0.31 (NVIDIA)",
+    "url": "https://github.com/NVIDIA/local-ai-inference-recipes/blob/main/models/qwen/qwen3.8-27b/dgx-spark-2gpu/linux/vllm/128gb/nvfp4/recipe.yaml",
+    "author": "NVIDIA local-ai-inference-recipes (recipe and measurement), z-lab (drafter)",
+    "measured": {
+      "single_stream_tok_s": 54.7,
+      "note": "NVIDIA's measurement of 2026-10-14 on two DGX Sparks: SPEED-Bench coding prompts, one request at a time, 8,192 output tokens each, image vllm/vllm-openai:v0.31.0. Not measured with TwinSpark yet; no figures for several requests at once."
+    },
+    "requirements": [
+      "Image vllm/vllm-openai:v0.31.0 (arm64) on both nodes — Pin resolves its digest. No patches, no mods.",
+      "Weights nvidia/Qwen3.8-27B-NVFP4 and the drafter z-lab/Qwen3.8-27B-DFlash2 on both nodes: staged on the first activation. Pin pins both commits and loads the drafter at its pinned commit."
+    ],
+    "notes": [
+      "A port of NVIDIA's two-Spark recipe with the same image, vLLM flags and environment. TwinSpark sets the node wiring (interfaces, RoCE devices, ranks) from controller.yaml, as for every recipe.",
+      "gpu-memory-utilization 0.8 is NVIDIA's value for two Sparks. For the same model on ONE Spark NVIDIA uses 0.6 on its NGC image: 0.85 hung the node during the start-up autotune and 0.70 took nodes down on some runs. Watch MemAvailable on both Sparks during the first start.",
+      "The text-only mode adds --language-model-only, as NVIDIA's notes suggest: the vision encoder is not loaded, which shortens the start and frees its memory. Image inputs are then refused.",
+      "eugr's recipe for the same model (recipes/qwen3.8-27b-nvfp4-dflash2.yaml) runs on a locally built vllm-node image with instanttensor loading. It is listed under Cookbook → Community."
+    ]
+  },
+  "default_mode": "vision",
+  "modes": {
+    "vision": {
+      "title": "Text and images — as NVIDIA ran it",
+      "description": "The recipe as published: text and image inputs.",
+      "patch": {},
+      "measured": {
+        "single_stream_tok_s": 54.7,
+        "note": "NVIDIA, 2026-10-14: SPEED-Bench coding, one request at a time, 8,192 output tokens."
+      }
+    },
+    "text-only": {
+      "title": "Text only",
+      "description": "Without the vision encoder (--language-model-only): a shorter start and its memory free for the KV cache. Image inputs are refused. Not measured separately.",
+      "patch": {
+        "tags": ["qwen", "dense", "dflash2"],
+        "advanced": {
+          "extra_vllm_flags": {
+            "async-scheduling": true,
+            "language-model-only": true
+          }
+        }
+      },
+      "measured": {}
+    }
+  }
+}

@@ -23,6 +23,13 @@ _MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 _HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
+# Where Cookbook → Community looks by default: eugr's recipes, and NVIDIA's for two DGX Sparks.
+DEFAULT_RECIPE_SOURCES = (
+    "eugr/spark-vllm-docker:recipes",
+    "NVIDIA/local-ai-inference-recipes:models/*/dgx-spark-2gpu/linux/vllm/*recipe.yaml",
+)
+
+
 class Listener(BaseModel):
     bind: str = "127.0.0.1"
     port: int
@@ -330,8 +337,9 @@ class ControllerConfig(BaseModel):
     metrics_interval_s: float = Field(default=10.0, gt=0)
     # which node downloads from the Hub when no node has the weights yet
     download_node: Literal["A", "B"] = "A"
-    # GitHub folders ("owner/repo:path[@ref]") and HTTPS Community /api/v1/recipes registries
-    recipe_sources: list[str] = Field(default_factory=lambda: ["eugr/spark-vllm-docker:recipes"])
+    # GitHub folders ("owner/repo:path[@ref]"), patterns over a repository (a path with "*") and HTTPS
+    # Community /api/v1/recipes registries
+    recipe_sources: list[str] = Field(default_factory=lambda: list(DEFAULT_RECIPE_SOURCES))
     cookbook: CookbookSettings = Field(default_factory=CookbookSettings)
 
     management_auth: Literal["none", "apikey"] = "apikey"

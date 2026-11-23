@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Optional
 import yaml
 
 from .. import __version__ as CLIENT_VERSION
+from ..schemas.config import DEFAULT_RECIPE_SOURCES
 from .connections import Connection, check_host
 from .ssh import RemoteResult, run_remote
 
@@ -267,7 +268,7 @@ def parse_controller_yaml(text: str) -> dict[str, Any]:
         "management_auth": str(doc.get("management_auth") or "apikey"),
         # where the client browses community recipes (the node's configured list; default as on the node)
         "recipe_sources": [str(x) for x in doc.get("recipe_sources") or [] if isinstance(x, str)][:20]
-        or ["eugr/spark-vllm-docker:recipes"],
+        or list(DEFAULT_RECIPE_SOURCES),
         # the recipe catalog and the community server, as node A uses them (the client reads them itself)
         "cookbook": _cookbook(doc.get("cookbook")),
     }

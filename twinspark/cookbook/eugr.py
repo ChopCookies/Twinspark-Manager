@@ -166,17 +166,37 @@ def _render_command(template: str, params: dict[str, Any]) -> str:
     return rendered
 
 
-def parse_eugr_recipe(text: str, profile_name: Optional[str] = None,
-                      overrides: Optional[dict[str, Any]] = None,
-                      source_ref: Optional[str] = None) -> tuple[ProfileDraft, dict[str, Any]]:
+def load_yaml(text: str) -> Any:
     try:
-        doc = yaml.safe_load(text)
+        return yaml.safe_load(text)
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         where = f" (line {mark.line + 1}, column {mark.column + 1})" if mark is not None else ""
         # no snippet of the input: it may be content fetched from somewhere that should stay private
         reason = getattr(exc, "problem", None) or "syntax error"
         raise RecipeImportError(f"not valid YAML{where}: {reason}") from exc
+
+
+_HUB_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
+
+
+def _typed(v: Optional[str]) -> Any:
+    """A dotted flag's value the way vLLM reads it: JSON when it is JSON (numbers, true/false), else the text."""
+    if v is None:
+        return True
+    parsed = _json(v)
+    return v if parsed is None and v.strip() != "null" else parsed
+
+
+def parse_eugr_recipe(text: str, profile_name: Optional[str] = None,
+                      overrides: Optional[dict[str, Any]] = None,
+                      source_ref: Optional[str] = None) -> tuple[ProfileDraft, dict[str, Any]]:
+    return parse_eugr_document(load_yaml(text), profile_name, overrides, source_ref)
+
+
+def parse_eugr_document(doc: Any, profile_name: Optional[str] = None,
+                        overrides: Optional[dict[str, Any]] = None,
+                        source_ref: Optional[str] = None) -> tuple[ProfileDraft, dict[str, Any]]:
     if not isinstance(doc, dict) or "command" not in doc:
         raise RecipeImportError("an eugr recipe needs at least 'name' and 'command'")
     _validate_document(doc)
@@ -210,12 +230,18 @@ def parse_eugr_recipe(text: str, profile_name: Optional[str] = None,
     tp, pp = 1, 1
     expert_parallel = False
     backend = DistributedBackend.MP
+    spec_keys: dict[str, Any] = {}             # --speculative_config.<key> <value>: vLLM's dotted form
     for tok, val, base in pairs:
         v = _value(tok, val)
         dotted = "." in canonical_flag(tok.split("=", 1)[0])
         if base == "model" and not dotted:
             model = model or v
             continue
+        if base == "speculative-config" and dotted:
+            key = canonical_flag(tok.split("=", 1)[0]).split(".", 1)[1]
+            if re.fullmatch(r"[a-z_][a-z0-9_]{0,63}", key):
+                spec_keys[key] = _typed(v)
+                continue
         if base == "tensor-parallel-size":
             tp = _parallel_size(v, "tensor parallel size")
             continue
@@ -326,6 +352,17 @@ def parse_eugr_recipe(text: str, profile_name: Optional[str] = None,
                 raw.append(val)
     if not model:
         raise RecipeImportError("the recipe command does not name a model")
+    if spec_keys:
+        # the dotted keys set fields of the same config as --speculative-config; vLLM applies them on top
+        adv["speculative_config"] = {**(adv.get("speculative_config") or {}), **spec_keys}
+        report["mapped"]["speculative-config"] = adv["speculative_config"]
+    drafter = (adv.get("speculative_config") or {}).get("model")
+    if isinstance(drafter, str) and _HUB_REPO.match(drafter) and drafter != model:
+        # a drafter is a second checkpoint: TwinSpark stages it on both nodes and pins its commit with the model.
+        # Left out, the containers (offline: the weights are staged) cannot load it and the start fails.
+        adv["extra_models"] = [drafter]
+        report["notes"].append(f"the drafter {drafter} is a second checkpoint: it is staged on both nodes and "
+                               "pinned together with the model")
     if doc.get("model") and doc["model"] != model and "/" in str(doc["model"]):
         report["notes"].append(f"command serves {model!r}; recipe 'model' says {doc['model']!r} — "
                                "using the command's model")

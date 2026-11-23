@@ -79,6 +79,51 @@ cookbook:
 The workstation client uses node A's settings and keeps its own copy in its folder. An unreleased build that
 is newer than the catalog keeps its own recipes where both have one.
 
+## NVIDIA's recipes
+
+Since November 2026 NVIDIA publishes its own DGX Spark recipes:
+[NVIDIA/local-ai-inference-recipes](https://github.com/NVIDIA/local-ai-inference-recipes), one `recipe.yaml`
+per model, machine and engine, each validated and measured on NVIDIA's own Sparks. **Cookbook → Community**
+lists the ones for two Sparks out of the box, next to eugr's:
+
+```yaml
+# the default; set recipe_sources in /etc/twinspark/controller.yaml only to change it
+recipe_sources:
+  - eugr/spark-vllm-docker:recipes
+  - NVIDIA/local-ai-inference-recipes:models/*/dgx-spark-2gpu/linux/vllm/*recipe.yaml
+  # NVIDIA's single-Spark recipes too (they import as single-a profiles):
+  # - NVIDIA/local-ai-inference-recipes:models/*/dgx-spark/linux/vllm/*recipe.yaml
+```
+
+A source path with `*` is a pattern over the whole repository: TwinSpark reads the repository's file list
+with one GitHub request and shows every file that matches (`*` also matches `/`). Add `@main` or a commit to
+list a fixed state. If you set `recipe_sources` yourself, the list replaces the default: add NVIDIA's line to
+yours to see its recipes.
+
+You can also paste a recipe's GitHub link into **Import recipe** (or `tsm cookbook import-recipe <url>`). An NVIDIA
+recipe is a complete launch written for people: the `docker run` for every node and the `vllm serve` of each
+rank. TwinSpark starts the containers and wires the nodes itself, so the import takes:
+
+- the image (`runtime.image`; Pin resolves its digest) and the checkpoint;
+- the variables the `vllm serve` command exports, and the tuning variables of the `docker run`
+  (`NCCL_BUFFSIZE`, `VLLM_ENABLE_ROCE_ALLREDUCE`, …);
+- every vLLM flag except the per-node ones (`--nnodes`, `--node-rank`, `--master-addr`, `--headless`, host,
+  port), which TwinSpark sets for each rank;
+- a drafter named in `--speculative-config` as a second checkpoint: it is staged on both nodes and pinned
+  with the model.
+
+The network wiring of the `docker run` (interfaces, RoCE devices, head address) and the Hugging Face token are
+left out: they come from `controller.yaml` and the node's vault. The import report lists both. Recipes for four
+or eight Sparks, llama.cpp recipes and commands that need a shell (`--flag "$VAR"`) are refused with the reason.
+
+NVIDIA's numbers come along as notes, not as measurements of yours: they were taken with NVIDIA's settings on
+NVIDIA's Sparks. Several recipes use eugr's community images (`eugr/spark-vllm-b12x:…`), which NVIDIA marks as
+mutable; Pin fixes the digest you test.
+
+The Cookbook has one of them built in, with TwinSpark's notes:
+`qwen3.8-27b-nvfp4-dflash2-tp2` (Qwen3.8-27B with the DFlash2 drafter on the stock vLLM 0.31.0 image).
+[notes/nvidia-recipes.md](notes/nvidia-recipes.md) compares the others with the built-in recipes.
+
 ## Browse TwinSpark Community
 
 To opt in to browsing the public recipe registry, add its HTTPS listing to

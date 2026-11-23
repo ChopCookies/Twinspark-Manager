@@ -167,7 +167,7 @@ tsm setup --root /tmp/stage --yes --no-start           # build a complete instal
   status, Updates, Profiles, Cookbook, **Integrations**, Model files, Mods, Planner, Diagnostics,
   **Remote**, Jobs, Logs.
 - **Recipes → profiles.** Built-in researched configs and community recipes (eugr/spark-vllm-docker
-  format) by URL, paste or file; immutable revisions (model commit + image digest); diff, duplicate,
+  and NVIDIA's DGX Spark recipes) by URL, paste or file; immutable revisions (model commit + image digest); diff, duplicate,
   known-good tracking; *Pin & prepare* stages weights without touching the model that is serving.
   Reviewed imports can pin and prepare automatically; source updates retain local experiment settings
   and show conflicts before creating an updated profile.
